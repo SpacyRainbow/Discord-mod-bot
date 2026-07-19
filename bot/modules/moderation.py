@@ -29,7 +29,7 @@ class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="kick")
+    @commands.hybrid_command(name="kick")
     @commands.has_permissions(kick_members=True)
     @commands.bot_has_permissions(kick_members=True)
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
@@ -37,7 +37,7 @@ class Moderation(commands.Cog):
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "kick", reason)
         await ctx.send(f"Kicked {member} (case #{case_id}): {reason}")
 
-    @commands.command(name="ban")
+    @commands.hybrid_command(name="ban")
     @commands.has_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
     async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
@@ -45,7 +45,7 @@ class Moderation(commands.Cog):
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "ban", reason)
         await ctx.send(f"Banned {member} (case #{case_id}): {reason}")
 
-    @commands.command(name="mute")
+    @commands.hybrid_command(name="mute")
     @commands.has_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def mute(
@@ -67,14 +67,14 @@ class Moderation(commands.Cog):
         )
         await ctx.send(f"Muted {member} for {duration} (case #{case_id}): {reason}")
 
-    @commands.command(name="unmute")
+    @commands.hybrid_command(name="unmute")
     @commands.has_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def unmute(self, ctx: commands.Context, member: discord.Member):
         await member.timeout(None)
         await ctx.send(f"Unmuted {member}.")
 
-    @commands.command(name="warn")
+    @commands.hybrid_command(name="warn")
     @commands.has_permissions(moderate_members=True)
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "warn", reason)
@@ -84,7 +84,7 @@ class Moderation(commands.Cog):
         except discord.Forbidden:
             pass  # DMs closed - the warning still exists in case history
 
-    @commands.command(name="cases")
+    @commands.hybrid_command(name="cases")
     @commands.has_permissions(moderate_members=True)
     async def cases(self, ctx: commands.Context, member: discord.Member):
         rows = await self.bot.stores.cases.for_user(ctx.guild.id, member.id)
@@ -95,7 +95,7 @@ class Moderation(commands.Cog):
         embed = discord.Embed(title=f"Case history: {member}", description="\n".join(lines[:20]))
         await ctx.send(embed=embed)
 
-    @commands.command(name="case")
+    @commands.hybrid_command(name="case")
     @commands.has_permissions(moderate_members=True)
     async def case(self, ctx: commands.Context, case_id: int):
         row = await self.bot.stores.cases.get(ctx.guild.id, case_id)

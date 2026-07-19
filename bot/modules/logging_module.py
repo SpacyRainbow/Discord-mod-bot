@@ -93,7 +93,7 @@ class LoggingModule(commands.Cog):
         )
         await post_log(self.bot, member.guild, embed)
 
-    @commands.command(name="setlogchannel")
+    @commands.hybrid_command(name="setlogchannel")
     @commands.has_permissions(manage_guild=True)
     async def set_log_channel(self, ctx: commands.Context, channel: discord.TextChannel):
         """Set the channel mod-log, edits/deletes, and join/leave events post to."""

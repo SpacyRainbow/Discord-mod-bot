@@ -60,7 +60,7 @@ class Bored(commands.Cog):
     async def before_check_loop(self):
         await self.bot.wait_until_ready()
 
-    @commands.command(name="setboredchannel")
+    @commands.hybrid_command(name="setboredchannel")
     @commands.has_permissions(manage_guild=True)
     async def set_bored_channel(self, ctx: commands.Context, channel: discord.TextChannel):
         await self.bot.stores.config.set(ctx.guild.id, "bored.channel", str(channel.id))

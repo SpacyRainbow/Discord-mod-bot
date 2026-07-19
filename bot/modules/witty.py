@@ -18,7 +18,7 @@ class Witty(commands.Cog):
         if response:
             await message.channel.send(response)
 
-    @commands.command(name="wittyadd")
+    @commands.hybrid_command(name="wittyadd")
     @commands.has_permissions(manage_guild=True)
     async def witty_add(self, ctx: commands.Context, *, response: str):
         await self.bot.stores.witty.add(ctx.guild.id, response)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import discord
 from discord.ext import commands
 
@@ -8,13 +10,13 @@ class Quote(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="addquote")
+    @commands.hybrid_command(name="addquote")
     async def add_quote(self, ctx: commands.Context, author: str, *, content: str):
         quote_id = await self.bot.stores.quotes.add(ctx.guild.id, author, content, ctx.author.id)
         await ctx.send(f"Saved as quote #{quote_id}.")
 
-    @commands.command(name="quote")
-    async def quote(self, ctx: commands.Context, quote_id: int | None = None):
+    @commands.hybrid_command(name="quote")
+    async def quote(self, ctx: commands.Context, quote_id: Optional[int] = None):
         if quote_id is None:
             row = await self.bot.stores.quotes.random(ctx.guild.id)
         else:

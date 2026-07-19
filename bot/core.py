@@ -28,6 +28,7 @@ MODULES = [
     "bot.modules.witty",
     "bot.modules.bored",
     "bot.modules.markov",
+    "bot.modules.music",
     # "bot.modules.scheduler",
     # "bot.modules.counters",
     # "bot.modules.leveling",
@@ -68,7 +69,25 @@ class ModBot(commands.Bot):
             except Exception:
                 logger.exception("Failed to load module: %s", module)
 
+        await self._sync_commands()
         self.loop.create_task(self._db_watchdog())
+
+    async def _sync_commands(self) -> None:
+        """Registers hybrid/slash commands with Discord. Guild-scoped sync
+        (via GUILD_ID) propagates instantly; a global sync can take up to an
+        hour, so guild-scoped is the better default for a single-server bot."""
+        guild_id = os.getenv("GUILD_ID")
+        try:
+            if guild_id:
+                guild_obj = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild_obj)
+                synced = await self.tree.sync(guild=guild_obj)
+                logger.info("Synced %d command(s) to guild %s", len(synced), guild_id)
+            else:
+                synced = await self.tree.sync()
+                logger.info("Synced %d command(s) globally (may take up to an hour to appear)", len(synced))
+        except Exception:
+            logger.exception("Failed to sync application commands")
 
     async def _db_watchdog(self) -> None:
         """Retry the DB connection every 30s while it's down, matching the

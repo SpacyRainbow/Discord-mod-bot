@@ -10,11 +10,11 @@ class Status(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="ping")
+    @commands.hybrid_command(name="ping")
     async def ping(self, ctx: commands.Context):
         await ctx.send(f"Pong. {round(self.bot.latency * 1000)}ms")
 
-    @commands.command(name="uptime")
+    @commands.hybrid_command(name="uptime")
     async def uptime(self, ctx: commands.Context):
         if self.bot.start_time is None:
             await ctx.send("Just started.")
@@ -24,7 +24,7 @@ class Status(commands.Cog):
         minutes, secs = divmod(remainder, 60)
         await ctx.send(f"Up for {hours}h {minutes}m {secs}s")
 
-    @commands.command(name="about")
+    @commands.hybrid_command(name="about")
     async def about(self, ctx: commands.Context):
         embed = discord.Embed(title="Bot status")
         embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms")

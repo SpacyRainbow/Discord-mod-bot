@@ -29,7 +29,7 @@ class Roles(commands.Cog):
             except discord.Forbidden:
                 pass
 
-    @commands.command(name="setautorole")
+    @commands.hybrid_command(name="setautorole")
     @commands.has_permissions(manage_roles=True)
     async def set_autorole(self, ctx: commands.Context, role: discord.Role):
         await self.bot.stores.config.set(ctx.guild.id, "roles.autorole", str(role.id))
@@ -37,20 +37,20 @@ class Roles(commands.Cog):
 
     # ---- self-assignable roles ----
 
-    @commands.command(name="allowrole")
+    @commands.hybrid_command(name="allowrole")
     @commands.has_permissions(manage_roles=True)
     async def allow_role(self, ctx: commands.Context, role: discord.Role):
         """Mark a role as self-assignable via !iam."""
         await self.bot.stores.roles.add_self_assignable(ctx.guild.id, role.id)
         await ctx.send(f"{role.mention} can now be self-assigned with `!iam {role.name}`.")
 
-    @commands.command(name="disallowrole")
+    @commands.hybrid_command(name="disallowrole")
     @commands.has_permissions(manage_roles=True)
     async def disallow_role(self, ctx: commands.Context, role: discord.Role):
         await self.bot.stores.roles.remove_self_assignable(ctx.guild.id, role.id)
         await ctx.send(f"{role.mention} is no longer self-assignable.")
 
-    @commands.command(name="iam")
+    @commands.hybrid_command(name="iam")
     async def iam(self, ctx: commands.Context, *, role: discord.Role):
         allowed = await self.bot.stores.roles.list_self_assignable(ctx.guild.id)
         if role.id not in allowed:
@@ -59,7 +59,7 @@ class Roles(commands.Cog):
         await ctx.author.add_roles(role, reason="Self-assigned via !iam")
         await ctx.send(f"Gave you {role.mention}.")
 
-    @commands.command(name="iamnot")
+    @commands.hybrid_command(name="iamnot")
     async def iamnot(self, ctx: commands.Context, *, role: discord.Role):
         allowed = await self.bot.stores.roles.list_self_assignable(ctx.guild.id)
         if role.id not in allowed:
@@ -70,7 +70,7 @@ class Roles(commands.Cog):
 
     # ---- reaction roles ----
 
-    @commands.command(name="reactionrole")
+    @commands.hybrid_command(name="reactionrole")
     @commands.has_permissions(manage_roles=True)
     async def reaction_role(
         self, ctx: commands.Context, message_id: int, emoji: str, role: discord.Role

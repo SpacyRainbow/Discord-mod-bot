@@ -46,9 +46,10 @@ class Markov(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="markov")
+    @commands.hybrid_command(name="markov")
     @commands.cooldown(1, 10, commands.BucketType.channel)
     async def markov(self, ctx: commands.Context):
+        await ctx.defer()
         messages = [
             m.content
             async for m in ctx.channel.history(limit=HISTORY_LIMIT)

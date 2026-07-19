@@ -99,7 +99,7 @@ class AutoMod(commands.Cog):
         )
         await post_log(self.bot, message.guild, embed)
 
-    @commands.group(name="filter", invoke_without_command=True)
+    @commands.hybrid_group(name="filter", invoke_without_command=True)
     @commands.has_permissions(manage_guild=True)
     async def filter_group(self, ctx: commands.Context):
         words = await self.bot.stores.filters.all(ctx.guild.id)

@@ -3,6 +3,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# ffmpeg is needed at runtime for voice playback (music.py transcodes the
+# yt-dlp audio stream into PCM for Discord). Installed before the pip layer
+# since it changes far less often, and before USER botuser since apt-get
+# needs root.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install deps first so this layer is cached unless requirements.txt changes
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
