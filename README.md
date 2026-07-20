@@ -40,6 +40,7 @@ bot/
     ├── bored.py           nudges a channel after it goes quiet
     ├── markov.py          generates text from recent channel history
     ├── music.py           YouTube playback via yt-dlp + SponsorBlock auto-skip
+    ├── setup.py           /setup step-by-step per-guild configuration wizard
     ├── scheduler.py       STUB - Phase 6, see file for design notes
     ├── counters.py        STUB - Phase 6, see file for design notes
     ├── leveling.py         STUB - Phase 6, see file for design notes
@@ -71,9 +72,51 @@ until it reconnects.
 | 5 | quote, tag, bucket, witty, bored, markov | ✅ Done |
 | 6 | scheduler, counters, leveling, minecraft | 🚧 Stubbed - see each file's docstring |
 | 7 | Hybrid `/slash` commands, music (yt-dlp + SponsorBlock) | ✅ Done |
+| 8 | Antispam bulk-delete fix, role-based mute, `/setup` wizard, `/help` | ✅ Done |
 
-59 tests currently pass (`pytest -q`), covering the pure detection logic
-(automod/antispam/markov/music) and the store layer against a real temp SQLite file.
+103 tests currently pass (`pytest -q`), covering the pure detection logic
+(automod/antispam/markov/music), the moderation and status commands (mocked
+Discord objects + a real temp SQLite file), and the store layer against a
+real temp SQLite file.
+
+## Commands
+
+Every command below works both as `!prefix` and `/slash` (run `/help` in
+Discord any time for this same list plus a link back here). Commands marked
+**mod** require `Manage Guild`, `Manage Roles`, `Kick/Ban Members`, or
+`Moderate Members` as noted.
+
+| Command | Module | What it does |
+|---|---|---|
+| `ping`, `uptime`, `about` | status | Bot health/status |
+| `help` | status | Lists every command, links back to this README |
+| `setconfig <key> <value>` **mod** | status | Set any config key from the table below directly |
+| `getconfig <key>` **mod** | status | Show a config key's current value |
+| `setup` **mod** | setup | Step-by-step wizard for every per-guild setting, re-runnable any time - see "Setup wizard" below |
+| `filter add/remove/list` **mod** | automod | Manage the banned-word list |
+| `kick <member> [reason]` **mod** | moderation | Kick, recorded to case history |
+| `ban <member> [reason]` **mod** | moderation | Ban, recorded to case history |
+| `mute <member> [duration] [reason]` **mod** | moderation | Mute - `10m`/`2h`/`3d` uses a native timeout (≤28 days); longer than 28 days or omitted/`perm` uses the auto-created Mute role instead (see below) |
+| `unmute <member>` **mod** | moderation | Clears a timeout, the Mute role, and any pending scheduled expiry, whichever applies |
+| `warn <member> [reason]` **mod** | moderation | Warns and DMs the member, recorded to case history |
+| `cases <member>` **mod** | moderation | Case history for a member |
+| `case <id>` **mod** | moderation | Look up one case by ID |
+| `setlogchannel <channel>` **mod** | logging_module | Where edit/delete/join/leave logs and mod-log entries post |
+| `setautorole <role>` **mod** | roles | Role granted automatically on join |
+| `allowrole`/`disallowrole <role>` **mod** | roles | Manage which roles are self-assignable |
+| `iam`/`iamnot <role>` | roles | Self-assign/remove an allowed role |
+| `reactionrole <message_id> <emoji> <role>` **mod** | roles | Bind a reaction to a role grant |
+| `addquote <author> <text>`, `quote [id]` | quote | Save/recall quotes |
+| `tag`, `tagset`, `tagdelete`, `tags` | tag | Custom canned-response commands |
+| `bucketadd`, `bucket`, `buckets` | bucket | Named random-pick lists |
+| `wittyadd <response>` **mod** | witty | Add a random reply used when the bot is @mentioned |
+| `setboredchannel <channel>` **mod** | bored | Channel to nudge after it goes quiet |
+| `markov` | markov | Generates text from recent channel history |
+| `play/skip/pause/resume/rewind/forward/stop/queue/nowplaying/leave` | music | See the Music section below |
+
+Antispam and automod's message-flooding/caps/invite detection have no
+commands of their own - they're always-on listeners tuned via `setconfig`/
+`setup` (see the config table).
 
 ## Local setup
 
@@ -163,17 +206,81 @@ guild. Defaults apply if a key was never set.
 | `logging.channel` | unset | Channel ID all logs post to |
 | `logging.edits` / `logging.deletes` / `logging.joins` | true | Toggle each log category |
 | `roles.autorole` | unset | Role ID granted automatically on join |
+| `moderation.mute_role` | unset | Role ID of the auto-created Mute role (see Moderation below) |
 | `bored.channel` | unset | Channel to watch for the bored-nudge |
 | `bored.idle_seconds` | 1800 | Silence duration before it fires |
 | `bored.message` | generic nudge | Text posted when triggered |
 | `music.sponsorblock_enabled` | true | Auto-skip non-music segments (sponsor reads, intros/outros, etc.) via SponsorBlock |
 
-Most of these are set via their module's dedicated command (`!setlogchannel`,
-`!setautorole`, `!setboredchannel`, `!filter add`) rather than a raw
-`!setconfig` - a generic `!setconfig`/`!getconfig` pair (matching Sweetie
-Bot's pattern exactly) is a natural next addition to `bot/modules/status.py`
-if you want a single escape hatch for keys that don't have a dedicated
-command yet.
+Some of these have a dedicated command (`setlogchannel`, `setautorole`,
+`setboredchannel`, `filter add`); everything else is reachable through the
+generic `setconfig <key> <value>` / `getconfig <key>` pair (mod-only). The
+`/setup` wizard below walks through all of them interactively and is the
+easiest way to configure a server end to end.
+
+## Setup wizard (`/setup`)
+
+Mod-only (`Manage Guild`), re-runnable any time - every change is saved to
+the DB the moment you make it, not just at the end, so stopping partway or
+letting the wizard time out (5 minutes idle) never loses anything you've
+already set. Only the person who ran `/setup` can use its buttons/menus;
+everyone else gets a "not yours" message if they try. It's one message that
+gets edited in place as you go, with **Back**/**Next** at the bottom of
+every step (the last step shows **Finish** instead, which locks the message).
+
+| Step | Title | What's on it | Writes to |
+|---|---|---|---|
+| 1/9 | General | Button: **Edit prefix** opens a form with one field, the command prefix | `commandprefix` |
+| 2/9 | Logging | A channel picker for the log channel, plus three On/Off toggle buttons: **Log edits**, **Log deletes**, **Log joins/leaves** | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
+| 3/9 | Moderation | Nothing to click - just creates the Mute role if it doesn't exist yet (or confirms it already does) and shows it by name. This is what makes `/setup` re-runnable for the mute role specifically: running it again re-applies the role's channel permissions everywhere, fixing it if a channel's overwrites ever got changed or a new channel doesn't have them yet | `moderation.mute_role` |
+| 4/9 | Anti-spam | Button: **Edit thresholds** opens a form with 5 fields - max messages per window, window length, max duplicate messages, max mentions, timeout duration - all whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
+| 5/9 | Automod | Toggle button **Block invites**, plus a separate button **Edit caps thresholds** opening a form with 2 fields (caps % threshold, minimum message length before caps checking applies). **Does not include the banned-word list** - that's a list of words, not a single value, and is managed separately with `filter add`/`filter remove`/`filter` (no dedicated setup step for it yet) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
+| 6/9 | Roles | A role picker for the auto-role granted on join | `roles.autorole` |
+| 7/9 | Bored detector | A channel picker for the nudge channel, plus a button **Edit bored settings** opening a form with 2 fields (idle seconds before it fires, the message it posts) | `bored.channel`, `bored.idle_seconds`, `bored.message` |
+| 8/9 | Music | Toggle button **SponsorBlock auto-skip** | `music.sponsorblock_enabled` |
+| 9/9 | Summary | Read-only recap of every setting above (current value or its default) plus a Spotify line that only ever says "Configured" or "Not configured" - Spotify credentials are never shown, edited, or settable here (see below) | nothing - display only |
+
+**Why Spotify never appears here as an editable field**: `SPOTIFY_CLIENT_ID`/
+`SPOTIFY_CLIENT_SECRET` are a bot-wide `.env` secret (used by every server
+the bot is in), not per-guild config. Accepting them through a Discord
+command would leak the secret into Discord's own interaction history the
+moment someone typed it, change it bot-wide from a single guild's command,
+and require storing a secret in the bot's own SQLite DB - three real
+problems, not a style choice. Set it once in `.env` (see "Local setup"
+above) and every server just sees "Configured".
+
+## Anti-spam
+
+Behavior-based: message flooding, repeated/duplicate content, and mass
+mentions (config keys above). Live testing surfaced a real bug here that's
+now fixed: a violation used to only delete the messages *after* the
+threshold was crossed, leaving the first few of any burst untouched. I
+checked how Sweetie Bot's own spam module actually handles this (read
+directly from its `spammodule/SpamModule.go`): once triggered, it
+bulk-deletes the offender's *entire* recent burst, not just the tail -
+that's the behavior this module now matches, grouped per-channel since
+Discord's bulk-delete API is channel-scoped. A per-user lock prevents a
+fast burst from racing itself into double-handling the same violation.
+
+## Moderation
+
+`kick`/`ban`/`warn` are straightforward, recorded to the `cases` table.
+`mute` has two mechanisms depending on how long it needs to last:
+
+- **≤28 days**: Discord's native timeout (`communication_disabled_until`) -
+  shows natively as "Timed Out" in Discord's own UI, no setup needed.
+- **>28 days, or indefinite** (the default when no duration is given, or
+  explicitly `perm`/`permanent`/`indefinite`): a **Mute role**, auto-created
+  the first time it's needed (or via `/setup`), with a deny-overwrite for
+  sending messages/reactions/starting threads applied to every channel -
+  including ones created afterward, kept in sync automatically. This exists
+  because Discord's native timeout has a hard 28-day cap and can't do
+  "more permanent"; indefinite mutes are lifted only by `unmute`,
+  longer-than-28-day mutes auto-lift on schedule via a background check
+  every 60 seconds.
+
+`unmute` always clears every mechanism at once (timeout, role, and any
+pending scheduled expiry) so a mod never needs to know which one was used.
 
 ## Music (`/play`, `/skip`, `/pause`, `/resume`, `/rewind`, `/forward`, `/stop`, `/queue`, `/nowplaying`, `/leave`)
 
@@ -241,6 +348,4 @@ Not yet included, but straightforward follow-ups: `/volume`, loop
   API token, server ID) - or a decision to use the simpler `mcstatus`-only
   route - before it can query your actual server. Planned as a follow-up now
   that the bot's deployed alongside Crafty4 on the same TrueNAS box.
-- A generic `!setconfig <key> <value>` / `!getconfig <key>` pair would round
-  out the Sweetie Bot config parity and is a good next commit.
 - Music extras noted above (`/volume`, loop, `/shuffle`, etc.).

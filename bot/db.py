@@ -85,6 +85,13 @@ CREATE TABLE IF NOT EXISTS witty_responses (
     guild_id INTEGER NOT NULL,
     response TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS mute_expirations (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
 """
 
 

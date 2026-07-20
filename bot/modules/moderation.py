@@ -1,17 +1,42 @@
 """
 moderation - kick/ban/mute/warn commands, all recorded to the cases table.
 
-Mute is implemented with Discord's native timeout feature (communication_disabled_until)
-rather than a separate mute role - simpler, no role-hierarchy setup required,
-and it's what current Discord clients show natively as "Timed Out".
+Mute has two mechanisms depending on how long it needs to last:
+  - <=28 days: Discord's native timeout (communication_disabled_until) -
+    simplest, no role-hierarchy setup, shows natively as "Timed Out".
+  - >28 days, or indefinite (the default when no duration is given): a
+    "Mute" role, auto-created on first use, with a deny-overwrite for
+    sending messages/reactions/threads applied to every channel (and any
+    channel created afterward). Native timeout has a hard 28-day cap, so
+    anything longer has no choice but to be role-based. Indefinite mutes
+    are lifted only by /unmute; longer-than-28-day mutes get an entry in
+    the mute_expirations table and are auto-lifted by mute_expiry_check.
+
+Config keys:
+  moderation.mute_role - role ID of the auto-created "Mute" role
 """
 
 from __future__ import annotations
 
 import datetime
+import logging
+from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+logger = logging.getLogger("bot.modules.moderation")
+
+MUTE_ROLE_NAME = "Mute"
+MUTE_ROLE_OVERWRITE = discord.PermissionOverwrite(
+    send_messages=False,
+    send_messages_in_threads=False,
+    create_public_threads=False,
+    create_private_threads=False,
+    add_reactions=False,
+)
+MUTE_EXPIRY_CHECK_SECONDS = 60
+PERMANENT_DURATION_KEYWORDS = {"perm", "permanent", "indefinite", "forever"}
 
 
 def _duration_to_timedelta(duration: str) -> datetime.timedelta:
@@ -25,9 +50,104 @@ def _duration_to_timedelta(duration: str) -> datetime.timedelta:
     return datetime.timedelta(**{units[unit]: amount})
 
 
+def is_permanent_duration(duration: Optional[str]) -> bool:
+    """No duration given, or an explicit perm/permanent/indefinite/forever
+    keyword, both mean "mute until manually /unmute'd"."""
+    return duration is None or duration.strip().lower() in PERMANENT_DURATION_KEYWORDS
+
+
 class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.mute_expiry_check.start()
+
+    def cog_unload(self):
+        self.mute_expiry_check.cancel()
+
+    # ---- mute role ----
+
+    async def get_mute_role(self, guild: discord.Guild) -> Optional[discord.Role]:
+        role_id = await self.bot.stores.config.get_int(guild.id, "moderation.mute_role", 0)
+        if not role_id:
+            return None
+        return guild.get_role(role_id)
+
+    async def ensure_mute_role(self, guild: discord.Guild) -> discord.Role:
+        role = await self.get_mute_role(guild)
+        if role is None:
+            role = await guild.create_role(
+                name=MUTE_ROLE_NAME,
+                permissions=discord.Permissions.none(),
+                reason="Auto-created mute role",
+            )
+            await self.bot.stores.config.set(guild.id, "moderation.mute_role", str(role.id))
+        for channel in guild.text_channels:
+            try:
+                await channel.set_permissions(
+                    role, overwrite=MUTE_ROLE_OVERWRITE, reason="Mute role setup"
+                )
+            except discord.Forbidden:
+                continue
+        return role
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        if not isinstance(channel, discord.TextChannel):
+            return
+        role = await self.get_mute_role(channel.guild)
+        if role is None:
+            return  # never force role creation just because a channel was made
+        try:
+            await channel.set_permissions(role, overwrite=MUTE_ROLE_OVERWRITE, reason="Mute role setup")
+        except discord.Forbidden:
+            pass
+
+    @tasks.loop(seconds=MUTE_EXPIRY_CHECK_SECONDS)
+    async def mute_expiry_check(self):
+        now_iso = discord.utils.utcnow().isoformat()
+        for guild_id, user_id in await self.bot.stores.mutes.due(now_iso):
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                await self.bot.stores.mutes.clear(guild_id, user_id)
+                continue
+            member = guild.get_member(user_id)
+            role = await self.get_mute_role(guild)
+            if member is not None and role is not None:
+                try:
+                    await member.remove_roles(role, reason="Mute expired")
+                except discord.Forbidden:
+                    logger.warning("Missing permission to lift expired mute in guild %s", guild_id)
+            await self.bot.stores.mutes.clear(guild_id, user_id)
+
+    @mute_expiry_check.before_loop
+    async def before_mute_expiry_check(self):
+        await self.bot.wait_until_ready()
+
+    async def _mute_with_role(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        delta: Optional[datetime.timedelta],
+        reason: str,
+    ) -> None:
+        role = await self.ensure_mute_role(ctx.guild)
+        await member.add_roles(role, reason=f"Mute: {reason}")
+        if delta is None:
+            await self.bot.stores.mutes.clear(ctx.guild.id, member.id)
+            case_id = await self.bot.stores.cases.add(
+                ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} (indefinite)"
+            )
+            await ctx.send(f"Muted {member} indefinitely (case #{case_id}): {reason}")
+        else:
+            expires_at = discord.utils.utcnow() + delta
+            await self.bot.stores.mutes.schedule(ctx.guild.id, member.id, expires_at.isoformat())
+            case_id = await self.bot.stores.cases.add(
+                ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} (until {expires_at.isoformat()})"
+            )
+            until = discord.utils.format_dt(expires_at, "f")
+            await ctx.send(f"Muted {member} until {until} (case #{case_id}): {reason}")
+
+    # ---- commands ----
 
     @commands.hybrid_command(name="kick")
     @commands.has_permissions(kick_members=True)
@@ -45,22 +165,34 @@ class Moderation(commands.Cog):
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "ban", reason)
         await ctx.send(f"Banned {member} (case #{case_id}): {reason}")
 
-    @commands.hybrid_command(name="mute")
+    @commands.hybrid_command(
+        name="mute",
+        description="Mute a member - omit duration (or use 'perm') for indefinite",
+    )
     @commands.has_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def mute(
         self,
         ctx: commands.Context,
         member: discord.Member,
-        duration: str = "10m",
+        duration: Optional[str] = None,
         *,
         reason: str = "No reason given",
     ):
+        if is_permanent_duration(duration):
+            await self._mute_with_role(ctx, member, None, reason)
+            return
+
         try:
             delta = _duration_to_timedelta(duration)
         except ValueError as e:
             await ctx.send(str(e))
             return
+
+        if delta > datetime.timedelta(days=28):
+            await self._mute_with_role(ctx, member, delta, reason)
+            return
+
         await member.timeout(discord.utils.utcnow() + delta, reason=reason)
         case_id = await self.bot.stores.cases.add(
             ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} ({duration})"
@@ -72,6 +204,13 @@ class Moderation(commands.Cog):
     @commands.bot_has_permissions(moderate_members=True)
     async def unmute(self, ctx: commands.Context, member: discord.Member):
         await member.timeout(None)
+        role = await self.get_mute_role(ctx.guild)
+        if role is not None:
+            try:
+                await member.remove_roles(role, reason="Unmuted")
+            except discord.Forbidden:
+                pass
+        await self.bot.stores.mutes.clear(ctx.guild.id, member.id)
         await ctx.send(f"Unmuted {member}.")
 
     @commands.hybrid_command(name="warn")

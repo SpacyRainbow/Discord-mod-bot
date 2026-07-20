@@ -89,8 +89,12 @@ class AutoMod(commands.Cog):
     async def _take_action(self, message: discord.Message, reason: str) -> None:
         try:
             await message.delete()
-        except discord.Forbidden:
-            logger.warning("Missing permission to delete message in %s", message.channel)
+        except discord.HTTPException:
+            # Missing permission, already gone, rate-limited, etc. - a bare
+            # `except discord.Forbidden` would leave anything else (a burst of
+            # flagged messages can genuinely 429 on delete) as an unhandled
+            # exception logged by discord.py's default on_message handler.
+            logger.warning("Failed to delete flagged message in %s", message.channel, exc_info=True)
             return
         embed = discord.Embed(
             title="Automod action",

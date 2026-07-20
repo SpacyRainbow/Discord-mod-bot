@@ -318,6 +318,41 @@ class WittyStore:
             return row[0] if row else None
 
 
+class MuteStore:
+    """Scheduled auto-lift times for role-based mutes longer than Discord's
+    28-day native timeout cap. Indefinite mutes never get a row here -
+    they're lifted only by a manual /unmute."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def schedule(self, guild_id: int, user_id: int, expires_at: str) -> None:
+        if not self.db.available:
+            raise RuntimeError("Database unavailable, mute expiration not scheduled")
+        await self.db.conn.execute(
+            "INSERT INTO mute_expirations (guild_id, user_id, expires_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET expires_at = excluded.expires_at",
+            (guild_id, user_id, expires_at),
+        )
+        await self.db.conn.commit()
+
+    async def clear(self, guild_id: int, user_id: int) -> None:
+        if not self.db.available:
+            raise RuntimeError("Database unavailable, mute expiration not cleared")
+        await self.db.conn.execute(
+            "DELETE FROM mute_expirations WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        )
+        await self.db.conn.commit()
+
+    async def due(self, now_iso: str) -> list:
+        if not self.db.available:
+            return []
+        async with self.db.conn.execute(
+            "SELECT guild_id, user_id FROM mute_expirations WHERE expires_at <= ?", (now_iso,)
+        ) as cursor:
+            return await cursor.fetchall()
+
+
 class Stores:
     """Bag of all store instances, attached to the bot as bot.stores."""
 
@@ -331,3 +366,4 @@ class Stores:
         self.tags = TagStore(db)
         self.buckets = BucketStore(db)
         self.witty = WittyStore(db)
+        self.mutes = MuteStore(db)

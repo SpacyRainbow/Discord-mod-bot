@@ -29,6 +29,7 @@ MODULES = [
     "bot.modules.bored",
     "bot.modules.markov",
     "bot.modules.music",
+    "bot.modules.setup",
     # "bot.modules.scheduler",
     # "bot.modules.counters",
     # "bot.modules.leveling",
@@ -43,7 +44,9 @@ class ModBot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         intents.message_content = True
-        super().__init__(command_prefix=self._get_prefix, intents=intents)
+        # help_command=None: status.py defines its own /help hybrid command,
+        # which would collide with discord.py's default one otherwise.
+        super().__init__(command_prefix=self._get_prefix, intents=intents, help_command=None)
 
         db_path = os.getenv("DB_PATH", "/app/data/bot.db")
         self.db = Database(db_path)
