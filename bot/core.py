@@ -6,9 +6,11 @@ import os
 import time
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .db import Database
+from .modules.minecraft import MinecraftGuildRestrictedError
 from .stores import Stores
 
 logger = logging.getLogger("bot.core")
@@ -30,10 +32,10 @@ MODULES = [
     "bot.modules.markov",
     "bot.modules.music",
     "bot.modules.setup",
+    "bot.modules.minecraft",
     # "bot.modules.scheduler",
     # "bot.modules.counters",
     # "bot.modules.leveling",
-    # "bot.modules.minecraft",
 ]
 
 DEFAULT_PREFIX = os.getenv("DEFAULT_PREFIX", "!")
@@ -112,6 +114,12 @@ class ModBot(commands.Bot):
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
         if isinstance(error, commands.CommandNotFound):
             return
+        if isinstance(error, commands.NoPrivateMessage):
+            await ctx.send("That command only works in a server, not in a DM.")
+            return
+        if isinstance(error, MinecraftGuildRestrictedError):
+            await ctx.send(str(error))
+            return
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You don't have permission to do that.")
             return
@@ -123,6 +131,15 @@ class ModBot(commands.Bot):
             return
         if isinstance(error, commands.BadArgument):
             await ctx.send(f"Bad argument: {error}")
+            return
+        if isinstance(error, commands.HybridCommandError) and isinstance(
+            error.original, app_commands.TransformerError
+        ):
+            # A hybrid command's Member/Role/Channel-typed parameter failed to
+            # resolve (e.g. a typo'd name) - discord.py routes this through
+            # its own transformer machinery for both invocation paths, not
+            # through commands.BadArgument, so it needs its own branch here.
+            await ctx.send(f"Couldn't resolve `{error.original.value}` to a valid argument.")
             return
         logger.exception("Unhandled command error in %s", ctx.command, exc_info=error)
         await ctx.send("Something went wrong running that command. It's been logged.")

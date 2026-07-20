@@ -54,10 +54,10 @@ bot/
     ├── markov.py          makes text from recent channel messages
     ├── music.py           YouTube playback; SponsorBlock auto-skip
     ├── setup.py           setup wizard for server settings
+    ├── minecraft.py       /mcstatus: status + button/modal controls (Crafty Controller 4)
     ├── scheduler.py       not complete; see the file for design notes
     ├── counters.py        not complete; see the file for design notes
-    ├── leveling.py         not complete; see the file for design notes
-    └── minecraft.py        not complete; needs your Crafty4 API details
+    └── leveling.py         not complete; see the file for design notes
 ```
 
 **Settings system.** The bot stores all settings in the database. Examples
@@ -90,17 +90,20 @@ case history until the connection is available again.
 | 3 | logging_module, moderation | Done |
 | 4 | roles | Done |
 | 5 | quote, tag, bucket, witty, bored, markov | Done |
-| 6 | scheduler, counters, leveling, minecraft | Not complete - see the notes in each file |
+| 6 | scheduler, counters, leveling | Not complete - see the notes in each file |
 | 7 | Hybrid `/slash` commands, music (yt-dlp and SponsorBlock) | Done |
 | 8 | Antispam bulk-delete fix, role-based mute, `/setup` wizard, `/help` | Done |
+| 9 | Minecraft status via Crafty Controller 4 | Done |
+| 10 | `/mcstatus` button/modal control (start/stop/restart, console, whitelist), guild-restricted | Done |
 
-At this time, 103 automated tests exist for this bot, and all 103 tests
-pass. Run the tests with the command `pytest -q`. The tests check three
-parts of the bot: the detection logic in `automod.py`, `antispam.py`,
-`markov.py`, and `music.py` (this logic does not depend on Discord); the
-moderation and status commands (these tests use mock Discord objects and a
-temporary SQLite database file); and the data storage layer in `stores.py`
-(these tests also use a temporary SQLite database file).
+Automated tests exist for this bot, and all of them pass. Run the tests
+with the command `pytest -q`. The tests check three parts of the bot: the
+detection logic in `automod.py`, `antispam.py`, `markov.py`, and `music.py`
+(this logic does not depend on Discord); the moderation, status, and
+minecraft commands (these tests use mock Discord objects, and a temporary
+SQLite database file where a database is needed); and the data storage
+layer in `stores.py` (these tests also use a temporary SQLite database
+file).
 
 ## Commands
 
@@ -137,6 +140,7 @@ Kick Members, Ban Members, or Moderate Members.
 | `setboredchannel <channel>` **mod** | bored | Sets the channel for the nudge message after quiet time |
 | `markov` | markov | Makes new text from recent messages in the channel |
 | `play`, `skip`, `pause`, `resume`, `rewind`, `forward`, `stop`, `queue`, `nowplaying`, `leave` | music | Controls music playback. See "Music" |
+| `mcstatus [server]` | minecraft | Shows Minecraft server status; mods get Start/Stop/Restart/Console/Whitelist buttons. See "Minecraft (Crafty4)" |
 
 The anti-spam function, and part of the automod function, have no commands
 of their own. Anti-spam checks for message flooding. Automod checks for
@@ -446,16 +450,98 @@ without difficulty:
 - A `/remove <index>` command.
 - Full playlist-URL expansion.
 
+## Minecraft (Crafty4)
+
+Command: `/mcstatus [server]`. This is the only Minecraft-related slash
+command - deliberately kept to one entry in the `/` command list. Every
+other function (start/stop/restart, sending a console command, managing
+the whitelist) is reached through buttons and pop-up forms on this
+command's response, not through separate top-level commands. This talks
+to [Crafty Controller 4](https://gitlab.com/crafty-controller/crafty-4),
+the same panel this bot runs alongside on the TrueNAS system.
+
+**Setup.** This function needs two values in `.env`: `CRAFTY_BASE_URL`
+(however you reach Crafty's web UI) and `CRAFTY_API_TOKEN` (from Crafty's
+web UI: gear icon, then your user, then the pencil icon, then the API key
+tab). Without these values, `/mcstatus` gives a clear "not configured"
+reply. The API token also needs Crafty's own `COMMANDS` permission (a
+setting on the token itself, inside Crafty - separate from any Discord
+permission) on a server before the Start/Stop/Restart, Console, or
+Whitelist buttons can act on it. Without it, Crafty replies with its own
+"not authorized" error, not a bot crash.
+
+The bot finds servers on its own - it does not need a server ID from you.
+If your Crafty API token can see only one server, `/mcstatus` with no
+name shows that server's status and controls directly. If it can see more
+than one (the normal case for this setup, since Crafty here manages
+multiple modpack servers), `/mcstatus` with no name shows a list of every
+server as buttons instead - sorted by player count, then online before
+offline, then alphabetically by name - and clicking one switches to that
+server's status and controls, with a button back to the full list. Give a
+name to skip straight to one server - `/mcstatus ozone` matches any server
+whose name contains "ozone", case-insensitive. Set `CRAFTY_SERVER_ID` in
+`.env` instead if you would rather always default to one specific server
+without naming it each time.
+
+**Restricting `/mcstatus` to one server.** A single deployment of this bot
+normally only needs `/mcstatus` to work in one Discord server - the one
+where the bot owner actually manages the Minecraft servers. At the same
+time, someone who forks this repository to run their own copy should get
+`/mcstatus` working in whichever server they add their bot to, with no
+code changes. This is controlled with an optional `MINECRAFT_GUILD_ID`
+value in `.env`, falling back to the existing `GUILD_ID` value (already
+used for instant slash-command sync) if that is unset. With neither value
+set, `/mcstatus` is unrestricted - the fork-friendly default. No guild ID
+is hardcoded in the source; the restriction is configuration only.
+
+**Status view.** Available to anyone. Shows online or offline status, the
+player count, the version, and the world name, when Crafty provides these
+values - a missing value is left out, not shown as an error. This was
+confirmed against a real Crafty Controller 4 instance, not just its
+source code: Crafty represents "not set" for some fields (for example the
+version of a server that has never been started) as the literal string
+`"False"`, not a JSON `false` or empty value, and this function treats
+that the same as missing so the embed never shows a false "Version:
+False".
+
+**Start / Stop / Restart buttons.** Require Manage Server, re-checked on
+whoever actually clicks (the buttons stay on the message for anyone to
+see, not just whoever ran the command). Start is disabled if the server
+is already running; Stop and Restart are disabled if it is not. Clicking
+one calls Crafty's action API for that server and replies with a plain
+confirmation, or Crafty's own error message if the action fails. `Start`
+was confirmed working against a real, offline Crafty4-managed server:
+Crafty genuinely booted it. `Stop` and `Restart` use the same naming
+convention Crafty's own source uses internally, but were not
+independently confirmed the same way - if either name turns out to be
+wrong, Crafty rejects the request and the bot shows that as a plain error
+message rather than crashing.
+
+**Console button.** Requires Manage Server. Opens a pop-up form asking for
+one command, then sends it to that server's console as-is - this is real,
+arbitrary Minecraft console access (`/op`, `/ban`, `/stop`, anything),
+which is why it needs Manage Server rather than a lower permission. Since
+Minecraft console output is not a synchronous request/response, the bot
+waits briefly after sending the command, then shows the most recent
+console lines as a best-effort readout - not a guaranteed exact capture of
+that command's output. If the target server is not running, the bot says
+so plainly instead of a generic error.
+
+**Whitelist button.** Requires Manage Server. Opens a pop-up form asking
+for an action (`add`, `remove`, or `list`) and a player name, blank for
+`list`. Crafty Controller 4 has no whitelist API of its own, so this
+function sends the vanilla Minecraft `whitelist add`/`whitelist remove`/
+`whitelist list` console commands through the same mechanism the Console
+button uses - it only works while the target server is running.
+
 ## Roadmap and next steps
 
-- The Phase 6 modules (`scheduler.py`, `counters.py`, `leveling.py`,
-  `minecraft.py`) are not complete, with design notes in each file's
-  docstring. Each one needs one design decision before real development is
-  worthwhile.
-- `minecraft.py` specifically needs your Crafty4 Controller API details
-  (host, API token, server ID), or a decision to use the simpler
-  `mcstatus`-only route, before it can query your actual server. This is a
-  planned follow-up now that the bot runs alongside Crafty4 on the same
-  TrueNAS system.
+- The Phase 6 modules (`scheduler.py`, `counters.py`, `leveling.py`) are
+  not complete, with design notes in each file's docstring. Each one needs
+  one design decision before real development is worthwhile.
 - The music extras noted above (`/volume`, loop, `/shuffle`, and similar
   functions).
+- On-demand Minecraft server backups from Discord - Crafty Controller 4
+  has no API to trigger one, only to schedule recurring ones through its
+  own web UI, so this was left out rather than shipping a button that
+  cannot do what it implies.

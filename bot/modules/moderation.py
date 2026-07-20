@@ -37,17 +37,40 @@ MUTE_ROLE_OVERWRITE = discord.PermissionOverwrite(
 )
 MUTE_EXPIRY_CHECK_SECONDS = 60
 PERMANENT_DURATION_KEYWORDS = {"perm", "permanent", "indefinite", "forever"}
+# Past this, the honest word is "permanent" - it also keeps `utcnow() + delta`
+# safely inside datetime's representable range (max year 9999), which a
+# multi-thousand-year duration could otherwise overflow.
+MAX_MUTE_DURATION = datetime.timedelta(days=3650)
 
 
 def _duration_to_timedelta(duration: str) -> datetime.timedelta:
     """Parses simple durations like '10m', '2h', '1d'. Raises ValueError on
-    anything else so the command's error handler can report a clean message."""
+    anything else - a bad unit, a non-numeric amount, a zero/negative
+    amount, or a duration long enough to overflow - so the command's error
+    handler can report a clean message instead of crashing."""
+    if not duration:
+        raise ValueError("Give a duration like 10m, 2h, or 1d.")
     units = {"m": "minutes", "h": "hours", "d": "days"}
     unit = duration[-1].lower()
     if unit not in units:
         raise ValueError(f"Unknown duration unit '{unit}'. Use m/h/d, e.g. 10m, 2h, 1d.")
-    amount = int(duration[:-1])
-    return datetime.timedelta(**{units[unit]: amount})
+    amount_text = duration[:-1]
+    try:
+        amount = int(amount_text)
+    except ValueError:
+        raise ValueError(f"'{amount_text}' isn't a whole number. Use m/h/d, e.g. 10m, 2h, 1d.") from None
+    if amount <= 0:
+        raise ValueError("Duration must be a positive number, e.g. 10m, 2h, 1d.")
+    try:
+        delta = datetime.timedelta(**{units[unit]: amount})
+    except OverflowError:
+        raise ValueError("That duration is too long. Use 'perm' for an indefinite mute instead.") from None
+    if delta > MAX_MUTE_DURATION:
+        raise ValueError(
+            f"That duration is too long (max {MAX_MUTE_DURATION.days} days). "
+            "Use 'perm' for an indefinite mute instead."
+        )
+    return delta
 
 
 def is_permanent_duration(duration: Optional[str]) -> bool:
@@ -131,7 +154,8 @@ class Moderation(commands.Cog):
         reason: str,
     ) -> None:
         role = await self.ensure_mute_role(ctx.guild)
-        await member.add_roles(role, reason=f"Mute: {reason}")
+        if not await self._try_action(ctx, member, member.add_roles(role, reason=f"Mute: {reason}")):
+            return
         if delta is None:
             await self.bot.stores.mutes.clear(ctx.guild.id, member.id)
             case_id = await self.bot.stores.cases.add(
@@ -149,19 +173,39 @@ class Moderation(commands.Cog):
 
     # ---- commands ----
 
+    async def _try_action(self, ctx: commands.Context, member: discord.Member, action) -> bool:
+        """Runs a moderation action (kick/ban/timeout/add_roles/...) and
+        reports a clear message on discord.Forbidden - either a missing
+        permission bit, or (just as common) the bot's own role sitting
+        below the target's highest role - instead of crashing to the
+        generic error handler."""
+        try:
+            await action
+            return True
+        except discord.Forbidden:
+            await ctx.send(
+                f"I don't have permission to do that to {member}. Check that my role is "
+                "above their highest role, and that I have the permission for this action."
+            )
+            return False
+
     @commands.hybrid_command(name="kick")
+    @commands.guild_only()
     @commands.has_permissions(kick_members=True)
     @commands.bot_has_permissions(kick_members=True)
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
-        await member.kick(reason=reason)
+        if not await self._try_action(ctx, member, member.kick(reason=reason)):
+            return
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "kick", reason)
         await ctx.send(f"Kicked {member} (case #{case_id}): {reason}")
 
     @commands.hybrid_command(name="ban")
+    @commands.guild_only()
     @commands.has_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
     async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
-        await member.ban(reason=reason)
+        if not await self._try_action(ctx, member, member.ban(reason=reason)):
+            return
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "ban", reason)
         await ctx.send(f"Banned {member} (case #{case_id}): {reason}")
 
@@ -169,6 +213,7 @@ class Moderation(commands.Cog):
         name="mute",
         description="Mute a member - omit duration (or use 'perm') for indefinite",
     )
+    @commands.guild_only()
     @commands.has_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def mute(
@@ -193,17 +238,22 @@ class Moderation(commands.Cog):
             await self._mute_with_role(ctx, member, delta, reason)
             return
 
-        await member.timeout(discord.utils.utcnow() + delta, reason=reason)
+        if not await self._try_action(
+            ctx, member, member.timeout(discord.utils.utcnow() + delta, reason=reason)
+        ):
+            return
         case_id = await self.bot.stores.cases.add(
             ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} ({duration})"
         )
         await ctx.send(f"Muted {member} for {duration} (case #{case_id}): {reason}")
 
     @commands.hybrid_command(name="unmute")
+    @commands.guild_only()
     @commands.has_permissions(moderate_members=True)
     @commands.bot_has_permissions(moderate_members=True)
     async def unmute(self, ctx: commands.Context, member: discord.Member):
-        await member.timeout(None)
+        if not await self._try_action(ctx, member, member.timeout(None)):
+            return
         role = await self.get_mute_role(ctx.guild)
         if role is not None:
             try:
@@ -214,6 +264,7 @@ class Moderation(commands.Cog):
         await ctx.send(f"Unmuted {member}.")
 
     @commands.hybrid_command(name="warn")
+    @commands.guild_only()
     @commands.has_permissions(moderate_members=True)
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "warn", reason)
@@ -224,6 +275,7 @@ class Moderation(commands.Cog):
             pass  # DMs closed - the warning still exists in case history
 
     @commands.hybrid_command(name="cases")
+    @commands.guild_only()
     @commands.has_permissions(moderate_members=True)
     async def cases(self, ctx: commands.Context, member: discord.Member):
         rows = await self.bot.stores.cases.for_user(ctx.guild.id, member.id)
@@ -235,6 +287,7 @@ class Moderation(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="case")
+    @commands.guild_only()
     @commands.has_permissions(moderate_members=True)
     async def case(self, ctx: commands.Context, case_id: int):
         row = await self.bot.stores.cases.get(ctx.guild.id, case_id)
