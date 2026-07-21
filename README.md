@@ -192,8 +192,8 @@ their settings with the `setconfig` command or the `setup` wizard - see
 ## Local setup
 
 ```bash
-git clone <your-repo-url>
-cd discord-bot
+git clone https://github.com/SpacyRainbow/Discord-mod-bot.git
+cd Discord-mod-bot
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

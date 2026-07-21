@@ -8,6 +8,9 @@ from bot.modules.setup import (
     STEP_RAID,
     STEPS,
     SetupView,
+    _AutoRoleSelect,
+    _current_default,
+    _LogChannelSelect,
     _ResetButton,
     build_summary_lines,
     combined_status_color,
@@ -172,3 +175,70 @@ async def test_reset_button_does_not_touch_other_steps_keys(db):
     await button.callback(interaction)
 
     assert await bot_stores.config.get(GUILD, "spam.max_messages") == "99"  # untouched
+
+
+# ---- select menus pre-select the currently configured value ----
+
+
+@pytest.mark.asyncio
+async def test_current_default_is_empty_when_unset(db):
+    cog = _make_cog(db)
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+
+    assert await _current_default(view, "logging.channel") == []
+
+
+@pytest.mark.asyncio
+async def test_current_default_wraps_stored_id_as_an_object(db):
+    bot_stores = Stores(db)
+    await bot_stores.config.set(GUILD, "logging.channel", "555")
+    cog = _make_cog(db)
+    cog.bot.stores = bot_stores
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+
+    defaults = await _current_default(view, "logging.channel")
+
+    assert len(defaults) == 1
+    assert isinstance(defaults[0], discord.Object)
+    assert defaults[0].id == 555
+
+
+@pytest.mark.asyncio
+async def test_log_channel_select_preselects_the_configured_channel(db):
+    bot_stores = Stores(db)
+    await bot_stores.config.set(GUILD, "logging.channel", "555")
+    cog = _make_cog(db)
+    cog.bot.stores = bot_stores
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+
+    select = await _LogChannelSelect.create(view)
+
+    assert [obj.id for obj in select.default_values] == [555]
+
+
+@pytest.mark.asyncio
+async def test_log_channel_select_has_no_preselection_when_unset(db):
+    cog = _make_cog(db)
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+
+    select = await _LogChannelSelect.create(view)
+
+    assert list(select.default_values) == []
+
+
+@pytest.mark.asyncio
+async def test_autorole_select_preselects_the_configured_role(db):
+    bot_stores = Stores(db)
+    await bot_stores.config.set(GUILD, "roles.autorole", "777")
+    cog = _make_cog(db)
+    cog.bot.stores = bot_stores
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+
+    select = await _AutoRoleSelect.create(view)
+
+    assert [obj.id for obj in select.default_values] == [777]

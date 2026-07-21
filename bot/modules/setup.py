@@ -230,7 +230,7 @@ class SetupView(discord.ui.View):
         if step == STEP_GENERAL:
             self.add_item(_ModalButton("Edit prefix", lambda: _build_prefix_modal(self)))
         elif step == STEP_LOGGING:
-            self.add_item(_LogChannelSelect(self))
+            self.add_item(await _LogChannelSelect.create(self))
             self.add_item(await _ToggleButton.create(self, "logging.edits", "Log edits", True))
             self.add_item(await _ToggleButton.create(self, "logging.deletes", "Log deletes", True))
             self.add_item(await _ToggleButton.create(self, "logging.joins", "Log joins/leaves", True))
@@ -252,18 +252,18 @@ class SetupView(discord.ui.View):
             self.add_item(await _ToggleButton.create(self, "antinuke.enabled", "Anti-nuke enabled", False))
             self.add_item(_ModalButton("Edit anti-nuke thresholds", lambda: _build_antinuke_modal(self)))
         elif step == STEP_ROLES:
-            self.add_item(_AutoRoleSelect(self))
+            self.add_item(await _AutoRoleSelect.create(self))
         elif step == STEP_BORED:
-            self.add_item(_BoredChannelSelect(self))
+            self.add_item(await _BoredChannelSelect.create(self))
             self.add_item(_ModalButton("Edit bored settings", lambda: _build_bored_modal(self)))
         elif step == STEP_STARBOARD:
-            self.add_item(_StarboardChannelSelect(self))
+            self.add_item(await _StarboardChannelSelect.create(self))
             self.add_item(_ModalButton("Edit star threshold", lambda: _build_starboard_modal(self)))
         elif step == STEP_TICKETS:
-            self.add_item(_TicketCategorySelect(self))
+            self.add_item(await _TicketCategorySelect.create(self))
         elif step == STEP_GREETINGS:
-            self.add_item(_WelcomeChannelSelect(self))
-            self.add_item(_LeaveChannelSelect(self))
+            self.add_item(await _WelcomeChannelSelect.create(self))
+            self.add_item(await _LeaveChannelSelect.create(self))
             self.add_item(_ModalButton("Edit welcome/leave text", lambda: _build_greetings_modal(self)))
         elif step == STEP_MUSIC:
             self.add_item(
@@ -494,12 +494,29 @@ class _ModalButton(discord.ui.Button):
         await interaction.response.send_modal(modal)
 
 
+async def _current_default(view: SetupView, key: str) -> list:
+    """A select's default_values list for whatever is already stored at
+    key, or [] if unset - discord.Object resolves to the right type
+    (channel/role) automatically based on which select it's attached to,
+    so the same helper covers both ChannelSelect and RoleSelect."""
+    current_id = await view.cfg(key)
+    return [discord.Object(id=int(current_id))] if current_id else []
+
+
 class _LogChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, view: SetupView):
+    def __init__(self, view: SetupView, default_values: list):
         super().__init__(
-            placeholder="Log channel", channel_types=[discord.ChannelType.text], min_values=0, max_values=1
+            placeholder="Log channel",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=1,
+            default_values=default_values,
         )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_LogChannelSelect":
+        return cls(view, await _current_default(view, "logging.channel"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
@@ -510,9 +527,15 @@ class _LogChannelSelect(discord.ui.ChannelSelect):
 
 
 class _AutoRoleSelect(discord.ui.RoleSelect):
-    def __init__(self, view: SetupView):
-        super().__init__(placeholder="Auto-role on join", min_values=0, max_values=1)
+    def __init__(self, view: SetupView, default_values: list):
+        super().__init__(
+            placeholder="Auto-role on join", min_values=0, max_values=1, default_values=default_values
+        )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_AutoRoleSelect":
+        return cls(view, await _current_default(view, "roles.autorole"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
@@ -523,14 +546,19 @@ class _AutoRoleSelect(discord.ui.RoleSelect):
 
 
 class _BoredChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, view: SetupView):
+    def __init__(self, view: SetupView, default_values: list):
         super().__init__(
             placeholder="Bored-nudge channel",
             channel_types=[discord.ChannelType.text],
             min_values=0,
             max_values=1,
+            default_values=default_values,
         )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_BoredChannelSelect":
+        return cls(view, await _current_default(view, "bored.channel"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
@@ -541,14 +569,19 @@ class _BoredChannelSelect(discord.ui.ChannelSelect):
 
 
 class _StarboardChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, view: SetupView):
+    def __init__(self, view: SetupView, default_values: list):
         super().__init__(
             placeholder="Starboard channel",
             channel_types=[discord.ChannelType.text],
             min_values=0,
             max_values=1,
+            default_values=default_values,
         )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_StarboardChannelSelect":
+        return cls(view, await _current_default(view, "starboard.channel"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
@@ -559,14 +592,19 @@ class _StarboardChannelSelect(discord.ui.ChannelSelect):
 
 
 class _TicketCategorySelect(discord.ui.ChannelSelect):
-    def __init__(self, view: SetupView):
+    def __init__(self, view: SetupView, default_values: list):
         super().__init__(
             placeholder="Ticket channel category",
             channel_types=[discord.ChannelType.category],
             min_values=0,
             max_values=1,
+            default_values=default_values,
         )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_TicketCategorySelect":
+        return cls(view, await _current_default(view, "tickets.category_id"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
@@ -577,14 +615,19 @@ class _TicketCategorySelect(discord.ui.ChannelSelect):
 
 
 class _WelcomeChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, view: SetupView):
+    def __init__(self, view: SetupView, default_values: list):
         super().__init__(
             placeholder="Welcome message channel",
             channel_types=[discord.ChannelType.text],
             min_values=0,
             max_values=1,
+            default_values=default_values,
         )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_WelcomeChannelSelect":
+        return cls(view, await _current_default(view, "welcome.channel_id"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
@@ -595,14 +638,19 @@ class _WelcomeChannelSelect(discord.ui.ChannelSelect):
 
 
 class _LeaveChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, view: SetupView):
+    def __init__(self, view: SetupView, default_values: list):
         super().__init__(
             placeholder="Leave message channel",
             channel_types=[discord.ChannelType.text],
             min_values=0,
             max_values=1,
+            default_values=default_values,
         )
         self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_LeaveChannelSelect":
+        return cls(view, await _current_default(view, "leave.channel_id"))
 
     async def callback(self, interaction: discord.Interaction):
         if self.values:
