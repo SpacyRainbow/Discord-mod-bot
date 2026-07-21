@@ -12,6 +12,12 @@ import discord
 from discord.ext import commands
 
 GITHUB_URL = "https://github.com/SpacyRainbow/Discord-mod-bot"
+# Bumped by hand when shipping a meaningful set of changes - there's no
+# packaging/release process here to derive this from automatically, and the
+# Docker image only copies bot/, not .git, so a git-log-based date wouldn't
+# work in production anyway.
+VERSION = "1.0.0"
+LAST_UPDATED = "2026-07-20"
 
 
 class Status(commands.Cog):
@@ -35,6 +41,8 @@ class Status(commands.Cog):
     @commands.hybrid_command(name="about")
     async def about(self, ctx: commands.Context):
         embed = discord.Embed(title="Bot status")
+        embed.add_field(name="Version", value=VERSION)
+        embed.add_field(name="Last updated", value=LAST_UPDATED)
         embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms")
         embed.add_field(name="Database", value="connected" if self.bot.db.available else "degraded (no DB)")
         embed.add_field(name="Modules loaded", value=str(len(self.bot.cogs)), inline=False)

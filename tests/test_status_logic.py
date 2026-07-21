@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from bot.modules.status import Status
+from bot.modules.status import LAST_UPDATED, VERSION, Status
 from bot.stores import Stores
 
 GUILD = 111
@@ -55,6 +55,22 @@ async def test_getconfig_reports_a_set_value(db):
 
     ctx.send.assert_awaited_once()
     assert "7" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_about_shows_version_and_last_updated(db):
+    bot = _make_bot(db)
+    bot.latency = 0.01
+    bot.db.available = True
+    cog = Status(bot)
+    ctx = _make_ctx()
+
+    await Status.about.callback(cog, ctx)
+
+    ctx.send.assert_awaited_once()
+    embed = ctx.send.await_args.kwargs["embed"]
+    assert any(field.name == "Version" and field.value == VERSION for field in embed.fields)
+    assert any(field.name == "Last updated" and field.value == LAST_UPDATED for field in embed.fields)
 
 
 @pytest.mark.asyncio

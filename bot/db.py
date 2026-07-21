@@ -92,6 +92,74 @@ CREATE TABLE IF NOT EXISTS mute_expirations (
     expires_at TEXT NOT NULL,
     PRIMARY KEY (guild_id, user_id)
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    run_at TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS channel_locks (
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    previous_send_messages TEXT NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS starboard_posts (
+    guild_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    starboard_message_id INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS giveaways (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER,
+    prize TEXT NOT NULL,
+    winner_count INTEGER NOT NULL,
+    host_id INTEGER NOT NULL,
+    end_at TEXT NOT NULL,
+    ended INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS giveaway_entries (
+    giveaway_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (giveaway_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS polls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER,
+    question TEXT NOT NULL,
+    options TEXT NOT NULL,
+    end_at TEXT,
+    closed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS poll_votes (
+    poll_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    option_index INTEGER NOT NULL,
+    PRIMARY KEY (poll_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS tickets (
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    opener_id INTEGER NOT NULL,
+    opened_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    PRIMARY KEY (guild_id, channel_id)
+);
 """
 
 

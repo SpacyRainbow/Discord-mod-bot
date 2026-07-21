@@ -8,11 +8,20 @@ The bot has these functions:
 
 - Anti-spam control, based on member behavior.
 - Automod, based on message content.
-- Moderation commands, with a case history.
+- Moderation commands, with a case history: kick, ban (with an optional
+  temp-ban duration), unban, mute, warn, purge, slowmode, and lockdown.
+- Raid protection: a minimum account-age gate, join-burst detection, and a
+  manual raid-mode toggle.
+- Anti-nuke: detects one member mass-deleting channels/roles or
+  mass-banning members, and strips their dangerous permissions.
 - Role management.
+- A starboard, giveaways, polls, a ticket system, and welcome/leave
+  messages.
+- Reminders and other scheduled, one-off tasks.
 - Music playback from YouTube and other sources.
 - Personality functions: quotes, tags, buckets, witty replies, a bored
   detector, and a text generator.
+- Minecraft server status and control, through Crafty Controller 4.
 
 This project replaces [Sweetie Bot](https://github.com/ErikMcClure/sweetiebot).
 Sweetie Bot was a bot written in the Go language. The developer archived the
@@ -39,12 +48,16 @@ bot/
 │                       connection; handles errors; syncs slash commands
 ├── db.py               database connection and schema
 ├── stores.py           one data-access class for each database table
+├── durations.py         shared "10m"/"2h"/"1d" duration parsing
 └── modules/
     ├── status.py        ping, uptime, about, help, setconfig, getconfig
     ├── automod.py        word filter, invite block, capital-letter check
     ├── antispam.py        message flooding, repeated messages, mass mentions
-    ├── moderation.py      kick, ban, mute, warn, case history, Mute role
+    ├── moderation.py      kick, ban/tempban, unban, mute, warn, purge,
+    │                       slowmode, lockdown, case history, Mute role
     ├── logging_module.py  message edit/delete logs, join/leave logs, mod log
+    ├── raid.py            join-age gate, join-burst detection, /raidmode
+    ├── antinuke.py        mass channel/role-delete or ban-burst detection
     ├── roles.py           self-assign roles, reaction roles, auto-role
     ├── quote.py           save and show quotes
     ├── tag.py             custom text commands
@@ -55,7 +68,12 @@ bot/
     ├── music.py           YouTube playback; SponsorBlock auto-skip
     ├── setup.py           setup wizard for server settings
     ├── minecraft.py       /mcstatus: status + button/modal controls (Crafty Controller 4)
-    ├── scheduler.py       not complete; see the file for design notes
+    ├── scheduler.py       generic "run this later" engine; /remind
+    ├── starboard.py       star-reaction board
+    ├── giveaway.py        /giveaway start/end/reroll
+    ├── poll.py            /poll with button voting
+    ├── tickets.py         /ticketpanel support-ticket channels
+    ├── greetings.py       welcome/leave messages
     ├── counters.py        not complete; see the file for design notes
     └── leveling.py         not complete; see the file for design notes
 ```
@@ -90,20 +108,27 @@ case history until the connection is available again.
 | 3 | logging_module, moderation | Done |
 | 4 | roles | Done |
 | 5 | quote, tag, bucket, witty, bored, markov | Done |
-| 6 | scheduler, counters, leveling | Not complete - see the notes in each file |
+| 6 | counters, leveling | Not complete - see the notes in each file (scheduler is now done - see Phase 15) |
 | 7 | Hybrid `/slash` commands, music (yt-dlp and SponsorBlock) | Done |
 | 8 | Antispam bulk-delete fix, role-based mute, `/setup` wizard, `/help` | Done |
 | 9 | Minecraft status via Crafty Controller 4 | Done |
 | 10 | `/mcstatus` button/modal control (start/stop/restart, console, whitelist), guild-restricted | Done |
+| 11 | Purge, tempban, unban, slowmode, lockdown, case edit/delete | Done |
+| 12 | Raid protection (account-age gate, join-burst detection, `/raidmode`) | Done |
+| 13 | Anti-nuke (mass channel/role-delete or ban-burst detection) | Done |
+| 14 | Starboard, giveaways, polls, tickets, welcome/leave messages | Done |
+| 15 | Scheduler engine and `/remind` (the rest of Phase 6 - `counters`, `leveling` - is still not complete) | Done |
+| 16 | Music volume, loop, and a dedicated `/shuffle` command | Done |
 
 Automated tests exist for this bot, and all of them pass. Run the tests
 with the command `pytest -q`. The tests check three parts of the bot: the
 detection logic in `automod.py`, `antispam.py`, `markov.py`, and `music.py`
-(this logic does not depend on Discord); the moderation, status, and
-minecraft commands (these tests use mock Discord objects, and a temporary
-SQLite database file where a database is needed); and the data storage
-layer in `stores.py` (these tests also use a temporary SQLite database
-file).
+(this logic does not depend on Discord); the moderation, status,
+minecraft, raid, anti-nuke, starboard, giveaway, poll, ticket, greetings,
+and scheduler commands (these tests use mock Discord objects, and a
+temporary SQLite database file where a database is needed); and the data
+storage layer in `stores.py` (these tests also use a temporary SQLite
+database file).
 
 ## Commands
 
@@ -122,12 +147,19 @@ Kick Members, Ban Members, or Moderate Members.
 | `setup` **mod** | setup | Starts the setup wizard. You can run this command again at any time. See "Setup wizard" |
 | `filter add/remove/list` **mod** | automod | Adds, removes, or shows words in the banned-word list |
 | `kick <member> [reason]` **mod** | moderation | Removes a member from the server; adds a case history record |
-| `ban <member> [reason]` **mod** | moderation | Bans a member from the server; adds a case history record |
+| `ban <member> [duration] [reason]` **mod** | moderation | Bans a member; give a duration (e.g. `7d`) for a temp-ban, or omit it for permanent |
+| `unban <user> [reason]` **mod** | moderation | Lifts a ban; adds a case history record |
 | `mute <member> [duration] [reason]` **mod** | moderation | Mutes a member. See "Moderation" for the duration rules |
 | `unmute <member>` **mod** | moderation | Removes a mute: the timeout, the Mute role, and any scheduled end time |
 | `warn <member> [reason]` **mod** | moderation | Sends a warning; sends a direct message; adds a case history record |
 | `cases <member>` **mod** | moderation | Shows the case history for a member |
 | `case <id>` **mod** | moderation | Shows one case by its ID |
+| `editcase <id> <reason>` **mod** | moderation | Changes a case's recorded reason |
+| `deletecase <id>` **mod** | moderation | Deletes a case from the history |
+| `purge <amount> [member]` **mod** | moderation | Deletes the last 1-100 messages in the channel, optionally only one member's |
+| `slowmode <seconds> [channel]` **mod** | moderation | Sets a channel's slowmode delay, 0-21600 seconds |
+| `lockdown [channel]` **mod** | moderation | Toggles blocking @everyone from sending messages in a channel |
+| `raidmode <on\|off>` **mod** | raid | Toggles a temporary verification-level lockdown |
 | `setlogchannel <channel>` **mod** | logging_module | Sets the channel for edit, delete, join, leave, and mod-log messages |
 | `setautorole <role>` **mod** | roles | Sets the role that the bot gives automatically on join |
 | `allowrole`/`disallowrole <role>` **mod** | roles | Adds or removes a role from the self-assign list |
@@ -140,7 +172,16 @@ Kick Members, Ban Members, or Moderate Members.
 | `setboredchannel <channel>` **mod** | bored | Sets the channel for the nudge message after quiet time |
 | `markov` | markov | Makes new text from recent messages in the channel |
 | `play`, `skip`, `pause`, `resume`, `rewind`, `forward`, `stop`, `queue`, `nowplaying`, `leave` | music | Controls music playback. See "Music" |
+| `volume <0-200>` | music | Sets playback volume as a percent |
+| `loop <off\|track\|queue>` | music | Repeats the current track, the whole queue, or neither |
+| `shuffle` | music | Shuffles the current queue |
 | `mcstatus [server]` | minecraft | Shows Minecraft server status; mods get Start/Stop/Restart/Console/Whitelist buttons. See "Minecraft (Crafty4)" |
+| `remind <duration> <text>` | scheduler | DMs you a reminder after a delay, e.g. `10m`, `2h`, `1d` |
+| `setstarboard <channel> [threshold]` **mod** | starboard | Sets the starboard channel and the star count needed to post, default 3 |
+| `giveaway start/end/reroll` **mod** | giveaway | Starts, ends early, or rerolls the winner of a giveaway. See "Giveaways" |
+| `poll <question> <option1> <option2> ... [duration]` | poll | Starts a button-voted poll with 2-5 options. See "Polls" |
+| `pollclose <message_id>` **mod** | poll | Closes a poll early |
+| `ticketpanel [message]` **mod** | tickets | Posts a button members click to open a support ticket. See "Tickets" |
 
 The anti-spam function, and part of the automod function, have no commands
 of their own. Anti-spam checks for message flooding. Automod checks for
@@ -249,12 +290,27 @@ to one server only. If a key has no stored value, the bot uses the default.
 | `bored.idle_seconds` | 1800 | The length of silence, in seconds, before the nudge |
 | `bored.message` | generic nudge | The message the bot sends for the nudge |
 | `music.sponsorblock_enabled` | true | If true, uses SponsorBlock data to skip non-music segments |
+| `raid.min_account_age_hours` | 0 (off) | Kicks a new member if their account is younger than this |
+| `raid.join_threshold` | 0 (off) | Joins within `raid.join_window_seconds` that count as a raid burst |
+| `raid.join_window_seconds` | 30 | The rolling window size for join-burst detection |
+| `raid.auto_lockdown` | false | If true, a detected join burst raises the verification level automatically |
+| `antinuke.enabled` | false | Turns on anti-nuke detection. Off by default - see "Anti-nuke" |
+| `antinuke.action_threshold` | 3 | Destructive actions (channel/role delete, ban) within the window before punishing |
+| `antinuke.window_seconds` | 30 | The rolling window size for anti-nuke detection |
+| `starboard.channel` | unset | The channel starred messages are posted to |
+| `starboard.threshold` | 3 | The number of stars needed before a message is posted |
+| `tickets.category_id` | unset | The category new ticket channels are created under |
+| `welcome.channel_id` | unset | The channel welcome messages are posted to |
+| `welcome.message` | generic welcome | The welcome message template - see "Welcome and leave messages" |
+| `leave.channel_id` | unset | The channel leave messages are posted to |
+| `leave.message` | generic leave message | The leave message template |
 
 Some settings have their own command: `setlogchannel`, `setautorole`,
-`setboredchannel`, and `filter add`. You can change every other setting
-with `setconfig <key> <value>` and `getconfig <key>` (both mod-only). The
-`/setup` wizard shows and changes all settings, in a guided series of
-steps, and is the easiest way to configure a server. See the next section.
+`setboredchannel`, `setstarboard`, and `filter add`. You can change every
+other setting with `setconfig <key> <value>` and `getconfig <key>` (both
+mod-only). The `/setup` wizard shows and changes all settings, in a
+guided series of steps, and is the easiest way to configure a server. See
+the next section.
 
 ## Setup wizard (`/setup`)
 
@@ -276,15 +332,37 @@ the buttons and menus no longer work.
 
 | Step | Title | Content | Setting keys |
 |---|---|---|---|
-| 1/9 | General | A button, "Edit prefix", opens a form with one field: the command prefix | `commandprefix` |
-| 2/9 | Logging | A menu selects the log channel. Three on/off buttons: "Log edits", "Log deletes", "Log joins/leaves" | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
-| 3/9 | Moderation | No button or menu. The bot creates the Mute role if it does not exist, or confirms the role if it does, and shows its name. Run `/setup` again to re-apply the role's channel permissions everywhere, for example after adding a new channel | `moderation.mute_role` |
-| 4/9 | Anti-spam | A button, "Edit thresholds", opens a form with 5 fields: max messages per window, window length, max duplicate messages, max mentions, and timeout duration. All five must be whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
-| 5/9 | Automod | An on/off button, "Block invites". A separate button, "Edit caps thresholds", opens a form with 2 fields: the caps percent threshold, and the minimum message length for the caps check. This step does not include the banned-word list - that list is a set of words, not one value, and is managed instead with `filter add`, `filter remove`, and `filter` (list) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
-| 6/9 | Roles | A menu selects the auto-role for new members | `roles.autorole` |
-| 7/9 | Bored detector | A menu selects the nudge channel. A button, "Edit bored settings", opens a form with 2 fields: idle seconds before the nudge, and the nudge message | `bored.channel`, `bored.idle_seconds`, `bored.message` |
-| 8/9 | Music | An on/off button, "SponsorBlock auto-skip" | `music.sponsorblock_enabled` |
-| 9/9 | Summary | A read-only summary of every setting above, its current value or default, and one line for Spotify that shows only "Configured" or "Not configured" - this step never shows or accepts the real Spotify credentials | None - display only |
+| 1/14 | General | A button, "Edit prefix", opens a form with one field: the command prefix | `commandprefix` |
+| 2/14 | Logging | A menu selects the log channel. Three on/off buttons: "Log edits", "Log deletes", "Log joins/leaves" | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
+| 3/14 | Moderation | No button or menu. The bot creates the Mute role if it does not exist, or confirms the role if it does, and shows its name. Run `/setup` again to re-apply the role's channel permissions everywhere, for example after adding a new channel | `moderation.mute_role` |
+| 4/14 | Anti-spam | A button, "Edit thresholds", opens a form with 5 fields: max messages per window, window length, max duplicate messages, max mentions, and timeout duration. All five must be whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
+| 5/14 | Automod | An on/off button, "Block invites". A separate button, "Edit caps thresholds", opens a form with 2 fields: the caps percent threshold, and the minimum message length for the caps check. This step does not include the banned-word list - that list is a set of words, not one value, and is managed instead with `filter add`, `filter remove`, and `filter` (list) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
+| 6/14 | Raid protection | An on/off button, "Auto-lockdown on burst". A button, "Edit raid thresholds", opens a form with 3 fields: minimum account age in hours, join burst size, and the burst window in seconds. Both checks are 0 (off) by default | `raid.min_account_age_hours`, `raid.join_threshold`, `raid.join_window_seconds`, `raid.auto_lockdown` |
+| 7/14 | Anti-nuke | An on/off button, "Anti-nuke enabled" (off by default). A button, "Edit anti-nuke thresholds", opens a form with 2 fields: the number of destructive actions before punishing, and the window in seconds | `antinuke.enabled`, `antinuke.action_threshold`, `antinuke.window_seconds` |
+| 8/14 | Roles | A menu selects the auto-role for new members | `roles.autorole` |
+| 9/14 | Bored detector | A menu selects the nudge channel. A button, "Edit bored settings", opens a form with 2 fields: idle seconds before the nudge, and the nudge message | `bored.channel`, `bored.idle_seconds`, `bored.message` |
+| 10/14 | Starboard | A menu selects the starboard channel. A button, "Edit star threshold", opens a form with one field: the number of stars needed to post | `starboard.channel`, `starboard.threshold` |
+| 11/14 | Tickets | A menu selects the category new ticket channels are created under | `tickets.category_id` |
+| 12/14 | Welcome/leave messages | Two menus select the welcome channel and the leave channel. A button, "Edit welcome/leave text", opens a form with 2 fields: the welcome message template and the leave message template | `welcome.channel_id`, `welcome.message`, `leave.channel_id`, `leave.message` |
+| 13/14 | Music | An on/off button, "SponsorBlock auto-skip" | `music.sponsorblock_enabled` |
+| 14/14 | Summary | A read-only summary of every setting above, its current value or default, and one line for Spotify that shows only "Configured" or "Not configured" - this step never shows or accepts the real Spotify credentials | None - display only |
+
+**Clear on/off status, and a default always shown.** Every setting that
+can genuinely be turned on or off - block invites, both raid checks,
+anti-lockdown, anti-nuke, autorole, the bored/starboard/welcome/leave
+channels, SponsorBlock - shows as a plain-language 🟢 Enabled / 🔴 Disabled
+line, not a raw `true`/`false`. Each step's embed color follows the same
+rule: green if everything in that step is on, red if everything is off,
+and blurple (the bot's neutral color) if the step has no on/off setting
+at all, or a mix of both. Every numeric field also always shows what it
+would reset to - `45 (default: 30)` if you've changed it, `30 (default)`
+if you haven't - both in the step's embed and in the modal's field
+labels, so you never have to leave the wizard to check what "normal" is.
+
+**Reset to defaults.** Every step except Moderation and the Summary has
+its own "Reset to defaults" button, restoring only that step's settings -
+a channel setting resets to unset (not a placeholder channel), everything
+else resets to its literal default value.
 
 **Why Spotify is never an editable field here.** `SPOTIFY_CLIENT_ID` and
 `SPOTIFY_CLIENT_SECRET` are secret values that apply to the whole bot, on
@@ -352,10 +430,144 @@ The `unmute` command always clears every method at the same time: the
 timeout, the Mute role, and any scheduled end time. A moderator does not
 need to know which method was active.
 
+**Temp-ban.** Give `ban` a duration, for example `/ban @user 7d spamming`,
+for a temporary ban. The bot schedules an automatic unban through the same
+scheduler engine `/remind` uses (see "Scheduler and reminders"). Omit the
+duration for a normal, permanent ban. If the duration is not understood,
+the ban still happens - the bot just reports that it is permanent, rather
+than silently discarding the ban. `unban` lifts a ban early, or lifts one
+that was never temporary, and works with a user ID or a `@mention` even
+for someone who already left - it does not need a current member. Known
+limitation: re-banning someone who already has a pending temp-ban
+schedules a second, independent auto-unban rather than replacing the
+first - rare in practice, but worth knowing about.
+
+**Purge.** `/purge <amount> [member]` deletes the last 1-100 messages in
+the channel. Give a member to delete only that member's messages within
+that same range, instead of every message. This uses Discord's bulk-delete
+API, the same one anti-spam's automatic cleanup uses - it deletes messages
+older than 14 days one at a time instead, automatically.
+
+**Slowmode and lockdown.** `/slowmode <seconds> [channel]` sets a
+channel's slowmode delay directly, 0 to turn it off. `/lockdown [channel]`
+is a toggle: the first use blocks @everyone from sending messages in that
+channel, remembering whatever the permission was set to before; using it
+again restores that exact previous value, rather than always turning
+sending back on (a channel that was already restricted to certain roles
+goes back to being restricted to those roles, not thrown open to
+everyone).
+
+**Editing case history.** `/editcase <id> <reason>` changes a case's
+recorded reason - useful for correcting a typo, or adding detail after the
+fact. `/deletecase <id>` removes a case from the history entirely.
+
+## Raid protection
+
+Two automatic checks, both off by default (this bot's usual "fork-friendly,
+does nothing until configured" default), plus one manual command:
+
+- **Minimum account age** (`raid.min_account_age_hours`): if set above 0,
+  a new member whose account is younger than this many hours is kicked
+  automatically, with a note in the mod-log channel.
+- **Join-burst detection** (`raid.join_threshold` /
+  `raid.join_window_seconds`): if this many members join within the
+  window, the bot posts an alert to the mod-log channel. If
+  `raid.auto_lockdown` is also true, the bot raises the server's
+  verification level to the maximum automatically, on top of the alert.
+- **`/raidmode <on|off>`**: raises or restores the verification level by
+  hand, at any time, independent of the automatic checks above. `off`
+  restores whatever level was active before `on` was used.
+
+## Anti-nuke
+
+Watches for one member deleting channels, deleting roles, or banning
+members in a fast burst - the signature of a compromised
+moderator/administrator account doing deliberate damage, not an
+individual mistake. **Off by default** (`antinuke.enabled`) - this is the
+one function in this bot that automatically strips a real staff member's
+permissions, so it needs a deliberate opt-in rather than acting out of the
+box.
+
+When one non-owner member exceeds `antinuke.action_threshold` such
+actions within `antinuke.window_seconds`, the bot removes every role from
+that member that grants Ban Members, Kick Members, Manage Channels,
+Manage Roles, or Manage Guild, and posts an alert to the mod-log channel.
+The server owner is never a target. Attribution comes from Discord's own
+audit log, so this needs the bot's View Audit Log permission - without
+it, an event simply is not counted, rather than guessed at.
+
+This function is deliberately narrow: only channel deletes, role deletes,
+and bans are watched. Deleting messages, including through this bot's own
+`/purge`, is never counted, so a moderator doing ordinary cleanup is never
+mistaken for an attack.
+
+## Starboard
+
+`/setstarboard <channel> [threshold]` sets the channel and the star count
+needed (default 3). Any message that collects enough
+:star: reactions gets reposted there, with a jump link back to the
+original. A message's own author starring their own message never counts
+towards the threshold. Reactions inside the starboard channel itself are
+ignored. Once a message is posted to the starboard, it stays there even if
+the star count later drops - only the displayed count changes.
+
+## Giveaways
+
+`/giveaway start <duration> <winners> <prize>` posts a giveaway with an
+Enter button - clicking it again leaves the giveaway, rather than needing
+a separate command to back out. The giveaway ends automatically when the
+duration passes, picking winners at random from everyone entered, and
+announces them in the channel. `/giveaway end <message_id>` ends one
+early; `/giveaway reroll <message_id>` picks a new winner for one that
+already ended. The Enter button keeps working even across a bot restart.
+
+## Polls
+
+`/poll <question> <option1> <option2> [option3] [option4] [option5]
+[duration]` posts a poll with one button per option (2 to 5 of them).
+Each member gets one vote: clicking a different option switches it,
+clicking your current one retracts it. Give a duration (e.g. `1h`) for
+the poll to close itself automatically; without one, it stays open until
+a moderator uses `/pollclose <message_id>`. Poll buttons also keep working
+across a bot restart.
+
+## Tickets
+
+`/ticketpanel [message]` posts a button members can click to open a
+private support ticket. Clicking it creates a new text channel visible
+only to that member and anyone with Manage Guild, with its own Close
+button inside. A member can only have one ticket open at a time - opening
+a second one just points back at the existing channel. Set
+`tickets.category_id` to have new ticket channels created under a specific
+category; without it, they're created at the top level.
+
+## Welcome and leave messages
+
+No dedicated commands - these use the same `setconfig`/`getconfig`
+escape hatch as any other setting (see "Settings reference"), since it's
+just a channel and a text template each. Set `welcome.channel_id` and
+`leave.channel_id` to turn these on; set `welcome.message` and
+`leave.message` to customize the text. Every template accepts these
+placeholders: `{member}` (a mention), `{member_name}` (the plain name),
+`{server}` (the server name), and `{member_count}`.
+
+## Scheduler and reminders
+
+`scheduler.py` is a generic "run this at a specific time" engine, shared
+by every feature in this bot that needs to do something later: temp-ban
+auto-unbans, giveaway endings, poll auto-closes, and the `/remind`
+command below. It survives a bot restart - anything scheduled while the
+bot was down still runs, on the next check after it starts back up.
+
+`/remind <duration> <text>` DMs you a reminder after the given delay
+(e.g. `10m`, `2h`, `1d`) - falls back to a mention in the channel you sent
+it from if your DMs are closed. Works in a DM with the bot too, not only
+in a server.
+
 ## Music
 
 Commands: `play`, `skip`, `pause`, `resume`, `rewind`, `forward`, `stop`,
-`queue`, `nowplaying`, `leave`.
+`queue`, `nowplaying`, `leave`, `volume`, `loop`, `shuffle`.
 
 The bot plays audio from a search term or a link, found through the
 program `yt-dlp`. Each server has one queue and one voice connection. When
@@ -442,11 +654,17 @@ channel. The bot leaves the voice channel on its own in two cases: after
 about 2 minutes with no activity, or immediately once every member has
 left.
 
+**Volume, loop, and shuffle.** `/volume <0-200>` sets playback volume as a
+percent, applied live to whatever is currently playing and remembered for
+whatever plays next. `/loop <off|track|queue>` repeats the current track,
+repeats the whole queue, or does neither - an explicit `/skip` (or the
+Skip button) always moves on regardless of the loop mode, since a
+deliberate skip should never be undone by looping. `/shuffle` is the same
+shuffle the Shuffle button already does, as its own command.
+
 **Future work.** These functions do not exist yet. The team could add them
 without difficulty:
 
-- A `/volume` command.
-- A loop function, for one track or for the whole queue.
 - A `/remove <index>` command.
 - Full playlist-URL expansion.
 
@@ -536,12 +754,13 @@ button uses - it only works while the target server is running.
 
 ## Roadmap and next steps
 
-- The Phase 6 modules (`scheduler.py`, `counters.py`, `leveling.py`) are
-  not complete, with design notes in each file's docstring. Each one needs
-  one design decision before real development is worthwhile.
-- The music extras noted above (`/volume`, loop, `/shuffle`, and similar
-  functions).
+- `counters.py` and `leveling.py` are not complete, with design notes in
+  each file's docstring. Each one needs one design decision before real
+  development is worthwhile. (`scheduler.py`, the third original Phase 6
+  module, is now done - see "Scheduler and reminders".)
 - On-demand Minecraft server backups from Discord - Crafty Controller 4
   has no API to trigger one, only to schedule recurring ones through its
   own web UI, so this was left out rather than shipping a button that
   cannot do what it implies.
+- A `/remove <index>` command for the music queue, and full playlist-URL
+  expansion (see "Music").

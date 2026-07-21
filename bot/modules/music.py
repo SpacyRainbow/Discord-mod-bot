@@ -225,6 +225,17 @@ class GuildMusicState:
         self.view: Optional["MusicControlView"] = None
         self.last_requester_id: Optional[int] = None
         self.ping_last_requester: bool = True
+        # Applied to new/resumed sources via _make_source; live-adjustable
+        # mid-track through voice_client.source (a PCMVolumeTransformer)
+        # since that doesn't require restarting playback.
+        self.volume: float = 1.0
+        # "off"/"track"/"queue" - see _advance()'s handling.
+        self.loop_mode: str = "off"
+        # Set by an explicit /skip (or the Skip button) right before
+        # .stop(), so _advance can tell "this track really finished" apart
+        # from "a mod skipped it" - loop mode re-queues on the former, not
+        # the latter (an explicit skip should always move on).
+        self.skip_requested: bool = False
 
     def position(self) -> float:
         if self.play_started_at is None:
@@ -308,6 +319,7 @@ class MusicControlView(discord.ui.View):
         if state.current is None:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
+        state.skip_requested = True
         state.voice_client.stop()
         await interaction.response.send_message("Skipped.", ephemeral=True)
 
@@ -708,6 +720,7 @@ class Music(commands.Cog):
             asyncio.run_coroutine_threadsafe(self._advance(state), self.bot.loop)
 
         source = self._make_source(track, seek_seconds)
+        source.volume = state.volume
         state.voice_client.play(source, after=after_play)
 
         if announce:
@@ -724,6 +737,15 @@ class Music(commands.Cog):
         return True
 
     async def _advance(self, state: GuildMusicState) -> None:
+        finished_track = state.current
+        skip_requested = state.skip_requested
+        state.skip_requested = False
+        if finished_track is not None and not skip_requested:
+            if state.loop_mode == "track":
+                state.queue.appendleft(finished_track)
+            elif state.loop_mode == "queue":
+                state.queue.append(finished_track)
+
         while state.queue:
             next_track = state.queue.popleft()
             if await self._ensure_and_play(state, next_track):
@@ -968,8 +990,59 @@ class Music(commands.Cog):
         if state.current is None:
             await ctx.send("Nothing is playing.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS)
             return
+        state.skip_requested = True
         state.voice_client.stop()
         await ctx.send("Skipped.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS)
+
+    @commands.hybrid_command(name="shuffle", description="Shuffle the current queue")
+    @commands.guild_only()
+    async def shuffle_cmd(self, ctx: commands.Context):
+        if not await self._require_shared_voice(ctx):
+            return
+        state = self._state(ctx.guild.id)
+        if len(state.queue) < 2:
+            await ctx.send(
+                "Not enough songs queued to shuffle.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS
+            )
+            return
+        shuffled = list(state.queue)
+        random.shuffle(shuffled)
+        state.queue = deque(shuffled)
+        await ctx.send(f"Queue shuffled.\n{self._format_queue_listing(state)}", ephemeral=True)
+
+    @commands.hybrid_command(name="volume", description="Set playback volume, 0-200% (default 100)")
+    @commands.guild_only()
+    async def volume(self, ctx: commands.Context, percent: int):
+        if not await self._require_shared_voice(ctx):
+            return
+        if not 0 <= percent <= 200:
+            await ctx.send(
+                "Give a value between 0 and 200.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS
+            )
+            return
+        state = self._state(ctx.guild.id)
+        state.volume = percent / 100
+        source = state.voice_client.source if state.voice_client is not None else None
+        if isinstance(source, discord.PCMVolumeTransformer):
+            source.volume = state.volume
+        await ctx.send(f"Volume set to {percent}%.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS)
+
+    @commands.hybrid_command(
+        name="loop", description="Set loop mode: off, track (repeat current), or queue (repeat all)"
+    )
+    @commands.guild_only()
+    async def loop_cmd(self, ctx: commands.Context, mode: str):
+        if not await self._require_shared_voice(ctx):
+            return
+        mode = mode.strip().lower()
+        if mode not in ("off", "track", "queue"):
+            await ctx.send(
+                "Give `off`, `track`, or `queue`.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS
+            )
+            return
+        state = self._state(ctx.guild.id)
+        state.loop_mode = mode
+        await ctx.send(f"Loop mode: {mode}.", ephemeral=True, delete_after=TRANSIENT_MESSAGE_SECONDS)
 
     @commands.hybrid_command(name="rewind", description="Rewind 10 seconds")
     @commands.guild_only()

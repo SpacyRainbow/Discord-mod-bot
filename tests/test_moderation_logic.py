@@ -15,6 +15,7 @@ def _make_bot(db):
     bot.stores = Stores(db)
     bot.wait_until_ready = AsyncMock()
     bot.get_guild = MagicMock(return_value=None)
+    bot.scheduler_handlers = {}
     return bot
 
 
@@ -45,7 +46,19 @@ def _make_ctx(guild=None):
     ctx.guild = guild or _make_guild()
     ctx.author.id = 1
     ctx.send = AsyncMock()
+    ctx.defer = AsyncMock()
     return ctx
+
+
+def _make_channel(channel_id=555):
+    channel = MagicMock()
+    channel.id = channel_id
+    channel.mention = f"#channel-{channel_id}"
+    channel.edit = AsyncMock()
+    channel.set_permissions = AsyncMock()
+    channel.purge = AsyncMock(return_value=[])
+    channel.overwrites_for = MagicMock(return_value=discord.PermissionOverwrite())
+    return channel
 
 
 def _make_member(member_id=2):
@@ -508,3 +521,446 @@ async def test_mute_expiry_check_lifts_due_mutes(db):
     member.remove_roles.assert_awaited_once_with(mute_role, reason="Mute expired")
     due = await bot.stores.mutes.due((discord.utils.utcnow() + datetime.timedelta(days=1)).isoformat())
     assert due == []
+
+
+# ---- ban duration / tempban / unban ----
+
+
+@pytest.mark.asyncio
+async def test_ban_without_duration_is_permanent_and_unscheduled(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    member = _make_member()
+
+    await Moderation.ban.callback(cog, ctx, member, None, reason="testing")
+
+    member.ban.assert_awaited_once()
+    far_future = (discord.utils.utcnow() + datetime.timedelta(days=100)).isoformat()
+    due = await bot.stores.scheduled.due(far_future)
+    assert due == []
+    assert "until" not in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ban_with_duration_schedules_auto_unban(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    member = _make_member()
+
+    await Moderation.ban.callback(cog, ctx, member, "7d", reason="testing")
+
+    member.ban.assert_awaited_once()
+    far_future = (discord.utils.utcnow() + datetime.timedelta(days=100)).isoformat()
+    due = await bot.stores.scheduled.due(far_future)
+    assert len(due) == 1
+    assert due[0][2] == "tempban_unban"
+    assert due[0][3] == {"user_id": member.id}
+    assert "until" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ban_with_unparseable_duration_still_bans_but_stays_permanent(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    member = _make_member()
+
+    await Moderation.ban.callback(cog, ctx, member, "10x", reason="testing")
+
+    member.ban.assert_awaited_once()  # the ban itself still happened
+    rows = await bot.stores.cases.for_user(GUILD, member.id)
+    assert rows[0][1] == "ban"  # case still recorded
+    far_future = (discord.utils.utcnow() + datetime.timedelta(days=100)).isoformat()
+    due = await bot.stores.scheduled.due(far_future)
+    assert due == []  # nothing scheduled - permanent since the duration wasn't understood
+
+
+@pytest.mark.asyncio
+async def test_unban_lifts_ban_and_records_case(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    ctx.guild.unban = AsyncMock()
+    user = _make_member(member_id=777)
+
+    await Moderation.unban.callback(cog, ctx, user, reason="appeal accepted")
+
+    ctx.guild.unban.assert_awaited_once_with(user, reason="appeal accepted")
+    rows = await bot.stores.cases.for_user(GUILD, user.id)
+    assert rows[0][1] == "unban"
+
+
+@pytest.mark.asyncio
+async def test_unban_reports_user_not_banned(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    ctx.guild.unban = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "Unknown Ban"))
+    user = _make_member(member_id=777)
+
+    await Moderation.unban.callback(cog, ctx, user)
+
+    ctx.send.assert_awaited_once()
+    assert "isn't banned" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_unban_reports_forbidden(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    ctx.guild.unban = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions"))
+    user = _make_member(member_id=777)
+
+    await Moderation.unban.callback(cog, ctx, user)
+
+    ctx.send.assert_awaited_once()
+    assert "don't have permission" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_tempban_unban_lifts_ban_and_records_case(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    guild.unban = AsyncMock()
+    bot.get_guild = MagicMock(return_value=guild)
+    bot.user = MagicMock(id=1)
+
+    await cog._handle_tempban_unban(GUILD, {"user_id": 777})
+
+    guild.unban.assert_awaited_once()
+    rows = await bot.stores.cases.for_user(GUILD, 777)
+    assert rows[0][1] == "unban"
+
+
+@pytest.mark.asyncio
+async def test_handle_tempban_unban_ignores_already_unbanned(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    guild.unban = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "Unknown Ban"))
+    bot.get_guild = MagicMock(return_value=guild)
+
+    await cog._handle_tempban_unban(GUILD, {"user_id": 777})  # must not raise
+
+    rows = await bot.stores.cases.for_user(GUILD, 777)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_handle_tempban_unban_does_nothing_if_guild_gone(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    bot.get_guild = MagicMock(return_value=None)
+
+    await cog._handle_tempban_unban(GUILD, {"user_id": 777})  # must not raise
+
+
+# ---- purge ----
+
+
+@pytest.mark.asyncio
+async def test_purge_rejects_amount_below_range(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+
+    await Moderation.purge.callback(cog, ctx, 0, None)
+
+    ctx.send.assert_awaited_once()
+    assert "between 1 and 100" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_purge_rejects_amount_above_range(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+
+    await Moderation.purge.callback(cog, ctx, 101, None)
+
+    ctx.send.assert_awaited_once()
+    assert "between 1 and 100" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_purge_accepts_boundary_amount_of_100(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    channel.purge = AsyncMock(return_value=[MagicMock()])
+    ctx.channel = channel
+
+    await Moderation.purge.callback(cog, ctx, 100, None)
+
+    channel.purge.assert_awaited_once()
+    assert channel.purge.await_args.kwargs["limit"] == 100
+
+
+@pytest.mark.asyncio
+async def test_purge_deletes_messages_and_reports_count(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    channel.purge = AsyncMock(return_value=[MagicMock(), MagicMock(), MagicMock()])
+    ctx.channel = channel
+
+    await Moderation.purge.callback(cog, ctx, 10, None)
+
+    assert channel.purge.await_args.kwargs["limit"] == 10
+    ctx.send.assert_awaited_once()
+    assert "Deleted 3 message(s)" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_purge_reports_zero_matches_without_erroring(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    channel.purge = AsyncMock(return_value=[])
+    ctx.channel = channel
+
+    await Moderation.purge.callback(cog, ctx, 10, _make_member())
+
+    assert "Deleted 0 message(s)" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_purge_reports_forbidden_instead_of_crashing(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    channel.purge = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions"))
+    ctx.channel = channel
+
+    await Moderation.purge.callback(cog, ctx, 10, None)
+
+    ctx.send.assert_awaited_once()
+    assert "don't have permission" in ctx.send.await_args.args[0]
+
+
+# ---- slowmode / lockdown ----
+
+
+@pytest.mark.asyncio
+async def test_slowmode_rejects_out_of_range(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+
+    await Moderation.slowmode.callback(cog, ctx, 99999, None)
+
+    ctx.send.assert_awaited_once()
+    assert "between 0" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slowmode_accepts_boundary_max(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    ctx.channel = channel
+
+    await Moderation.slowmode.callback(cog, ctx, 21600, None)
+
+    channel.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slowmode_sets_channel_delay(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    ctx.channel = channel
+
+    await Moderation.slowmode.callback(cog, ctx, 30, None)
+
+    assert channel.edit.await_args.kwargs["slowmode_delay"] == 30
+    assert "30s" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slowmode_zero_turns_it_off(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    ctx.channel = channel
+
+    await Moderation.slowmode.callback(cog, ctx, 0, None)
+
+    assert "off" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_slowmode_reports_forbidden(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    channel.edit = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions"))
+    ctx.channel = channel
+
+    await Moderation.slowmode.callback(cog, ctx, 30, None)
+
+    assert "don't have permission" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_lockdown_locks_channel_and_records_previous_state(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    channel = _make_channel()
+    ctx.channel = channel
+
+    await Moderation.lockdown.callback(cog, ctx, None)
+
+    channel.set_permissions.assert_awaited_once()
+    overwrite_arg = channel.set_permissions.await_args.kwargs["overwrite"]
+    assert overwrite_arg.send_messages is False
+    stored = await bot.stores.channel_locks.get(GUILD, channel.id)
+    assert stored == "none"  # a fresh PermissionOverwrite() starts with send_messages=None
+    assert "locked down" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_lockdown_toggles_off_and_restores_previous_state(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    channel = _make_channel()
+    ctx.channel = channel
+    await bot.stores.channel_locks.set(GUILD, channel.id, True)  # simulate an already-locked channel
+
+    await Moderation.lockdown.callback(cog, ctx, None)
+
+    overwrite_arg = channel.set_permissions.await_args.kwargs["overwrite"]
+    assert overwrite_arg.send_messages is True
+    stored = await bot.stores.channel_locks.get(GUILD, channel.id)
+    assert stored is None
+    assert "no longer locked down" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_lockdown_reports_forbidden(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+    channel = _make_channel()
+    channel.set_permissions = AsyncMock(
+        side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+    )
+    ctx.channel = channel
+
+    await Moderation.lockdown.callback(cog, ctx, None)
+
+    assert "don't have permission" in ctx.send.await_args.args[0]
+
+
+# ---- editcase / deletecase ----
+
+
+@pytest.mark.asyncio
+async def test_editcase_updates_reason(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    member = _make_member()
+    await Moderation.warn.callback(cog, ctx, member, reason="first")
+
+    await Moderation.editcase.callback(cog, ctx, 1, reason="corrected reason")
+
+    row = await bot.stores.cases.get(GUILD, 1)
+    assert row[3] == "corrected reason"
+
+
+@pytest.mark.asyncio
+async def test_editcase_reports_missing_case(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+
+    await Moderation.editcase.callback(cog, ctx, 999, reason="x")
+
+    assert "No case #999" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_deletecase_removes_case(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    member = _make_member()
+    await Moderation.warn.callback(cog, ctx, member, reason="first")
+
+    await Moderation.deletecase.callback(cog, ctx, 1)
+
+    row = await bot.stores.cases.get(GUILD, 1)
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_deletecase_reports_missing_case(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+
+    await Moderation.deletecase.callback(cog, ctx, 999)
+
+    assert "No case #999" in ctx.send.await_args.args[0]
+
+
+# ---- edge cases ----
+
+
+@pytest.mark.asyncio
+async def test_slowmode_rejects_negative_value(db):
+    cog = _make_cog(_make_bot(db))
+    ctx = _make_ctx()
+
+    await Moderation.slowmode.callback(cog, ctx, -5, None)
+
+    assert "between 0" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ban_with_perm_keyword_stays_permanent_not_understood_as_a_unit(db):
+    """'perm' isn't a valid m/h/d duration for /ban (unlike /mute, which has
+    its own permanent-keyword handling) - it should degrade to the same
+    "permanent, duration not understood" path as any other garbage string,
+    not silently misparse."""
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    ctx = _make_ctx()
+    member = _make_member()
+
+    await Moderation.ban.callback(cog, ctx, member, "perm", reason="testing")
+
+    member.ban.assert_awaited_once()
+    far_future = (discord.utils.utcnow() + datetime.timedelta(days=100)).isoformat()
+    due = await bot.stores.scheduled.due(far_future)
+    assert due == []
+
+
+@pytest.mark.asyncio
+async def test_case_lookup_is_scoped_to_the_calling_guild(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    other_guild_id = GUILD + 1
+    await bot.stores.cases.add(other_guild_id, 2, 1, "warn", "from another guild")
+    ctx = _make_ctx()
+
+    await Moderation.case.callback(cog, ctx, 1)
+
+    assert "No case #1" in ctx.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_editcase_cannot_touch_a_case_in_another_guild(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    other_guild_id = GUILD + 1
+    case_id = await bot.stores.cases.add(other_guild_id, 2, 1, "warn", "original")
+    ctx = _make_ctx()
+
+    await Moderation.editcase.callback(cog, ctx, case_id, reason="tampered")
+
+    assert f"No case #{case_id}" in ctx.send.await_args.args[0]
+    row = await bot.stores.cases.get(other_guild_id, case_id)
+    assert row[3] == "original"  # untouched

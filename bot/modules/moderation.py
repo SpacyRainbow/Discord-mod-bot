@@ -25,6 +25,8 @@ from typing import Optional
 import discord
 from discord.ext import commands, tasks
 
+from ..durations import parse_duration
+
 logger = logging.getLogger("bot.modules.moderation")
 
 MUTE_ROLE_NAME = "Mute"
@@ -41,6 +43,10 @@ PERMANENT_DURATION_KEYWORDS = {"perm", "permanent", "indefinite", "forever"}
 # safely inside datetime's representable range (max year 9999), which a
 # multi-thousand-year duration could otherwise overflow.
 MAX_MUTE_DURATION = datetime.timedelta(days=3650)
+# Same cap as mutes, for the same reason (honesty past this point, plus the
+# datetime overflow guard) - applies to /ban's optional duration.
+MAX_TEMPBAN_DURATION = datetime.timedelta(days=3650)
+SLOWMODE_MAX_SECONDS = 21600  # Discord's own cap: 6 hours
 
 
 def _duration_to_timedelta(duration: str) -> datetime.timedelta:
@@ -86,6 +92,28 @@ class Moderation(commands.Cog):
 
     def cog_unload(self):
         self.mute_expiry_check.cancel()
+
+    async def cog_load(self) -> None:
+        self.bot.scheduler_handlers["tempban_unban"] = self._handle_tempban_unban
+
+    async def _handle_tempban_unban(self, guild_id: int, payload: dict) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+        user_id = payload["user_id"]
+        try:
+            await guild.unban(discord.Object(id=user_id), reason="Temp-ban expired")
+        except discord.NotFound:
+            return  # already unbanned manually - nothing to do
+        except discord.Forbidden:
+            logger.warning("Missing permission to lift expired temp-ban in guild %s", guild_id)
+            return
+        try:
+            await self.bot.stores.cases.add(
+                guild_id, user_id, self.bot.user.id, "unban", "Temp-ban expired"
+            )
+        except RuntimeError:
+            pass  # DB unavailable - the unban itself already happened, degrade gracefully
 
     # ---- mute role ----
 
@@ -199,15 +227,160 @@ class Moderation(commands.Cog):
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "kick", reason)
         await ctx.send(f"Kicked {member} (case #{case_id}): {reason}")
 
-    @commands.hybrid_command(name="ban")
+    @commands.hybrid_command(
+        name="ban",
+        description="Ban a member - give a duration (e.g. 7d) for a temp-ban, or omit for permanent",
+    )
     @commands.guild_only()
     @commands.has_permissions(ban_members=True)
     @commands.bot_has_permissions(ban_members=True)
-    async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason given"):
+    async def ban(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        duration: Optional[str] = None,
+        *,
+        reason: str = "No reason given",
+    ):
         if not await self._try_action(ctx, member, member.ban(reason=reason)):
             return
         case_id = await self.bot.stores.cases.add(ctx.guild.id, member.id, ctx.author.id, "ban", reason)
-        await ctx.send(f"Banned {member} (case #{case_id}): {reason}")
+
+        if not duration:
+            await ctx.send(f"Banned {member} (case #{case_id}): {reason}")
+            return
+
+        try:
+            delta = parse_duration(duration, max_duration=MAX_TEMPBAN_DURATION)
+        except ValueError as e:
+            await ctx.send(
+                f"Banned {member} (case #{case_id}): {reason}\n"
+                f"{e} This ban is permanent since the duration wasn't understood - use `/unban` to lift it."
+            )
+            return
+
+        unban_at = discord.utils.utcnow() + delta
+        try:
+            # Known limitation: re-banning someone who already has a
+            # pending temp-ban schedules a second, independent auto-unban
+            # rather than replacing the first - whichever one is due
+            # first will unban them even if a later ban meant to be
+            # permanent or longer. Rare in practice (re-banning an
+            # already-banned member), not worth a ban-generation-tracking
+            # system for.
+            await self.bot.stores.scheduled.add(
+                ctx.guild.id, "tempban_unban", {"user_id": member.id}, unban_at
+            )
+        except RuntimeError:
+            await ctx.send(
+                f"Banned {member} (case #{case_id}): {reason}\n"
+                "Couldn't schedule the auto-unban (database unavailable) - this ban is permanent "
+                "until manually `/unban`'d."
+            )
+            return
+
+        until = discord.utils.format_dt(unban_at, "f")
+        await ctx.send(f"Banned {member} until {until} (case #{case_id}): {reason}")
+
+    @commands.hybrid_command(name="unban")
+    @commands.guild_only()
+    @commands.has_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def unban(self, ctx: commands.Context, user: discord.User, *, reason: str = "No reason given"):
+        try:
+            await ctx.guild.unban(user, reason=reason)
+        except discord.NotFound:
+            await ctx.send(f"{user} isn't banned.")
+            return
+        except discord.Forbidden:
+            await ctx.send("I don't have permission to do that.")
+            return
+        case_id = await self.bot.stores.cases.add(ctx.guild.id, user.id, ctx.author.id, "unban", reason)
+        await ctx.send(f"Unbanned {user} (case #{case_id}): {reason}")
+
+    @commands.hybrid_command(
+        name="purge", description="Delete the last N messages in this channel (optionally, only one member's)"
+    )
+    @commands.guild_only()
+    @commands.has_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def purge(self, ctx: commands.Context, amount: int, member: Optional[discord.Member] = None):
+        if not 1 <= amount <= 100:
+            await ctx.send("Give an amount between 1 and 100.")
+            return
+
+        await ctx.defer(ephemeral=True)
+
+        def check(message: discord.Message) -> bool:
+            return member is None or message.author.id == member.id
+
+        try:
+            deleted = await ctx.channel.purge(limit=amount, check=check)
+        except discord.Forbidden:
+            await ctx.send("I don't have permission to delete messages here.")
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"Couldn't delete messages: {e}")
+            return
+        await ctx.send(f"Deleted {len(deleted)} message(s).", ephemeral=True)
+
+    @commands.hybrid_command(name="slowmode", description="Set this (or another) channel's slowmode delay")
+    @commands.guild_only()
+    @commands.has_permissions(manage_channels=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def slowmode(
+        self, ctx: commands.Context, seconds: int, channel: Optional[discord.TextChannel] = None
+    ):
+        if not 0 <= seconds <= SLOWMODE_MAX_SECONDS:
+            await ctx.send(f"Give a value between 0 (off) and {SLOWMODE_MAX_SECONDS} (6 hours).")
+            return
+        target = channel or ctx.channel
+        try:
+            await target.edit(slowmode_delay=seconds, reason=f"Slowmode set by {ctx.author}")
+        except discord.Forbidden:
+            await ctx.send("I don't have permission to edit that channel.")
+            return
+        if seconds == 0:
+            await ctx.send(f"Slowmode turned off in {target.mention}.")
+        else:
+            await ctx.send(f"Slowmode set to {seconds}s in {target.mention}.")
+
+    @commands.hybrid_command(
+        name="lockdown",
+        description="Toggle blocking @everyone from sending messages in this (or another) channel",
+    )
+    @commands.guild_only()
+    @commands.has_permissions(manage_channels=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def lockdown(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+        target = channel or ctx.channel
+        everyone = ctx.guild.default_role
+        existing = await self.bot.stores.channel_locks.get(ctx.guild.id, target.id)
+
+        if existing is not None:
+            overwrite = target.overwrites_for(everyone)
+            overwrite.send_messages = self.bot.stores.channel_locks.decode(existing)
+            try:
+                await target.set_permissions(
+                    everyone, overwrite=overwrite, reason=f"Lockdown lifted by {ctx.author}"
+                )
+            except discord.Forbidden:
+                await ctx.send("I don't have permission to edit that channel's permissions.")
+                return
+            await self.bot.stores.channel_locks.clear(ctx.guild.id, target.id)
+            await ctx.send(f"{target.mention} is no longer locked down.")
+            return
+
+        overwrite = target.overwrites_for(everyone)
+        previous = overwrite.send_messages
+        overwrite.send_messages = False
+        try:
+            await target.set_permissions(everyone, overwrite=overwrite, reason=f"Lockdown by {ctx.author}")
+        except discord.Forbidden:
+            await ctx.send("I don't have permission to edit that channel's permissions.")
+            return
+        await self.bot.stores.channel_locks.set(ctx.guild.id, target.id, previous)
+        await ctx.send(f"{target.mention} is now locked down - @everyone can't send messages.")
 
     @commands.hybrid_command(
         name="mute",
@@ -302,6 +475,28 @@ class Moderation(commands.Cog):
         embed.add_field(name="Reason", value=reason or "No reason given", inline=False)
         embed.add_field(name="Date", value=created_at)
         await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="editcase", description="Change a case's recorded reason")
+    @commands.guild_only()
+    @commands.has_permissions(moderate_members=True)
+    async def editcase(self, ctx: commands.Context, case_id: int, *, reason: str):
+        row = await self.bot.stores.cases.get(ctx.guild.id, case_id)
+        if not row:
+            await ctx.send(f"No case #{case_id} found.")
+            return
+        await self.bot.stores.cases.update_reason(ctx.guild.id, case_id, reason)
+        await ctx.send(f"Updated case #{case_id}'s reason to: {reason}")
+
+    @commands.hybrid_command(name="deletecase", description="Delete a case from the case history")
+    @commands.guild_only()
+    @commands.has_permissions(moderate_members=True)
+    async def deletecase(self, ctx: commands.Context, case_id: int):
+        row = await self.bot.stores.cases.get(ctx.guild.id, case_id)
+        if not row:
+            await ctx.send(f"No case #{case_id} found.")
+            return
+        await self.bot.stores.cases.delete(ctx.guild.id, case_id)
+        await ctx.send(f"Deleted case #{case_id}.")
 
 
 async def setup(bot: commands.Bot):

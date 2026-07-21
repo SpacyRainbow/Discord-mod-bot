@@ -33,7 +33,14 @@ MODULES = [
     "bot.modules.music",
     "bot.modules.setup",
     "bot.modules.minecraft",
-    # "bot.modules.scheduler",
+    "bot.modules.scheduler",
+    "bot.modules.raid",
+    "bot.modules.antinuke",
+    "bot.modules.starboard",
+    "bot.modules.giveaway",
+    "bot.modules.poll",
+    "bot.modules.tickets",
+    "bot.modules.greetings",
     # "bot.modules.counters",
     # "bot.modules.leveling",
 ]
@@ -54,6 +61,11 @@ class ModBot(commands.Bot):
         self.db = Database(db_path)
         self.stores = Stores(self.db)
         self.start_time: float | None = None
+        # Populated by producer cogs' cog_load (moderation.py, giveaway.py,
+        # poll.py, scheduler.py itself) - see scheduler.py's module
+        # docstring. Initialized here, not in Scheduler's own __init__, so
+        # it exists no matter what order MODULES loads in.
+        self.scheduler_handlers: dict = {}
 
     async def _get_prefix(self, bot: "ModBot", message: discord.Message):
         if message.guild is None:
@@ -88,6 +100,14 @@ class ModBot(commands.Bot):
                 self.tree.copy_global_to(guild=guild_obj)
                 synced = await self.tree.sync(guild=guild_obj)
                 logger.info("Synced %d command(s) to guild %s", len(synced), guild_id)
+                # Clears any global registration left over from before
+                # GUILD_ID was set (or from earlier testing) - without
+                # this, Discord's / picker shows every command twice, one
+                # global copy and one guild-scoped copy, even though only
+                # the guild-scoped one is ever actually live.
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                logger.info("Cleared any stale global command registrations")
             else:
                 synced = await self.tree.sync()
                 logger.info("Synced %d command(s) globally (may take up to an hour to appear)", len(synced))
@@ -111,26 +131,40 @@ class ModBot(commands.Bot):
         logger.info("Logged in as %s (id=%s)", self.user, self.user.id)
         logger.info("Connected to %d guild(s)", len(self.guilds))
 
+    async def _report_error(self, ctx: commands.Context, content: str) -> None:
+        """Best-effort - reporting the error can itself fail for the same
+        underlying reason as the original error (most commonly: the
+        interaction already expired, since Discord invalidates it ~3s
+        after dispatch if nothing's responded yet). Without this, that
+        second failure was an unhandled exception discord.py could only
+        log as "Ignoring exception in on_command_error" - silent from the
+        user's side, since neither the original error nor this report
+        ever reached them."""
+        try:
+            await ctx.send(content)
+        except discord.HTTPException:
+            logger.warning("Couldn't deliver an error message for %s", ctx.command)
+
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
         if isinstance(error, commands.CommandNotFound):
             return
         if isinstance(error, commands.NoPrivateMessage):
-            await ctx.send("That command only works in a server, not in a DM.")
+            await self._report_error(ctx, "That command only works in a server, not in a DM.")
             return
         if isinstance(error, MinecraftGuildRestrictedError):
-            await ctx.send(str(error))
+            await self._report_error(ctx, str(error))
             return
         if isinstance(error, commands.MissingPermissions):
-            await ctx.send("You don't have permission to do that.")
+            await self._report_error(ctx, "You don't have permission to do that.")
             return
         if isinstance(error, commands.BotMissingPermissions):
-            await ctx.send("I don't have the permissions I need to do that.")
+            await self._report_error(ctx, "I don't have the permissions I need to do that.")
             return
         if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(f"Missing argument: `{error.param.name}`")
+            await self._report_error(ctx, f"Missing argument: `{error.param.name}`")
             return
         if isinstance(error, commands.BadArgument):
-            await ctx.send(f"Bad argument: {error}")
+            await self._report_error(ctx, f"Bad argument: {error}")
             return
         if isinstance(error, commands.HybridCommandError) and isinstance(
             error.original, app_commands.TransformerError
@@ -139,7 +173,7 @@ class ModBot(commands.Bot):
             # resolve (e.g. a typo'd name) - discord.py routes this through
             # its own transformer machinery for both invocation paths, not
             # through commands.BadArgument, so it needs its own branch here.
-            await ctx.send(f"Couldn't resolve `{error.original.value}` to a valid argument.")
+            await self._report_error(ctx, f"Couldn't resolve `{error.original.value}` to a valid argument.")
             return
         logger.exception("Unhandled command error in %s", ctx.command, exc_info=error)
-        await ctx.send("Something went wrong running that command. It's been logged.")
+        await self._report_error(ctx, "Something went wrong running that command. It's been logged.")
