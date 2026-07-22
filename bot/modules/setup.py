@@ -20,6 +20,8 @@ from typing import Awaitable, Callable, Optional
 import discord
 from discord.ext import commands
 
+from bot.modules.updater import UpdateStatus, describe_status
+
 STEP_GENERAL = "general"
 STEP_LOGGING = "logging"
 STEP_MODERATION = "moderation"
@@ -33,6 +35,7 @@ STEP_STARBOARD = "starboard"
 STEP_TICKETS = "tickets"
 STEP_GREETINGS = "greetings"
 STEP_MUSIC = "music"
+STEP_UPDATES = "updates"
 STEP_SUMMARY = "summary"
 
 STEPS = [
@@ -49,6 +52,7 @@ STEPS = [
     STEP_TICKETS,
     STEP_GREETINGS,
     STEP_MUSIC,
+    STEP_UPDATES,
     STEP_SUMMARY,
 ]
 
@@ -66,6 +70,7 @@ STEP_TITLES = {
     STEP_TICKETS: "Tickets",
     STEP_GREETINGS: "Welcome/leave messages",
     STEP_MUSIC: "Music",
+    STEP_UPDATES: "Updates",
     STEP_SUMMARY: "Summary",
 }
 
@@ -114,6 +119,7 @@ CONFIG_MANIFEST = [
     ("leave.channel_id", None, "unset", "Leave message channel"),
     ("leave.message", _LEAVE_DEFAULT, _LEAVE_DEFAULT, "Leave message"),
     ("music.sponsorblock_enabled", "true", "true", "SponsorBlock auto-skip"),
+    ("updates.auto_apply", "false", "false", "Automatically restart to apply detected updates"),
 ]
 
 # Prefixes a step's "Reset to defaults" button clears - STEP_MODERATION and
@@ -131,6 +137,7 @@ STEP_RESET_PREFIXES = {
     STEP_TICKETS: ["tickets."],
     STEP_GREETINGS: ["welcome.", "leave."],
     STEP_MUSIC: ["music."],
+    STEP_UPDATES: ["updates."],
 }
 
 
@@ -269,6 +276,8 @@ class SetupView(discord.ui.View):
             self.add_item(
                 await _ToggleButton.create(self, "music.sponsorblock_enabled", "SponsorBlock auto-skip", True)
             )
+        elif step == STEP_UPDATES:
+            self.add_item(await _ToggleButton.create(self, "updates.auto_apply", "Auto-update", False))
 
         if step in STEP_RESET_PREFIXES:
             self.add_item(_ResetButton())
@@ -380,6 +389,20 @@ class SetupView(discord.ui.View):
             enabled = await self.cfg_bool("music.sponsorblock_enabled", True)
             embed.description = f"**SponsorBlock auto-skip**: {format_status(enabled)}"
             embed.color = discord.Color.green() if enabled else discord.Color.red()
+        elif step == STEP_UPDATES:
+            auto_apply = await self.cfg_bool("updates.auto_apply", False)
+            updater_cog = self.cog.bot.get_cog("Updater")
+            live_status = updater_cog.status if updater_cog is not None else UpdateStatus(checked=False)
+            embed.description = (
+                f"**Auto-update**: {format_status(auto_apply)}\n"
+                f"**Current status**: {describe_status(live_status)}\n\n"
+                "When enabled, the bot restarts itself the next time it notices a newer "
+                "commit on GitHub (checked roughly every 30 minutes) - this relies on the "
+                "container's restart policy and its `git pull`-on-start entrypoint, see the "
+                "README's \"Updates\" section. A manual \"Apply update\" button also appears "
+                "under `/about` any time an update is detected, regardless of this setting."
+            )
+            embed.color = discord.Color.green() if auto_apply else discord.Color.red()
         elif step == STEP_SUMMARY:
             values = {key: await self.cfg(key) for key, _, _, _ in CONFIG_MANIFEST}
             embed.description = "\n".join(build_summary_lines(values))

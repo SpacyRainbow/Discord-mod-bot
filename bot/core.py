@@ -41,6 +41,7 @@ MODULES = [
     "bot.modules.poll",
     "bot.modules.tickets",
     "bot.modules.greetings",
+    "bot.modules.updater",
     # "bot.modules.counters",
     # "bot.modules.leveling",
 ]

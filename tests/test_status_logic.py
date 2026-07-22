@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bot.modules.status import LAST_UPDATED, VERSION, Status
+from bot.modules.updater import UpdateStatus
 from bot.stores import Stores
 
 GUILD = 111
@@ -12,6 +13,7 @@ def _make_bot(db):
     bot = MagicMock()
     bot.stores = Stores(db)
     bot.cogs = {}
+    bot.get_cog = MagicMock(return_value=None)
     return bot
 
 
@@ -71,6 +73,44 @@ async def test_about_shows_version_and_last_updated(db):
     embed = ctx.send.await_args.kwargs["embed"]
     assert any(field.name == "Version" and field.value == VERSION for field in embed.fields)
     assert any(field.name == "Last updated" and field.value == LAST_UPDATED for field in embed.fields)
+
+
+@pytest.mark.asyncio
+async def test_about_shows_up_to_date_and_no_button_when_no_update(db):
+    bot = _make_bot(db)
+    bot.latency = 0.01
+    bot.db.available = True
+    updater_cog = MagicMock()
+    updater_cog.status = UpdateStatus(checked=True, available=False)
+    bot.get_cog = MagicMock(return_value=updater_cog)
+    cog = Status(bot)
+    ctx = _make_ctx()
+
+    await Status.about.callback(cog, ctx)
+
+    embed = ctx.send.await_args.kwargs["embed"]
+    assert any(field.name == "Updates" and field.value == "Up to date" for field in embed.fields)
+    assert ctx.send.await_args.kwargs["view"] is None
+
+
+@pytest.mark.asyncio
+async def test_about_shows_apply_button_when_update_available(db):
+    bot = _make_bot(db)
+    bot.latency = 0.01
+    bot.db.available = True
+    updater_cog = MagicMock()
+    updater_cog.status = UpdateStatus(checked=True, available=True, behind=2, latest_summary="fix bug")
+    bot.get_cog = MagicMock(return_value=updater_cog)
+    cog = Status(bot)
+    ctx = _make_ctx()
+
+    await Status.about.callback(cog, ctx)
+
+    embed = ctx.send.await_args.kwargs["embed"]
+    assert any("2 commit(s) behind" in field.value for field in embed.fields if field.name == "Updates")
+    view = ctx.send.await_args.kwargs["view"]
+    assert view is not None
+    assert any(item.label == "Apply update" for item in view.children)
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ import pytest
 from bot.modules.setup import (
     CONFIG_MANIFEST,
     STEP_RAID,
+    STEP_UPDATES,
     STEPS,
     SetupView,
     _AutoRoleSelect,
@@ -16,6 +17,7 @@ from bot.modules.setup import (
     combined_status_color,
     format_status,
 )
+from bot.modules.updater import UpdateStatus
 from bot.stores import Stores
 
 GUILD = 111
@@ -24,6 +26,7 @@ GUILD = 111
 def _make_cog(db):
     cog = MagicMock()
     cog.bot.stores = Stores(db)
+    cog.bot.get_cog = MagicMock(return_value=None)
     cog.moderation_cog = MagicMock(return_value=None)
     return cog
 
@@ -228,6 +231,56 @@ async def test_log_channel_select_has_no_preselection_when_unset(db):
     select = await _LogChannelSelect.create(view)
 
     assert list(select.default_values) == []
+
+
+# ---- updates step ----
+
+
+@pytest.mark.asyncio
+async def test_updates_step_shows_unable_to_check_when_no_updater_cog(db):
+    cog = _make_cog(db)
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+    view.step_index = STEPS.index(STEP_UPDATES)
+
+    embed = await view._build_embed()
+
+    assert "Unable to check" in embed.description
+    assert embed.color == discord.Color.red()  # auto-update off by default
+
+
+@pytest.mark.asyncio
+async def test_updates_step_shows_live_status_from_updater_cog(db):
+    cog = _make_cog(db)
+    updater_cog = MagicMock()
+    updater_cog.status = UpdateStatus(checked=True, available=True, behind=1, latest_summary="fix x")
+    cog.bot.get_cog = MagicMock(return_value=updater_cog)
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+    view.step_index = STEPS.index(STEP_UPDATES)
+
+    embed = await view._build_embed()
+
+    assert "1 commit(s) behind" in embed.description
+    assert "fix x" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_updates_step_toggle_button_reflects_stored_value(db):
+    bot_stores = Stores(db)
+    await bot_stores.config.set(GUILD, "updates.auto_apply", "true")
+    cog = _make_cog(db)
+    cog.bot.stores = bot_stores
+    guild = MagicMock(id=GUILD)
+    view = SetupView(cog, guild, invoker_id=1)
+    view.step_index = STEPS.index(STEP_UPDATES)
+
+    await view._rebuild_items()
+    embed = await view._build_embed()
+
+    toggle = next(item for item in view.children if getattr(item, "key", None) == "updates.auto_apply")
+    assert toggle.label.endswith("On")
+    assert embed.color == discord.Color.green()
 
 
 @pytest.mark.asyncio

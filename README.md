@@ -74,9 +74,14 @@ bot/
     ├── poll.py            /poll with button voting
     ├── tickets.py         /ticketpanel support-ticket channels
     ├── greetings.py       welcome/leave messages
+    ├── updater.py          detects/applies updates from GitHub; see "Updates"
     ├── counters.py        not complete; see the file for design notes
     └── leveling.py         not complete; see the file for design notes
 ```
+
+`entrypoint.sh`, at the repo root, runs `git pull` before starting the bot
+on every container start - this is what makes the update mechanism in
+"Updates" below work.
 
 **Settings system.** The bot stores all settings in the database. Examples
 of settings: spam thresholds, the log channel, and the auto-role. Each
@@ -119,6 +124,7 @@ case history until the connection is available again.
 | 14 | Starboard, giveaways, polls, tickets, welcome/leave messages | Done |
 | 15 | Scheduler engine and `/remind` (the rest of Phase 6 - `counters`, `leveling` - is still not complete) | Done |
 | 16 | Music volume, loop, and a dedicated `/shuffle` command | Done |
+| 17 | Update detection and one-click/auto-apply updates from GitHub | Done |
 
 Automated tests exist for this bot, and all of them pass. Run the tests
 with the command `pytest -q`. The tests check three parts of the bot: the
@@ -265,6 +271,12 @@ flake8 --max-line-length=110 bot/
    bot writes its module load results and its database connection status to
    the log. This is the fastest way to confirm a clean startup.
 
+The image bakes in a real git checkout (see the `COPY . .` in `Dockerfile`),
+so from this point on, restarting the container (`docker restart
+discord-mod-bot`, or a Custom App restart) is all it takes to pick up a new
+version pushed to GitHub - see "Updates" below for how the bot detects and
+can trigger this itself.
+
 ## Settings reference
 
 The code reads and writes each key below through the object
@@ -304,6 +316,7 @@ to one server only. If a key has no stored value, the bot uses the default.
 | `welcome.message` | generic welcome | The welcome message template - see "Welcome and leave messages" |
 | `leave.channel_id` | unset | The channel leave messages are posted to |
 | `leave.message` | generic leave message | The leave message template |
+| `updates.auto_apply` | false | If true, the bot restarts itself automatically when it detects a newer commit on GitHub - see "Updates" |
 
 Some settings have their own command: `setlogchannel`, `setautorole`,
 `setboredchannel`, `setstarboard`, and `filter add`. You can change every
@@ -332,20 +345,21 @@ the buttons and menus no longer work.
 
 | Step | Title | Content | Setting keys |
 |---|---|---|---|
-| 1/14 | General | A button, "Edit prefix", opens a form with one field: the command prefix | `commandprefix` |
-| 2/14 | Logging | A menu selects the log channel. Three on/off buttons: "Log edits", "Log deletes", "Log joins/leaves" | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
-| 3/14 | Moderation | No button or menu. The bot creates the Mute role if it does not exist, or confirms the role if it does, and shows its name. Run `/setup` again to re-apply the role's channel permissions everywhere, for example after adding a new channel | `moderation.mute_role` |
-| 4/14 | Anti-spam | A button, "Edit thresholds", opens a form with 5 fields: max messages per window, window length, max duplicate messages, max mentions, and timeout duration. All five must be whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
-| 5/14 | Automod | An on/off button, "Block invites". A separate button, "Edit caps thresholds", opens a form with 2 fields: the caps percent threshold, and the minimum message length for the caps check. This step does not include the banned-word list - that list is a set of words, not one value, and is managed instead with `filter add`, `filter remove`, and `filter` (list) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
-| 6/14 | Raid protection | An on/off button, "Auto-lockdown on burst". A button, "Edit raid thresholds", opens a form with 3 fields: minimum account age in hours, join burst size, and the burst window in seconds. Both checks are 0 (off) by default | `raid.min_account_age_hours`, `raid.join_threshold`, `raid.join_window_seconds`, `raid.auto_lockdown` |
-| 7/14 | Anti-nuke | An on/off button, "Anti-nuke enabled" (off by default). A button, "Edit anti-nuke thresholds", opens a form with 2 fields: the number of destructive actions before punishing, and the window in seconds | `antinuke.enabled`, `antinuke.action_threshold`, `antinuke.window_seconds` |
-| 8/14 | Roles | A menu selects the auto-role for new members | `roles.autorole` |
-| 9/14 | Bored detector | A menu selects the nudge channel. A button, "Edit bored settings", opens a form with 2 fields: idle seconds before the nudge, and the nudge message | `bored.channel`, `bored.idle_seconds`, `bored.message` |
-| 10/14 | Starboard | A menu selects the starboard channel. A button, "Edit star threshold", opens a form with one field: the number of stars needed to post | `starboard.channel`, `starboard.threshold` |
-| 11/14 | Tickets | A menu selects the category new ticket channels are created under | `tickets.category_id` |
-| 12/14 | Welcome/leave messages | Two menus select the welcome channel and the leave channel. A button, "Edit welcome/leave text", opens a form with 2 fields: the welcome message template and the leave message template | `welcome.channel_id`, `welcome.message`, `leave.channel_id`, `leave.message` |
-| 13/14 | Music | An on/off button, "SponsorBlock auto-skip" | `music.sponsorblock_enabled` |
-| 14/14 | Summary | A read-only summary of every setting above, its current value or default, and one line for Spotify that shows only "Configured" or "Not configured" - this step never shows or accepts the real Spotify credentials | None - display only |
+| 1/15 | General | A button, "Edit prefix", opens a form with one field: the command prefix | `commandprefix` |
+| 2/15 | Logging | A menu selects the log channel. Three on/off buttons: "Log edits", "Log deletes", "Log joins/leaves" | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
+| 3/15 | Moderation | No button or menu. The bot creates the Mute role if it does not exist, or confirms the role if it does, and shows its name. Run `/setup` again to re-apply the role's channel permissions everywhere, for example after adding a new channel | `moderation.mute_role` |
+| 4/15 | Anti-spam | A button, "Edit thresholds", opens a form with 5 fields: max messages per window, window length, max duplicate messages, max mentions, and timeout duration. All five must be whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
+| 5/15 | Automod | An on/off button, "Block invites". A separate button, "Edit caps thresholds", opens a form with 2 fields: the caps percent threshold, and the minimum message length for the caps check. This step does not include the banned-word list - that list is a set of words, not one value, and is managed instead with `filter add`, `filter remove`, and `filter` (list) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
+| 6/15 | Raid protection | An on/off button, "Auto-lockdown on burst". A button, "Edit raid thresholds", opens a form with 3 fields: minimum account age in hours, join burst size, and the burst window in seconds. Both checks are 0 (off) by default | `raid.min_account_age_hours`, `raid.join_threshold`, `raid.join_window_seconds`, `raid.auto_lockdown` |
+| 7/15 | Anti-nuke | An on/off button, "Anti-nuke enabled" (off by default). A button, "Edit anti-nuke thresholds", opens a form with 2 fields: the number of destructive actions before punishing, and the window in seconds | `antinuke.enabled`, `antinuke.action_threshold`, `antinuke.window_seconds` |
+| 8/15 | Roles | A menu selects the auto-role for new members | `roles.autorole` |
+| 9/15 | Bored detector | A menu selects the nudge channel. A button, "Edit bored settings", opens a form with 2 fields: idle seconds before the nudge, and the nudge message | `bored.channel`, `bored.idle_seconds`, `bored.message` |
+| 10/15 | Starboard | A menu selects the starboard channel. A button, "Edit star threshold", opens a form with one field: the number of stars needed to post | `starboard.channel`, `starboard.threshold` |
+| 11/15 | Tickets | A menu selects the category new ticket channels are created under | `tickets.category_id` |
+| 12/15 | Welcome/leave messages | Two menus select the welcome channel and the leave channel. A button, "Edit welcome/leave text", opens a form with 2 fields: the welcome message template and the leave message template | `welcome.channel_id`, `welcome.message`, `leave.channel_id`, `leave.message` |
+| 13/15 | Music | An on/off button, "SponsorBlock auto-skip" | `music.sponsorblock_enabled` |
+| 14/15 | Updates | An on/off button, "Auto-update", plus a live status line showing whether an update is currently detected. See "Updates" | `updates.auto_apply` |
+| 15/15 | Summary | A read-only summary of every setting above, its current value or default, and one line for Spotify that shows only "Configured" or "Not configured" - this step never shows or accepts the real Spotify credentials | None - display only |
 
 **Clear on/off status, and a default always shown.** Every setting that
 can genuinely be turned on or off - block invites, both raid checks,
@@ -751,6 +765,51 @@ for an action (`add`, `remove`, or `list`) and a player name, blank for
 function sends the vanilla Minecraft `whitelist add`/`whitelist remove`/
 `whitelist list` console commands through the same mechanism the Console
 button uses - it only works while the target server is running.
+
+## Updates
+
+The bot can tell when GitHub has commits it doesn't have yet, and can
+restart itself to pick them up - either manually, with a button, or
+automatically.
+
+**How detection works.** A background check (`bot/modules/updater.py`)
+runs roughly every 30 minutes: it runs `git fetch` inside the container,
+then compares the running checkout's commit against the fetched branch.
+This needs the deployed image to be a real git checkout with an `origin`
+remote - true by default, since `Dockerfile` now bakes in the whole repo
+(including `.git`, excluding secrets - see `.dockerignore`), not just the
+`bot/` folder. If the container isn't a git checkout for some reason, or
+the fetch fails (no network), the bot just reports "unable to check"
+rather than erroring.
+
+**How applying an update works.** The running Python process can't safely
+replace its own already-imported code out from under itself, so "applying
+an update" doesn't happen inside the process at all. Instead, `entrypoint.
+sh` runs `git pull` once, before `python -m bot` starts, on every
+container start (see "Architecture" and "Deploying to TrueNAS SCALE").
+Applying an update from Discord is therefore just: exit the process, and
+let the container's restart policy (`restart: unless-stopped` in
+`docker-compose.yml`, or the equivalent for a TrueNAS Custom App) relaunch
+it - which reruns `entrypoint.sh` against whatever is now on `origin`.
+
+**Manual updates.** `/about` always shows an "Updates" field - "Up to
+date," "N commit(s) behind - latest: `<commit summary>`," or "Unable to
+check." When an update is detected, an "Apply update" button appears
+under the same message. Anyone with Manage Server can click it; the bot
+replies, then restarts within a few seconds.
+
+**Automatic updates.** Off by default. Turn it on from `/setup`'s
+"Updates" step (`updates.auto_apply`). When on, the next background check
+that finds a newer commit restarts the bot right away, with no button
+click needed - useful if you don't want to babysit it, at the cost of the
+bot occasionally restarting itself (a few seconds of downtime) without
+you choosing the exact moment.
+
+**Why 30 minutes, not instant.** Checking is a `git fetch` against
+GitHub - frequent enough to notice a new release within the hour, without
+fetching on every command or hammering GitHub. `entrypoint.sh`'s pull at
+every container start is unrelated to this timer - a fresh restart always
+gets the latest code regardless of when the background check last ran.
 
 ## Roadmap and next steps
 

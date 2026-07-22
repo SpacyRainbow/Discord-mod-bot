@@ -1,0 +1,21 @@
+# Secrets - never bake these into the image
+.env
+
+# Local data and caches - not needed in the image, and data/ is a volume mount anyway
+data/
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+.DS_Store
+
+# .git is intentionally NOT excluded here - entrypoint.sh needs a real
+# git checkout with an `origin` remote to `git pull` from on every start.
