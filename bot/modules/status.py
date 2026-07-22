@@ -16,8 +16,8 @@ GITHUB_URL = "https://github.com/SpacyRainbow/Discord-mod-bot"
 # packaging/release process here to derive this from automatically, and the
 # Docker image only copies bot/, not .git, so a git-log-based date wouldn't
 # work in production anyway.
-VERSION = "1.0.0"
-LAST_UPDATED = "2026-07-20"
+VERSION = "1.0.1"
+LAST_UPDATED = "2026-07-22"
 
 
 class Status(commands.Cog):

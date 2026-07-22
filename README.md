@@ -764,3 +764,20 @@ button uses - it only works while the target server is running.
   cannot do what it implies.
 - A `/remove <index>` command for the music queue, and full playlist-URL
   expansion (see "Music").
+
+## Troubleshooting: duplicate slash commands
+
+If Discord's `/` picker shows every command twice, the cause is almost
+always a missing `GUILD_ID` in `.env` on a deployment that previously ran
+*with* one set (or vice versa). `_sync_commands()` in `bot/core.py` only
+clears stale global registrations when it does a guild-scoped sync
+(`GUILD_ID` set); a global-only sync (no `GUILD_ID`) never touches
+leftover guild-scoped commands from an earlier run. If those two states
+alternate across restarts/redeploys, both a global and a guild copy of
+each command end up registered at once, and Discord shows both.
+
+Fix: set `GUILD_ID` in `.env` to your server's ID and restart the bot -
+this switches to the guild-scoped path, which also clears any stale
+global registrations in the same pass. Keep `GUILD_ID` set consistently
+in production from then on; this is a config gotcha rather than a bug
+that reproduces on its own once `GUILD_ID` is set and left alone.
