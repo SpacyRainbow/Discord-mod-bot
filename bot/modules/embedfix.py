@@ -4,7 +4,9 @@ Instagram, ...) onto proxy hosts that serve real OpenGraph/video metadata, so
 the content plays inline instead of forcing everyone to open the platform.
 
 The bot replies with the fixed link, suppresses the original message's broken
-embed, and puts a cross-mark on its own reply as an undo button.
+embed, and puts a cross-mark on its own reply as an undo button. The cross-mark
+is taken back off once the poster's undo window closes, so it is only ever
+showing while it actually does something.
 
 Config keys:
   embedfix.enabled             - "true"/"false", default true
@@ -12,7 +14,11 @@ Config keys:
                                  Messages; degrades to reply-only without it.
   embedfix.remove_seconds      - int 0-3600, how long the original poster may
                                  undo a fix, default 120. Moderators (anyone
-                                 with manage_messages) are never time-limited.
+                                 with manage_messages) are never time-limited -
+                                 once the cross-mark is gone they undo by
+                                 adding one back by hand, since the reaction
+                                 handler below is stateless. 0 means the poster
+                                 can never undo, so no cross-mark is added.
   embedfix.platform.<name>     - "true"/"false" per entry in PLATFORMS,
                                  default true
 
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import discord
@@ -175,6 +182,14 @@ class EmbedFix(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def cog_load(self) -> None:
+        self.bot.scheduler_handlers["embedfix_expire"] = self._handle_expire
+
+    async def _remove_window(self, guild_id: int) -> int:
+        return await self.bot.stores.config.get_int(
+            guild_id, "embedfix.remove_seconds", 120, minimum=0, maximum=3600
+        )
+
     async def _enabled_platforms(self, guild_id: int) -> set[str]:
         enabled = set()
         for name in PLATFORMS:
@@ -208,10 +223,16 @@ class EmbedFix(commands.Cog):
             logger.warning("Failed to post embed fix in %s", message.channel, exc_info=True)
             return
 
-        try:
-            await reply.add_reaction(CROSS_MARK)
-        except discord.HTTPException:
-            logger.warning("Failed to add undo reaction in %s", message.channel, exc_info=True)
+        # A window of 0 means the poster can never undo, so the cross-mark would
+        # be dead on arrival - don't offer it at all.
+        window = await self._remove_window(guild_id)
+        if window > 0:
+            try:
+                await reply.add_reaction(CROSS_MARK)
+            except discord.HTTPException:
+                logger.warning("Failed to add undo reaction in %s", message.channel, exc_info=True)
+            else:
+                await self._schedule_expiry(guild_id, reply, window)
 
         if await self.bot.stores.config.get_bool(guild_id, "embedfix.suppress_original", True):
             try:
@@ -222,6 +243,40 @@ class EmbedFix(commands.Cog):
                 # Needs Manage Messages. Without it the reply still stands, so
                 # this is a degradation, not a failure.
                 logger.warning("Failed to suppress original embed in %s", message.channel, exc_info=True)
+
+    async def _schedule_expiry(self, guild_id: int, reply: discord.Message, window: int) -> None:
+        """Books the cross-mark's removal with the shared scheduler rather than
+        sleeping in-process, because an in-process timer dies on restart and
+        would leave the stale cross-mark this is meant to prevent."""
+        run_at = reply.created_at + timedelta(seconds=window)
+        payload = {"channel_id": reply.channel.id, "message_id": reply.id}
+        try:
+            await self.bot.stores.scheduled.add(guild_id, "embedfix_expire", payload, run_at)
+        except RuntimeError:
+            # Database unavailable. The fix itself still stands and _may_remove
+            # still refuses late undos, so this is cosmetic - the reaction-add
+            # path below cleans up the leftover cross-mark on the first click.
+            logger.warning("Failed to schedule undo-reaction expiry in %s", reply.channel, exc_info=True)
+
+    async def _handle_expire(self, guild_id: int, payload: dict) -> None:
+        """Takes the undo affordance away once the poster's window has closed.
+        Cosmetic only - _may_remove stays the authority on who may undo."""
+        channel = self.bot.get_channel(payload["channel_id"])
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+            return
+        try:
+            reply = await channel.fetch_message(payload["message_id"])
+        except discord.HTTPException:
+            return  # already undone and deleted, which is the happy path
+        await self._drop_cross_mark(reply)
+
+    async def _drop_cross_mark(self, reply: discord.Message) -> None:
+        """Removes only the bot's own cross-mark. clear_reaction() would take
+        everyone's but needs Manage Messages; this needs no permission at all."""
+        try:
+            await reply.remove_reaction(CROSS_MARK, self.bot.user)
+        except discord.HTTPException:
+            pass
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
@@ -266,6 +321,13 @@ class EmbedFix(commands.Cog):
                 await reply.remove_reaction(payload.emoji, member)
             except discord.HTTPException:
                 pass
+            # Self-heal: if our own cross-mark is still up on an already-expired
+            # fix - a scheduled row lost to a database outage, or the up-to-30s
+            # gap before the scheduler's next sweep - take it down now. Gated on
+            # the window really being over, because a bystander clicking during
+            # the window is also refused and must not cost the poster their undo.
+            if await self._expired(reply, guild.id):
+                await self._drop_cross_mark(reply)
             return
 
         try:
@@ -291,11 +353,12 @@ class EmbedFix(commands.Cog):
             return True  # moderators, any time
         if source is None or source.author.id != member.id:
             return False
-        window = await self.bot.stores.config.get_int(
-            member.guild.id, "embedfix.remove_seconds", 120, minimum=0, maximum=3600
-        )
+        return not await self._expired(reply, member.guild.id)
+
+    async def _expired(self, reply: discord.Message, guild_id: int) -> bool:
+        window = await self._remove_window(guild_id)
         age = (discord.utils.utcnow() - reply.created_at).total_seconds()
-        return age <= window
+        return age > window
 
 
 async def setup(bot: commands.Bot):

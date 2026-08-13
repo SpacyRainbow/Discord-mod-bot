@@ -1,6 +1,20 @@
+from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
 import pytest
 
-from bot.modules.embedfix import PLATFORMS, find_links, fix_links, platform_for, rewrite, strip_uneditable
+from bot.modules.embedfix import (
+    CROSS_MARK,
+    PLATFORMS,
+    EmbedFix,
+    find_links,
+    fix_links,
+    platform_for,
+    rewrite,
+    strip_uneditable,
+)
+from bot.stores import Stores
 
 ALL = set(PLATFORMS)
 
@@ -125,3 +139,190 @@ def test_every_platform_replacement_is_a_known_proxy_host():
 
     for _pattern, replacement, _drop in PLATFORMS.values():
         assert replacement in PROXY_HOSTS
+
+
+# --- the undo cross-mark's lifetime ---------------------------------------
+#
+# The cross-mark is only meant to be up while the undo actually works, so these
+# cover: not offering it when it can never work, booking its removal, the
+# scheduled removal itself, and the self-heal that catches a leftover.
+
+GUILD = 111
+BOT_ID = 42
+POSTER_ID = 7
+BYSTANDER_ID = 8
+
+
+def _make_bot(db):
+    bot = MagicMock()
+    bot.stores = Stores(db)
+    bot.user = MagicMock(id=BOT_ID)
+    return bot
+
+
+def _make_reply(age_seconds=0):
+    reply = MagicMock()
+    reply.id = 555
+    reply.channel = MagicMock(id=10)
+    reply.created_at = discord.utils.utcnow() - timedelta(seconds=age_seconds)
+    reply.add_reaction = AsyncMock()
+    reply.remove_reaction = AsyncMock()
+    reply.delete = AsyncMock()
+    return reply
+
+
+def _make_source_message(reply):
+    message = MagicMock()
+    message.author = MagicMock(id=POSTER_ID, bot=False)
+    message.guild = MagicMock(id=GUILD)
+    message.channel = MagicMock(id=10)
+    message.content = "https://x.com/u/status/1"
+    message.reply = AsyncMock(return_value=reply)
+    message.edit = AsyncMock()
+    return message
+
+
+@pytest.mark.asyncio
+async def test_reply_gets_a_cross_mark_and_a_booked_expiry(db):
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    reply = _make_reply()
+
+    await cog.on_message(_make_source_message(reply))
+
+    reply.add_reaction.assert_awaited_once_with(CROSS_MARK)
+    due = await bot.stores.scheduled.due((reply.created_at + timedelta(seconds=121)).isoformat())
+    assert [(kind, payload) for _id, _g, kind, payload in due] == [
+        ("embedfix_expire", {"channel_id": 10, "message_id": 555})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expiry_is_booked_for_the_end_of_the_window_not_before(db):
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    reply = _make_reply()
+
+    await cog.on_message(_make_source_message(reply))
+
+    one_second_early = reply.created_at + timedelta(seconds=119)
+    assert await bot.stores.scheduled.due(one_second_early.isoformat()) == []
+
+
+@pytest.mark.asyncio
+async def test_no_cross_mark_at_all_when_the_window_is_zero(db):
+    # Nobody but a moderator could ever use it, so it would be a dead control.
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    await bot.stores.config.set(GUILD, "embedfix.remove_seconds", "0")
+    reply = _make_reply()
+
+    await cog.on_message(_make_source_message(reply))
+
+    reply.add_reaction.assert_not_awaited()
+    assert await bot.stores.scheduled.due(discord.utils.utcnow().isoformat()) == []
+
+
+@pytest.mark.asyncio
+async def test_expiry_handler_removes_only_the_bots_own_cross_mark(db):
+    # remove_reaction needs no permission; clear_reaction would need Manage
+    # Messages, which the bot is not guaranteed to have.
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    reply = _make_reply(age_seconds=200)
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.fetch_message = AsyncMock(return_value=reply)
+    bot.get_channel = MagicMock(return_value=channel)
+
+    await cog._handle_expire(GUILD, {"channel_id": 10, "message_id": 555})
+
+    reply.remove_reaction.assert_awaited_once_with(CROSS_MARK, bot.user)
+
+
+@pytest.mark.asyncio
+async def test_expiry_handler_survives_an_already_undone_reply(db):
+    # The reply being gone is the happy path: someone used the undo.
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.fetch_message = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "gone"))
+    bot.get_channel = MagicMock(return_value=channel)
+
+    await cog._handle_expire(GUILD, {"channel_id": 10, "message_id": 555})  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_expired_is_true_only_past_the_window(db):
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+
+    assert await cog._expired(_make_reply(age_seconds=119), GUILD) is False
+    assert await cog._expired(_make_reply(age_seconds=121), GUILD) is True
+
+
+def _drive_reaction_setup(bot, reply, source, clicker_id, manage_messages):
+    """Wires up the mocks on_raw_reaction_add walks: guild -> channel ->
+    the bot's reply -> the message it was replying to."""
+    reply.author = MagicMock(id=BOT_ID)
+    reply.reference = MagicMock(message_id=999)
+
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.fetch_message = AsyncMock(
+        side_effect=lambda mid: {reply.id: reply, 999: source}[mid]
+    )
+    guild = MagicMock(id=GUILD)
+    guild.get_channel_or_thread = MagicMock(return_value=channel)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    member = MagicMock(id=clicker_id)
+    member.guild = guild
+    member.guild_permissions = MagicMock(manage_messages=manage_messages)
+
+    payload = MagicMock(guild_id=GUILD, emoji=CROSS_MARK, user_id=clicker_id, message_id=reply.id, member=member)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_a_late_click_takes_the_leftover_cross_mark_down(db):
+    # Self-heal for a cross-mark the scheduler missed - a database outage, or
+    # the gap before the next sweep.
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    reply = _make_reply(age_seconds=200)
+    source = _make_source_message(reply)
+    payload = _drive_reaction_setup(bot, reply, source, POSTER_ID, manage_messages=False)
+
+    await cog.on_raw_reaction_add(payload)
+
+    reply.delete.assert_not_awaited()  # the window really is closed
+    assert (CROSS_MARK, bot.user) in [call.args for call in reply.remove_reaction.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_a_bystander_click_inside_the_window_leaves_the_cross_mark_alone(db):
+    # Refusing someone else's click must not cost the poster their undo.
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    reply = _make_reply(age_seconds=5)
+    source = _make_source_message(reply)
+    payload = _drive_reaction_setup(bot, reply, source, BYSTANDER_ID, manage_messages=False)
+
+    await cog.on_raw_reaction_add(payload)
+
+    reply.delete.assert_not_awaited()
+    assert (CROSS_MARK, bot.user) not in [call.args for call in reply.remove_reaction.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_a_moderator_can_still_undo_after_the_cross_mark_is_gone(db):
+    # They re-add the cross-mark by hand; the handler is stateless, so it works.
+    bot = _make_bot(db)
+    cog = EmbedFix(bot)
+    reply = _make_reply(age_seconds=5000)
+    source = _make_source_message(reply)
+    payload = _drive_reaction_setup(bot, reply, source, BYSTANDER_ID, manage_messages=True)
+
+    await cog.on_raw_reaction_add(payload)
+
+    reply.delete.assert_awaited_once()
+    source.edit.assert_awaited_once_with(suppress=False)

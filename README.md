@@ -323,7 +323,7 @@ to one server only. If a key has no stored value, the bot uses the default.
 | `updates.auto_apply` | false | If true, the bot restarts itself automatically when it detects a newer commit on GitHub - see "Updates" |
 | `embedfix.enabled` | true | If true, replies with a working link when someone posts one Discord will not embed - see "Link embed fixer" |
 | `embedfix.suppress_original` | true | If true, also hides the original message's empty embed. Needs Manage Messages |
-| `embedfix.remove_seconds` | 120 | How long the poster has to undo a fix, in seconds. Moderators have no time limit |
+| `embedfix.remove_seconds` | 120 | How long the poster has to undo a fix, in seconds. The ❌ is removed when the window closes; `0` means no ❌ at all. Moderators have no time limit |
 | `embedfix.platform.<name>` | true | One key per supported site: `twitter`, `tiktok`, `instagram`, `reddit`, `bluesky`, `pixiv`, `twitch` |
 
 Some settings have their own command: `setlogchannel`, `setautorole`,
@@ -607,10 +607,18 @@ per message are rewritten, so one message cannot become a wall of replies.
 **Undoing a fix.** The bot puts a ❌ on its own reply. Click it and the
 reply is deleted and the original message's embed is restored. The member
 who posted the link can do this for `embedfix.remove_seconds` (120 by
-default) after the fix. Anyone with the Manage Messages permission can do
-it at any time, with no time limit. Anyone else who clicks just has their
-reaction removed. This check reads the messages themselves rather than
-in-memory state, so undo still works after a bot restart.
+default) after the fix, and **the ❌ is taken back off once that window
+closes**, so it is only showing while it actually does something. Set the
+window to `0` and no ❌ is added at all.
+
+Anyone with the Manage Messages permission can undo at any time, with no
+time limit - once the ❌ is gone they add one back by hand and it still
+works. Anyone else who clicks just has their reaction removed. This check
+reads the messages themselves rather than in-memory state, so undo still
+works after a bot restart. The removal is booked with the scheduler for
+the same reason, which means it can lag the deadline by up to 30 seconds
+(the scheduler's sweep interval); the undo itself is already refused in
+that gap.
 
 **Permissions.** Hiding the original message's embed needs Manage
 Messages. Without it the bot still posts the fixed link - only the empty
