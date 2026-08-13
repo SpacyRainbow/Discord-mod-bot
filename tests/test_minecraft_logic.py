@@ -505,3 +505,58 @@ def test_server_control_view_disables_stop_and_restart_when_offline():
     assert view.start_button.disabled is False
     assert view.stop_button.disabled is True
     assert view.restart_button.disabled is True
+
+
+# --- review F8: TLS verification on the token-bearing Crafty connection ---
+
+def test_ssl_context_defaults_to_the_system_trust_store(monkeypatch):
+    monkeypatch.delenv("CRAFTY_INSECURE_TLS", raising=False)
+    monkeypatch.delenv("CRAFTY_CA_BUNDLE", raising=False)
+    # None means "aiohttp default" - verify, don't disable.
+    assert Minecraft(MagicMock())._ssl_context() is None
+
+
+def test_ssl_context_uses_the_configured_ca_bundle(monkeypatch):
+    """CRAFTY_CA_BUNDLE is the supported answer to Crafty's self-signed cert -
+    trust that one cert, rather than turning verification off."""
+    import ssl as ssl_module
+
+    monkeypatch.delenv("CRAFTY_INSECURE_TLS", raising=False)
+    monkeypatch.setenv("CRAFTY_CA_BUNDLE", "/etc/crafty/ca.pem")
+
+    # Don't depend on a real PEM existing on the test machine - assert that the
+    # bundle is handed to a *verifying* context rather than short-circuiting.
+    calls = {}
+    sentinel = ssl_module.create_default_context()
+
+    def fake_create_default_context(*, cafile=None, **kwargs):
+        calls["cafile"] = cafile
+        return sentinel
+
+    monkeypatch.setattr(ssl_module, "create_default_context", fake_create_default_context)
+
+    context = Minecraft(MagicMock())._ssl_context()
+    assert context is sentinel
+    assert calls["cafile"] == "/etc/crafty/ca.pem"
+    assert sentinel.verify_mode == ssl_module.CERT_REQUIRED
+
+
+def test_ssl_context_opt_out_is_explicit_and_warns(monkeypatch, caplog):
+    monkeypatch.setenv("CRAFTY_INSECURE_TLS", "true")
+    monkeypatch.delenv("CRAFTY_CA_BUNDLE", raising=False)
+
+    with caplog.at_level("WARNING"):
+        assert Minecraft(MagicMock())._ssl_context() is False
+    assert "CRAFTY_API_TOKEN" in caplog.text
+
+
+def test_requests_use_the_prepared_ssl_context_not_ssl_false(monkeypatch):
+    """Regression: both _request and _post hardcoded ssl=False, sending a token
+    with full Minecraft console access over an unverified connection."""
+    import inspect
+
+    from bot.modules import minecraft as module
+
+    source = inspect.getsource(module)
+    assert "ssl=False" not in source
+    assert source.count("ssl=self.ssl_context") == 2

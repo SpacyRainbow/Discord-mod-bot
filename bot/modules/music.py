@@ -717,7 +717,21 @@ class Music(commands.Cog):
                 logger.error("Playback error in guild %s: %s", state.guild_id, error)
             if gen != state.generation:
                 return  # stale callback from a track we deliberately interrupted
-            asyncio.run_coroutine_threadsafe(self._advance(state), self.bot.loop)
+            # after_play runs on ffmpeg's thread, so any exception inside
+            # _advance is captured by this Future and never surfaces anywhere -
+            # playback just stops mid-queue with nothing to debug from. Drain
+            # the result so it gets logged. (review F17)
+            future = asyncio.run_coroutine_threadsafe(self._advance(state), self.bot.loop)
+
+            def _log_advance_failure(fut):
+                try:
+                    fut.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Advancing the queue failed in guild %s", state.guild_id)
+
+            future.add_done_callback(_log_advance_failure)
 
         source = self._make_source(track, seek_seconds)
         source.volume = state.volume
@@ -741,6 +755,15 @@ class Music(commands.Cog):
         skip_requested = state.skip_requested
         state.skip_requested = False
         if finished_track is not None and not skip_requested:
+            if state.loop_mode in ("track", "queue"):
+                # Re-queueing with stream_url still set hands ffmpeg the
+                # original signed CDN URL, which expires after a few hours -
+                # a long-running loop session degrades into tracks that won't
+                # play. Clear it so _ensure_stream_url re-resolves, and its
+                # existing "Couldn't load ..., skipping" path handles a dead
+                # link. (review F17)
+                finished_track.stream_url = None
+                finished_track.resolve_query = finished_track.resolve_query or finished_track.webpage_url
             if state.loop_mode == "track":
                 state.queue.appendleft(finished_track)
             elif state.loop_mode == "queue":
@@ -772,7 +795,14 @@ class Music(commands.Cog):
         else:
             text = "The queue is empty."
         try:
-            await state.text_channel.send(text)
+            # Opts back in to the client-wide AllowedMentions.none() default: this
+            # ping is behaviour the user toggled on via the bell button. (review F6)
+            await state.text_channel.send(
+                text,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=True
+                ),
+            )
         except discord.HTTPException:
             pass
 
@@ -801,6 +831,12 @@ class Music(commands.Cog):
         if state.idle_task and not state.idle_task.done():
             state.idle_task.cancel()
         await self._strip_player_buttons(state)
+        # The session is over, so nothing is left worth remembering for this
+        # guild - drop the state instead of keeping one GuildMusicState per
+        # guild that has ever played anything. _state() recreates on demand,
+        # so this is pure eviction. (review F10)
+        if state.voice_client is None and not state.queue:
+            self.states.pop(state.guild_id, None)
 
     def _schedule_idle_disconnect(self, state: GuildMusicState) -> None:
         if state.idle_task and not state.idle_task.done():
@@ -819,14 +855,24 @@ class Music(commands.Cog):
 
     @tasks.loop(seconds=POSITION_CHECK_INTERVAL)
     async def position_check(self):
-        for state in list(self.states.values()):
-            if not state.skip_segments or state.voice_client is None:
-                continue
-            if not state.voice_client.is_playing():
-                continue
-            target = next_skip_target(state.position(), state.skip_segments)
-            if target is not None:
-                await self._seek_within_track(state, target)
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. (review F4)
+        try:
+            for state in list(self.states.values()):
+                # Per-guild isolation: one broken player must not stop the other
+                # guilds' SponsorBlock skip checks.
+                try:
+                    if not state.skip_segments or state.voice_client is None:
+                        continue
+                    if not state.voice_client.is_playing():
+                        continue
+                    target = next_skip_target(state.position(), state.skip_segments)
+                    if target is not None:
+                        await self._seek_within_track(state, target)
+                except Exception:
+                    logger.exception("position_check failed for one guild's player")
+        except Exception:
+            logger.exception("position_check iteration failed")
 
     @position_check.before_loop
     async def before_position_check(self):
@@ -872,10 +918,24 @@ class Music(commands.Cog):
         state.text_channel = ctx.channel
         channel = author_voice.channel
 
-        if state.voice_client is None or not state.voice_client.is_connected():
-            state.voice_client = await channel.connect(self_deaf=True, self_mute=False)
-        elif state.voice_client.channel.id != channel.id:
-            await state.voice_client.move_to(channel)
+        # connect() raises asyncio.TimeoutError on a slow voice handshake and
+        # discord.ClientException ("Already connected...") when state has
+        # drifted; unhandled, both left state.voice_client stale and broke every
+        # later command for the guild until a restart. (review F18)
+        try:
+            if state.voice_client is None or not state.voice_client.is_connected():
+                state.voice_client = await channel.connect(self_deaf=True, self_mute=False)
+            elif state.voice_client.channel.id != channel.id:
+                await state.voice_client.move_to(channel)
+        except (asyncio.TimeoutError, discord.ClientException) as e:
+            logger.warning("Voice connect failed in guild %s: %s", ctx.guild.id, e)
+            state.voice_client = None
+            await ctx.send(
+                "I couldn't join your voice channel just then - try `/play` again in a moment.",
+                ephemeral=True,
+                delete_after=TRANSIENT_MESSAGE_SECONDS,
+            )
+            return
 
         if state.idle_task and not state.idle_task.done():
             state.idle_task.cancel()

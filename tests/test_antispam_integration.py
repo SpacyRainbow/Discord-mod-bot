@@ -37,8 +37,12 @@ class FakeAuthor:
         return f"user#{self.id}"
 
 
+_next_message_id = iter(range(1000, 100000))
+
+
 class FakeMessage:
     def __init__(self, author, channel, guild_id, content="spam", mentions=None, role_mentions=None):
+        self.id = next(_next_message_id)
         self.author = author
         self.channel = channel
         self.guild = MagicMock(id=guild_id)
@@ -74,7 +78,9 @@ async def test_flooding_bulk_deletes_the_entire_burst_not_just_the_tail(db):
     channel.delete_messages.assert_awaited_once()
     deleted = channel.delete_messages.await_args.args[0]
     assert len(deleted) == 4
-    assert deleted == messages
+    # antispam now retains (channel_id, message_id) pairs and rebuilds bare
+    # snowflakes at delete time rather than holding Message objects (F10).
+    assert [obj.id for obj in deleted] == [m.id for m in messages]
 
 
 @pytest.mark.asyncio

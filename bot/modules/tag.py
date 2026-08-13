@@ -16,11 +16,16 @@ class Tag(commands.Cog):
         await ctx.send(content)
 
     @commands.hybrid_command(name="tagset")
+    # Any member could previously overwrite any tag in the guild. manage_messages is
+    # the "trusted with content" tier this bot already uses for automod/antispam
+    # exemptions - a lower bar than the manage_guild required for config. (review F7)
+    @commands.has_permissions(manage_messages=True)
     async def tag_set(self, ctx: commands.Context, name: str, *, content: str):
         await self.bot.stores.tags.set(ctx.guild.id, name, content, ctx.author.id)
         await ctx.send(f"Tag `{name}` saved. Use `!tag {name}` to recall it.")
 
     @commands.hybrid_command(name="tagdelete")
+    @commands.has_permissions(manage_messages=True)  # review F7
     async def tag_delete(self, ctx: commands.Context, name: str):
         await self.bot.stores.tags.delete(ctx.guild.id, name)
         await ctx.send(f"Deleted tag `{name}`.")

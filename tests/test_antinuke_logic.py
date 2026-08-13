@@ -265,3 +265,76 @@ async def test_one_role_failing_to_strip_does_not_block_the_other(db):
     await cog.on_guild_channel_delete(MagicMock(guild=guild, id=99))
 
     assert member.remove_roles.await_count == 2  # both attempted, one failed, one succeeded
+
+
+# --- review F11: the audit log was queried even when anti-nuke was off ---
+
+
+async def test_channel_delete_does_not_touch_the_audit_log_when_disabled(db):
+    bot = _make_bot(db)
+    cog = AntiNuke(bot)
+    guild = _make_guild()
+    channel = MagicMock(guild=guild, id=77)
+
+    await cog.on_guild_channel_delete(channel)
+
+    guild.audit_logs.assert_not_called()
+
+
+async def test_role_delete_does_not_touch_the_audit_log_when_disabled(db):
+    bot = _make_bot(db)
+    cog = AntiNuke(bot)
+    guild = _make_guild()
+    role = MagicMock(guild=guild, id=88)
+
+    await cog.on_guild_role_delete(role)
+
+    guild.audit_logs.assert_not_called()
+
+
+async def test_member_ban_does_not_touch_the_audit_log_when_disabled(db):
+    bot = _make_bot(db)
+    cog = AntiNuke(bot)
+    guild = _make_guild()
+
+    await cog.on_member_ban(guild, MagicMock(id=99))
+
+    guild.audit_logs.assert_not_called()
+
+
+async def test_channel_delete_still_queries_the_audit_log_when_enabled(db):
+    bot = _make_bot(db)
+    await bot.stores.config.set(GUILD, "antinuke.enabled", "true")
+    cog = AntiNuke(bot)
+    executor = _make_executor(5)
+    guild = _make_guild(audit_entries=[_make_audit_entry(77, executor)])
+    channel = MagicMock(guild=guild, id=77)
+
+    await cog.on_guild_channel_delete(channel)
+
+    guild.audit_logs.assert_called_once()
+
+
+# --- review F10: _actions grew one entry per (guild, executor), forever ---
+
+
+async def test_sweep_drops_a_stale_executor_entry(db):
+    cog = AntiNuke(_make_bot(db))
+    now = 10_000.0
+    cog._actions[(GUILD, 5)].append(now - 7200)
+    assert cog._sweep(now) == 1
+    assert (GUILD, 5) not in cog._actions
+
+
+async def test_sweep_keeps_a_recent_executor_entry(db):
+    cog = AntiNuke(_make_bot(db))
+    now = 10_000.0
+    cog._actions[(GUILD, 5)].append(now - 5)
+    assert cog._sweep(now) == 0
+    assert (GUILD, 5) in cog._actions
+
+
+async def test_sweep_loop_body_survives_a_raising_sweep(db):
+    cog = AntiNuke(_make_bot(db))
+    cog._sweep = MagicMock(side_effect=RuntimeError("boom"))
+    await cog.sweep_actions.coro(cog)  # must not raise (review F4)

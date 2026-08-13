@@ -14,6 +14,7 @@ now on origin.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from dataclasses import dataclass
@@ -110,14 +111,19 @@ class Updater(commands.Cog):
 
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
     async def check_loop(self):
-        self.status = await check_for_update()
-        if not self.status.available:
-            return
-        for guild in self.bot.guilds:
-            if await self.bot.stores.config.get_bool(guild.id, AUTO_APPLY_KEY, False):
-                logger.info("Auto-update enabled (guild %s) - restarting to apply it", guild.id)
-                await self.apply_update()
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. (review F4)
+        try:
+            self.status = await check_for_update()
+            if not self.status.available:
                 return
+            for guild in self.bot.guilds:
+                if await self.bot.stores.config.get_bool(guild.id, AUTO_APPLY_KEY, False):
+                    logger.info("Auto-update enabled (guild %s) - restarting to apply it", guild.id)
+                    await self.apply_update()
+                    return
+        except Exception:
+            logger.exception("updater check_loop iteration failed")
 
     @check_loop.before_loop
     async def before_check_loop(self):
@@ -128,6 +134,15 @@ class Updater(commands.Cog):
         it, and entrypoint.sh's `git pull` picks up whatever's new."""
         logger.info("Applying update - exiting so the restart policy relaunches with the new code")
         await self.bot.close()
+        # os._exit skips interpreter cleanup, so the SQLite connection has to be
+        # closed by hand or the next start has a -journal/-wal to recover.
+        # db.close() is idempotent and never raises out (review F2/F19).
+        with contextlib.suppress(Exception):
+            await self.bot.db.close()
+        # Deliberately os._exit and NOT sys.exit: apply_update is called from
+        # inside a command callback and an interaction button, where discord.py
+        # catches SystemExit along with everything else - the process would log
+        # an error and keep running instead of restarting. (review F19)
         os._exit(0)
 
 

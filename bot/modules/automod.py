@@ -79,8 +79,14 @@ class AutoMod(commands.Cog):
                 await self._take_action(message, f"used a filtered word ({hit})")
                 return
 
-        threshold = await self.bot.stores.config.get_int(guild_id, "automod.caps_threshold", 70)
-        minlen = await self.bot.stores.config.get_int(guild_id, "automod.caps_minlen", 10)
+        # Bounds reject stored garbage that would otherwise flag every message
+        # (a negative caps threshold) or never flag any. (review F14)
+        threshold = await self.bot.stores.config.get_int(
+            guild_id, "automod.caps_threshold", 70, minimum=0, maximum=100
+        )
+        minlen = await self.bot.stores.config.get_int(
+            guild_id, "automod.caps_minlen", 10, minimum=1, maximum=2000
+        )
         if threshold and len(message.content) >= minlen:
             if caps_percentage(message.content) >= threshold:
                 await self._take_action(message, "excessive caps")

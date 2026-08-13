@@ -10,6 +10,7 @@ about and surface to the user, not silently swallow.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import Optional
@@ -180,9 +181,14 @@ class Database:
         logger.info("Connected to database at %s", self.path)
 
     async def close(self) -> None:
+        # A connection that is already broken often raises on close() too; that
+        # must not stop us nulling the handle, or ping() can never take its
+        # reconnect branch again. (review F2)
         if self.conn is not None:
-            await self.conn.close()
-            self.available = False
+            with contextlib.suppress(Exception):
+                await self.conn.close()
+        self.conn = None
+        self.available = False
 
     async def ping(self) -> bool:
         """Used by the watchdog task in core.py to test/recover a dead connection."""
@@ -190,9 +196,15 @@ class Database:
             if self.conn is None:
                 await self.connect()
                 return True
-            await self.conn.execute("SELECT 1")
+            # `async with` so the cursor is closed - a bare execute() leaked one
+            # cursor per ping. (review F2)
+            async with self.conn.execute("SELECT 1"):
+                pass
             self.available = True
             return True
         except Exception:
-            self.available = False
+            logger.warning("Database ping failed - dropping the connection", exc_info=True)
+            # Drop the dead handle so the next watchdog tick reconnects rather
+            # than retrying the same broken connection forever. (review F2)
+            await self.close()
             return False

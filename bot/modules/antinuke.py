@@ -32,11 +32,16 @@ from collections import defaultdict, deque
 from typing import Optional, Union
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from .logging_module import post_log
 
 logger = logging.getLogger("bot.modules.antinuke")
+
+# 3600 is the ceiling antinuke.window_seconds is clamped to, so no live window
+# can outlive a swept entry. (review F10)
+ACTIONS_MAX_AGE_SECONDS = 3600
+ACTIONS_SWEEP_MINUTES = 10
 
 DANGEROUS_PERMISSIONS = (
     "ban_members",
@@ -51,6 +56,38 @@ class AntiNuke(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._actions: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+
+    async def cog_load(self) -> None:
+        self.sweep_actions.start()
+
+    def cog_unload(self):
+        self.sweep_actions.cancel()
+
+    def _sweep(self, now: float, max_age: float = ACTIONS_MAX_AGE_SECONDS) -> int:
+        """Drops the action-time deque for any (guild, executor) with no recent
+        destructive actions. The dict was keyed by every staff member who has
+        ever deleted a channel and nothing was ever removed. (review F10)"""
+        dropped = 0
+        for key in list(self._actions):
+            times = self._actions[key]
+            if times and now - times[-1] <= max_age:
+                continue
+            del self._actions[key]
+            dropped += 1
+        return dropped
+
+    @tasks.loop(minutes=ACTIONS_SWEEP_MINUTES)
+    async def sweep_actions(self):
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. (review F4)
+        try:
+            self._sweep(time.monotonic())
+        except Exception:
+            logger.exception("antinuke sweep_actions iteration failed")
+
+    @sweep_actions.before_loop
+    async def before_sweep_actions(self):
+        await self.bot.wait_until_ready()
 
     async def _find_executor(
         self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int
@@ -72,8 +109,14 @@ class AntiNuke(commands.Cog):
         if not await self.bot.stores.config.get_bool(guild.id, "antinuke.enabled", False):
             return
 
-        threshold = await self.bot.stores.config.get_int(guild.id, "antinuke.action_threshold", 3)
-        window_seconds = await self.bot.stores.config.get_int(guild.id, "antinuke.window_seconds", 30)
+        # Bounded so a stored negative/absurd value can't make anti-nuke fire
+        # on a single action or never fire at all. (review F14)
+        threshold = await self.bot.stores.config.get_int(
+            guild.id, "antinuke.action_threshold", 3, minimum=1, maximum=1000
+        )
+        window_seconds = await self.bot.stores.config.get_int(
+            guild.id, "antinuke.window_seconds", 30, minimum=1, maximum=3600
+        )
 
         key = (guild.id, executor.id)
         times = self._actions[key]
@@ -115,8 +158,19 @@ class AntiNuke(commands.Cog):
                 continue
         return stripped
 
+    async def _enabled(self, guild: discord.Guild) -> bool:
+        """Cheap config read, checked *before* _find_executor's audit-log API
+        call. The module is off by default, so without this every guild pays
+        rate-limit budget on every channel/role delete and ban for a feature
+        that never fires - worst of all during a mass-ban burst. The same
+        check stays inside _handle_destructive_action so that method is still
+        safe to call from anywhere. (review F11)"""
+        return await self.bot.stores.config.get_bool(guild.id, "antinuke.enabled", False)
+
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        if not await self._enabled(channel.guild):
+            return
         executor = await self._find_executor(
             channel.guild, discord.AuditLogAction.channel_delete, channel.id
         )
@@ -124,11 +178,15 @@ class AntiNuke(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
+        if not await self._enabled(role.guild):
+            return
         executor = await self._find_executor(role.guild, discord.AuditLogAction.role_delete, role.id)
         await self._handle_destructive_action(role.guild, executor, "deleting roles")
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: Union[discord.User, discord.Member]):
+        if not await self._enabled(guild):
+            return
         executor = await self._find_executor(guild, discord.AuditLogAction.ban, user.id)
         await self._handle_destructive_action(guild, executor, "mass-banning members")
 

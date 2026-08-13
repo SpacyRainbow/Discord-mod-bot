@@ -188,3 +188,71 @@ async def test_open_ticket_ignores_category_id_pointing_to_a_non_category_channe
 
     guild.create_text_channel.assert_awaited_once()
     assert guild.create_text_channel.await_args.kwargs["category"] is None
+
+# --- review F9: duplicate ticket channels from two fast clicks -----------
+
+@pytest.mark.asyncio
+async def test_open_ticket_is_serialised_per_user(db):
+    """get_open_for_user -> create_text_channel -> create had no mutual
+    exclusion, so two quick Open Ticket clicks both read "no open ticket" and
+    created two channels - the duplicate the check exists to prevent."""
+    import asyncio
+
+    bot = MagicMock()
+    bot.stores = Stores(db)
+    cog = Tickets(bot)
+
+    created = []
+
+    async def create_text_channel(name, **kwargs):
+        await asyncio.sleep(0)  # yield, so an unguarded second click can interleave
+        channel = MagicMock()
+        channel.id = 900 + len(created)
+        channel.mention = f"#{name}"
+        channel.send = AsyncMock()
+        created.append(channel)
+        return channel
+
+    guild = MagicMock()
+    guild.id = 1
+    guild.roles = []
+    guild.get_channel = MagicMock(return_value=None)
+    guild.create_text_channel = AsyncMock(side_effect=create_text_channel)
+
+    def _interaction():
+        interaction = MagicMock()
+        interaction.guild = guild
+        interaction.user.id = 42
+        interaction.user.name = "someone"
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        return interaction
+
+    await asyncio.gather(cog.open_ticket(_interaction()), cog.open_ticket(_interaction()))
+
+    assert len(created) == 1
+    assert await bot.stores.tickets.get_open_for_user(1, 42) is not None
+
+
+# --- review F10: _open_locks grew one entry per ticket-open click ---
+
+
+async def test_sweep_locks_drops_an_unheld_lock(db):
+    cog = Tickets(_make_bot(db))
+    cog._open_lock_for(GUILD, 7)
+    assert cog._sweep_locks() == 1
+    assert cog._open_locks == {}
+
+
+async def test_sweep_locks_never_evicts_a_held_lock(db):
+    cog = Tickets(_make_bot(db))
+    lock = cog._open_lock_for(GUILD, 7)
+    async with lock:
+        assert cog._sweep_locks() == 0
+        assert cog._open_lock_for(GUILD, 7) is lock
+
+
+async def test_sweep_locks_loop_body_survives_a_raising_sweep(db):
+    cog = Tickets(_make_bot(db))
+    cog._sweep_locks = MagicMock(side_effect=RuntimeError("boom"))
+    await cog.sweep_locks.coro(cog)  # must not raise (review F4)

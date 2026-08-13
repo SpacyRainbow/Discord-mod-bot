@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -346,3 +347,151 @@ async def test_shuffle_cmd_shuffles_without_losing_tracks():
     assert len(state.queue) == 10
     assert {t.title for t in state.queue} == original_titles
     ctx.send.assert_awaited_once()
+
+
+# --- review F4: the loop body must never let an exception escape -----------
+# tasks.loop only auto-restarts on network errors, so an exception escaping
+# position_check would silently disable SponsorBlock skipping forever.
+
+
+def _make_playing_state(cog, guild_id):
+    state = cog._state(guild_id)
+    state.skip_segments = [(10.0, 20.0)]
+    state.voice_client = MagicMock()
+    state.voice_client.is_playing = MagicMock(return_value=True)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_position_check_survives_a_failing_player():
+    cog = _make_cog()
+    state = _make_playing_state(cog, 1)
+    state.voice_client.is_playing = MagicMock(side_effect=RuntimeError("voice exploded"))
+
+    await cog.position_check.coro(cog)  # must return normally, not propagate
+
+
+@pytest.mark.asyncio
+async def test_position_check_survives_a_failing_seek():
+    cog = _make_cog()
+    _make_playing_state(cog, 1)
+    cog._seek_within_track = AsyncMock(side_effect=RuntimeError("seek exploded"))
+
+    await cog.position_check.coro(cog)  # must return normally
+
+
+@pytest.mark.asyncio
+async def test_position_check_one_broken_guild_does_not_stop_the_others():
+    cog = _make_cog()
+    broken = _make_playing_state(cog, 1)
+    broken.voice_client.is_playing = MagicMock(side_effect=RuntimeError("voice exploded"))
+    healthy = _make_playing_state(cog, 2)
+    healthy.position = MagicMock(return_value=12.0)  # inside the (10, 20) skip segment
+
+    cog._seek_within_track = AsyncMock()
+
+    await cog.position_check.coro(cog)
+
+    # The healthy guild still got its skip check despite guild 1 blowing up.
+    cog._seek_within_track.assert_awaited_once()
+    assert cog._seek_within_track.await_args.args[0] is healthy
+
+
+# --- review F17: _advance failures were swallowed; loops replayed dead URLs ---
+
+
+@pytest.mark.asyncio
+async def test_advance_clears_the_stream_url_when_re_queueing_for_loop_mode():
+    """A signed CDN stream URL expires after a few hours, so re-queueing a
+    looped track with it still set eventually hands ffmpeg a dead link."""
+    cog = _make_cog()
+    state = GuildMusicState(1)
+    track = _make_track()
+    track.stream_url = "https://cdn.example/expired-signed-url"
+    state.current = track
+    state.loop_mode = "queue"
+
+    played = []
+
+    async def fake_ensure_and_play(s, t, ctx=None):
+        played.append(t)
+        return True
+
+    cog._ensure_and_play = fake_ensure_and_play
+    await cog._advance(state)
+
+    assert played == [track]
+    assert track.stream_url is None
+    assert track.resolve_query == track.webpage_url
+
+
+@pytest.mark.asyncio
+async def test_advance_leaves_the_stream_url_alone_when_not_looping():
+    cog = _make_cog()
+    state = GuildMusicState(1)
+    finished = _make_track("Finished")
+    finished.stream_url = "https://cdn.example/still-set"
+    state.current = finished
+    state.loop_mode = "off"
+    cog._announce_queue_empty = AsyncMock()
+    cog._schedule_idle_disconnect = MagicMock()
+
+    await cog._advance(state)
+
+    assert finished.stream_url == "https://cdn.example/still-set"
+    assert state.current is None
+
+
+def test_after_play_attaches_a_done_callback_so_advance_failures_get_logged():
+    """Source-level: the Future returned by run_coroutine_threadsafe must not
+    be discarded, or an exception inside _advance never surfaces anywhere."""
+    import inspect
+
+    from bot.modules import music as music_module
+
+    src = inspect.getsource(music_module.Music._start_playback)
+    assert "add_done_callback" in src
+    assert "fut.result()" in src
+
+
+# --- review F18: voice connect errors were unhandled ---
+
+
+def _play_ctx(guild_id=1):
+    ctx = _make_ctx(guild_id)
+    ctx.defer = AsyncMock()
+    ctx.author.voice.channel = MagicMock()
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [asyncio.TimeoutError(), discord.ClientException("Already connected")]
+)
+async def test_play_reports_a_failed_voice_connect_and_clears_the_stale_client(error):
+    cog = _make_cog()
+    ctx = _play_ctx()
+    ctx.author.voice.channel.connect = AsyncMock(side_effect=error)
+    state = cog._state(1)
+    state.voice_client = None
+
+    await Music.play.callback(cog, ctx, query="anything")
+
+    ctx.send.assert_awaited_once()
+    assert "couldn't join" in ctx.send.await_args.args[0].lower()
+    assert cog._state(1).voice_client is None
+
+
+# --- review F10: Music.states kept a GuildMusicState per guild forever ---
+
+
+@pytest.mark.asyncio
+async def test_full_stop_evicts_the_guild_state():
+    cog = _make_cog()
+    state = cog._state(42)
+    state.voice_client = None
+    cog._strip_player_buttons = AsyncMock()
+
+    await cog._full_stop(state)
+
+    assert 42 not in cog.states

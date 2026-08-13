@@ -49,17 +49,27 @@ class Scheduler(commands.Cog):
 
     @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
     async def check_due_tasks(self):
-        now_iso = discord.utils.utcnow().isoformat()
-        for task_id, guild_id, kind, payload in await self.bot.stores.scheduled.due(now_iso):
-            handler = self.bot.scheduler_handlers.get(kind)
-            if handler is None:
-                logger.warning("No handler registered for scheduled task kind=%s", kind)
-            else:
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. This is the single
+        # scheduling engine for tempbans, giveaways, polls and /remind. (review F4)
+        try:
+            now_iso = discord.utils.utcnow().isoformat()
+            for task_id, guild_id, kind, payload in await self.bot.stores.scheduled.due(now_iso):
+                # Per-row isolation: one bad task must not skip the rest of the batch.
                 try:
-                    await handler(guild_id, payload)
+                    handler = self.bot.scheduler_handlers.get(kind)
+                    if handler is None:
+                        logger.warning("No handler registered for scheduled task kind=%s", kind)
+                    else:
+                        try:
+                            await handler(guild_id, payload)
+                        except Exception:
+                            logger.exception("Scheduled task handler failed for kind=%s", kind)
+                    await self.bot.stores.scheduled.mark_done(task_id)
                 except Exception:
-                    logger.exception("Scheduled task handler failed for kind=%s", kind)
-            await self.bot.stores.scheduled.mark_done(task_id)
+                    logger.exception("Failed to process scheduled task id=%s", task_id)
+        except Exception:
+            logger.exception("check_due_tasks iteration failed")
 
     @check_due_tasks.before_loop
     async def before_check_due_tasks(self):
@@ -79,7 +89,14 @@ class Scheduler(commands.Cog):
         channel = self.bot.get_channel(payload.get("channel_id"))
         if channel is not None:
             try:
-                await channel.send(f"<@{user_id}> {content}")
+                # Opts back in to the client-wide AllowedMentions.none() default:
+                # a reminder that doesn't ping the person is useless. (review F6)
+                await channel.send(
+                    f"<@{user_id}> {content}",
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, roles=False, users=True
+                    ),
+                )
             except discord.HTTPException:
                 pass
 

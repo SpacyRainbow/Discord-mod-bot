@@ -17,6 +17,17 @@ reason Spotify's credentials in music.py aren't per-guild:
                         action/console/whitelist buttons to work against
                         it - Crafty replies with its own "not authorized"
                         error otherwise.
+  CRAFTY_CA_BUNDLE    - optional; path to the certificate (or internal CA)
+                        Crafty's HTTPS listener presents. Self-hosted
+                        Crafty usually runs a self-signed cert, which the
+                        system trust store won't accept - point this at it
+                        rather than turning verification off, because this
+                        connection carries CRAFTY_API_TOKEN, which has full
+                        Minecraft console access.
+  CRAFTY_INSECURE_TLS - optional; 1/true/yes disables certificate
+                        verification entirely. Last resort only - it
+                        exposes CRAFTY_API_TOKEN to anyone on the network
+                        path. Logs a warning every time it's used.
   CRAFTY_SERVER_ID    - optional; skips server discovery entirely and
                         always targets this one server ID. Without it,
                         /mcstatus looks servers up by name (or auto-picks
@@ -75,6 +86,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import ssl
 from collections import Counter
 from typing import Optional
 
@@ -383,9 +395,28 @@ class Minecraft(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
+        # Built once at cog_load and reused by _request/_post - see _ssl_context.
+        self.ssl_context = None
+
+    def _ssl_context(self):
+        """Verify Crafty's certificate. Self-hosted Crafty usually runs a self-signed
+        cert, so point CRAFTY_CA_BUNDLE at it (or at your internal CA) rather than
+        disabling verification - this connection carries a token with full Minecraft
+        console access. (review F8)"""
+        if os.getenv("CRAFTY_INSECURE_TLS", "").lower() in ("1", "true", "yes"):
+            logger.warning(
+                "CRAFTY_INSECURE_TLS is set - Crafty's certificate is NOT verified "
+                "and CRAFTY_API_TOKEN is exposed to anyone on the network path."
+            )
+            return False
+        ca_bundle = os.getenv("CRAFTY_CA_BUNDLE")
+        if ca_bundle:
+            return ssl.create_default_context(cafile=ca_bundle)
+        return None  # aiohttp default: verify against the system trust store
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
+        self.ssl_context = self._ssl_context()
 
     async def cog_unload(self) -> None:
         if self.session is not None:
@@ -409,7 +440,7 @@ class Minecraft(commands.Cog):
             async with self.session.get(
                 f"{base_url}{path}",
                 headers={"Authorization": f"Bearer {token}"},
-                ssl=False,  # self-hosted Crafty typically runs on a self-signed cert
+                ssl=self.ssl_context,  # review F8 - see _ssl_context
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
             ) as resp:
                 if resp.status != 200:
@@ -441,7 +472,7 @@ class Minecraft(commands.Cog):
                 f"{base_url}{path}",
                 data=data,
                 headers={"Authorization": f"Bearer {token}"},
-                ssl=False,
+                ssl=self.ssl_context,  # review F8 - see _ssl_context
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
             ) as resp:
                 if resp.status != 200:

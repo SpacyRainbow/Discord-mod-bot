@@ -8,6 +8,9 @@ class Bucket(commands.Cog):
         self.bot = bot
 
     @commands.hybrid_command(name="bucketadd")
+    # Any member could previously push content into any bucket, which bucket_pick
+    # then replays verbatim. Same manage_messages tier as tagset. (review F7)
+    @commands.has_permissions(manage_messages=True)
     async def bucket_add(self, ctx: commands.Context, bucket_name: str, *, item: str):
         await self.bot.stores.buckets.add(ctx.guild.id, bucket_name, item)
         await ctx.send(f"Added to `{bucket_name}`.")

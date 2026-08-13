@@ -964,3 +964,160 @@ async def test_editcase_cannot_touch_a_case_in_another_guild(db):
     assert f"No case #{case_id}" in ctx.send.await_args.args[0]
     row = await bot.stores.cases.get(other_guild_id, case_id)
     assert row[3] == "original"  # untouched
+
+
+# --- review F4: the loop body must never let an exception escape -----------
+
+
+@pytest.mark.asyncio
+async def test_mute_expiry_check_survives_a_failing_store(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    bot.stores.mutes.due = AsyncMock(side_effect=RuntimeError("db exploded"))
+
+    await cog.mute_expiry_check.coro(cog)  # must return normally, not propagate
+
+
+@pytest.mark.asyncio
+async def test_mute_expiry_check_survives_a_failing_clear(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    past = (discord.utils.utcnow() - datetime.timedelta(minutes=1)).isoformat()
+    await bot.stores.mutes.schedule(GUILD, 42, past)
+    bot.stores.mutes.clear = AsyncMock(side_effect=RuntimeError("db exploded"))
+
+    await cog.mute_expiry_check.coro(cog)  # must return normally
+
+
+@pytest.mark.asyncio
+async def test_mute_expiry_check_bad_row_does_not_skip_the_rest_of_the_batch(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    past = (discord.utils.utcnow() - datetime.timedelta(minutes=1)).isoformat()
+    await bot.stores.mutes.schedule(GUILD, 1, past)
+    await bot.stores.mutes.schedule(GUILD, 2, past)
+
+    # get_guild raises for the first user seen, succeeds (returns None) after.
+    calls = []
+
+    def _flaky_get_guild(guild_id):
+        calls.append(guild_id)
+        if len(calls) == 1:
+            raise RuntimeError("cache exploded")
+        return None
+
+    bot.get_guild = MagicMock(side_effect=_flaky_get_guild)
+
+    await cog.mute_expiry_check.coro(cog)
+
+    # Both rows were attempted despite the first one raising.
+    assert len(calls) == 2
+
+
+# --- review F15: ensure_mute_role rewrote every channel on every mute ---
+
+
+@pytest.mark.asyncio
+async def test_ensure_mute_role_backfills_channel_overwrites_on_creation(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    channels = [_make_channel(1), _make_channel(2)]
+    guild.text_channels = channels
+
+    await cog.ensure_mute_role(guild)
+
+    for channel in channels:
+        channel.set_permissions.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_mute_role_does_not_touch_channels_when_the_role_exists(db):
+    """One API call per channel per mute rate-limited big guilds, and
+    _mute_with_role awaited all of it before the mute actually landed."""
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    first = await cog.ensure_mute_role(guild)
+    guild.get_role = MagicMock(return_value=first)
+    channels = [_make_channel(1), _make_channel(2)]
+    guild.text_channels = channels
+
+    await cog.ensure_mute_role(guild)
+
+    for channel in channels:
+        channel.set_permissions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sync_mute_role_command_reapplies_overwrites_manually(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    role = await cog.ensure_mute_role(guild)
+    guild.get_role = MagicMock(return_value=role)
+    channels = [_make_channel(1), _make_channel(2)]
+    guild.text_channels = channels
+    ctx = _make_ctx(guild=guild)
+
+    await Moderation.sync_mute_role.callback(cog, ctx)
+
+    for channel in channels:
+        channel.set_permissions.assert_awaited_once()
+    assert "2/2" in ctx.send.await_args.args[0]
+
+
+# --- review F16: a role mute could succeed while its bookkeeping raised ---
+
+
+@pytest.mark.asyncio
+async def test_timed_role_mute_still_confirms_when_scheduling_the_expiry_fails(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    ctx = _make_ctx(guild=guild)
+    member = _make_member()
+    bot.stores.mutes.schedule = AsyncMock(side_effect=RuntimeError("Database unavailable"))
+
+    await cog._mute_with_role(ctx, member, datetime.timedelta(days=40), "spamming")
+
+    member.add_roles.assert_awaited_once()
+    reply = ctx.send.await_args.args[0]
+    assert "Muted" in reply
+    assert "unmute" in reply.lower()
+    assert "case #" not in reply  # there is no case id to interpolate
+
+
+@pytest.mark.asyncio
+async def test_timed_role_mute_still_confirms_when_the_case_record_fails(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    ctx = _make_ctx(guild=guild)
+    member = _make_member()
+    bot.stores.cases.add = AsyncMock(side_effect=RuntimeError("Database unavailable"))
+
+    await cog._mute_with_role(ctx, member, datetime.timedelta(days=40), "spamming")
+
+    member.add_roles.assert_awaited_once()
+    reply = ctx.send.await_args.args[0]
+    assert "Muted" in reply
+    assert "case history" in reply
+    assert "case #" not in reply
+
+
+@pytest.mark.asyncio
+async def test_indefinite_role_mute_still_confirms_when_the_case_record_fails(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    guild = _make_guild()
+    ctx = _make_ctx(guild=guild)
+    member = _make_member()
+    bot.stores.cases.add = AsyncMock(side_effect=RuntimeError("Database unavailable"))
+
+    await cog._mute_with_role(ctx, member, None, "spamming")
+
+    member.add_roles.assert_awaited_once()
+    reply = ctx.send.await_args.args[0]
+    assert "indefinitely" in reply
+    assert "case #" not in reply

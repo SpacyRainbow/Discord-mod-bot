@@ -182,3 +182,67 @@ async def test_check_due_tasks_skips_unregistered_kind_without_raising(db):
 
     due = await bot.stores.scheduled.due(discord.utils.utcnow().isoformat())
     assert due == []
+
+
+# --- review F4: the loop body must never let an exception escape -----------
+# tasks.loop only auto-restarts on a small allowlist of network errors; any
+# other exception stops the loop for the life of the process. check_due_tasks
+# is the single scheduling engine for tempbans, giveaways, polls and /remind.
+
+
+@pytest.mark.asyncio
+async def test_check_due_tasks_survives_a_failing_store(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    bot.stores.scheduled.due = AsyncMock(side_effect=RuntimeError("db exploded"))
+
+    await cog.check_due_tasks.coro(cog)  # must return normally, not propagate
+
+
+@pytest.mark.asyncio
+async def test_check_due_tasks_survives_a_failing_mark_done(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    bot.scheduler_handlers["reminder"] = AsyncMock()
+    await bot.stores.scheduled.add(
+        GUILD, "reminder", {"x": 1}, discord.utils.utcnow() - datetime.timedelta(seconds=1)
+    )
+    bot.stores.scheduled.mark_done = AsyncMock(side_effect=RuntimeError("db exploded"))
+
+    await cog.check_due_tasks.coro(cog)  # must return normally
+
+
+@pytest.mark.asyncio
+async def test_check_due_tasks_bad_row_does_not_skip_the_rest_of_the_batch(db):
+    bot = _make_bot(db)
+    cog = _make_cog(bot)
+    past = discord.utils.utcnow() - datetime.timedelta(seconds=1)
+    await bot.stores.scheduled.add(GUILD, "first", {"n": 1}, past)
+    await bot.stores.scheduled.add(GUILD, "second", {"n": 2}, past)
+
+    seen = []
+
+    async def _first(guild_id, payload):
+        seen.append(payload["n"])
+
+    async def _second(guild_id, payload):
+        seen.append(payload["n"])
+
+    bot.scheduler_handlers["first"] = _first
+    bot.scheduler_handlers["second"] = _second
+
+    # mark_done blows up on the first task only; the second must still run.
+    original = bot.stores.scheduled.mark_done
+    calls = []
+
+    async def _flaky_mark_done(task_id):
+        calls.append(task_id)
+        if len(calls) == 1:
+            raise RuntimeError("db exploded")
+        await original(task_id)
+
+    bot.stores.scheduled.mark_done = _flaky_mark_done
+
+    await cog.check_due_tasks.coro(cog)
+
+    assert sorted(seen) == [1, 2]

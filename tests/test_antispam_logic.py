@@ -85,17 +85,64 @@ def test_sync_message_window_no_op_when_already_in_sync():
 
 
 def test_group_by_channel_groups_messages_by_channel_id():
-    class FakeMessage:
-        def __init__(self, channel_id):
-            self.channel = type("Channel", (), {"id": channel_id})()
-
-    messages = [FakeMessage(1), FakeMessage(2), FakeMessage(1)]
-    grouped = group_by_channel(messages)
+    # (channel_id, message_id) pairs rather than Message objects - see F10.
+    refs = [(1, 10), (2, 20), (1, 11)]
+    grouped = group_by_channel(refs)
 
     assert set(grouped.keys()) == {1, 2}
-    assert len(grouped[1]) == 2
-    assert len(grouped[2]) == 1
+    assert grouped[1] == [10, 11]
+    assert grouped[2] == [20]
 
 
 def test_group_by_channel_empty_list_returns_empty_dict():
     assert group_by_channel([]) == {}
+
+
+# --- review F10: _history/_locks were keyed by every user who ever posted ---
+
+
+def _cog():
+    from unittest.mock import MagicMock
+
+    from bot.modules.antispam import AntiSpam
+
+    return AntiSpam(MagicMock())
+
+
+def test_sweep_drops_a_user_whose_history_is_stale():
+    cog = _cog()
+    now = 10_000.0
+    cog._history[(1, 2)].timestamps.append(now - 7200)
+    cog._locks[(1, 2)]  # materialise the lock too
+    assert cog._sweep(now) == 1
+    assert (1, 2) not in cog._history
+    assert (1, 2) not in cog._locks
+
+
+def test_sweep_keeps_a_user_who_posted_recently():
+    cog = _cog()
+    now = 10_000.0
+    cog._history[(1, 2)].timestamps.append(now - 5)
+    assert cog._sweep(now) == 0
+    assert (1, 2) in cog._history
+
+
+async def test_sweep_never_evicts_a_lock_that_is_currently_held():
+    """Evicting a held lock hands the holder and the next caller two different
+    Lock objects for the same key, silently undoing phase 2's F9 race fix."""
+    cog = _cog()
+    now = 10_000.0
+    cog._history[(1, 2)].timestamps.append(now - 7200)  # stale enough to evict
+    lock = cog._locks[(1, 2)]
+    async with lock:
+        assert cog._sweep(now) == 0
+        assert (1, 2) in cog._history
+        assert cog._locks[(1, 2)] is lock
+
+
+async def test_sweep_loop_body_survives_a_raising_sweep():
+    from unittest.mock import MagicMock
+
+    cog = _cog()
+    cog._sweep = MagicMock(side_effect=RuntimeError("boom"))
+    await cog.sweep_history.coro(cog)  # must not raise (review F4)

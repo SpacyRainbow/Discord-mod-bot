@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from bot.modules.raid import Raid
+from bot.modules.raid import Raid, _previous_level
 from bot.stores import Stores
 
 GUILD = 111
@@ -209,3 +209,51 @@ async def test_account_age_exactly_at_the_gate_boundary_is_not_kicked(db):
     await cog.on_member_join(member)
 
     member.kick.assert_not_awaited()
+
+
+# --- review F12: /raidmode off crashed on a malformed stored level ---
+
+
+def test_previous_level_unset_defaults_to_medium():
+    assert _previous_level(None) is discord.VerificationLevel.medium
+
+
+def test_previous_level_empty_string_defaults_to_medium():
+    assert _previous_level("") is discord.VerificationLevel.medium
+
+
+def test_previous_level_non_numeric_defaults_to_medium():
+    assert _previous_level("banana") is discord.VerificationLevel.medium
+
+
+def test_previous_level_out_of_enum_range_defaults_to_medium():
+    assert _previous_level("9") is discord.VerificationLevel.medium
+
+
+def test_previous_level_accepts_a_valid_stored_value():
+    assert _previous_level("1") is discord.VerificationLevel.low
+
+
+# --- review F10: _join_times grew one entry per guild, forever ---
+
+
+async def test_sweep_drops_a_guild_with_only_stale_joins(db):
+    cog = Raid(_make_bot(db))
+    now = 10_000.0
+    cog._join_times[GUILD].append(now - 7200)
+    assert cog._sweep(now) == 1
+    assert GUILD not in cog._join_times
+
+
+async def test_sweep_keeps_a_guild_with_a_recent_join(db):
+    cog = Raid(_make_bot(db))
+    now = 10_000.0
+    cog._join_times[GUILD].append(now - 5)
+    assert cog._sweep(now) == 0
+    assert GUILD in cog._join_times
+
+
+async def test_sweep_loop_body_survives_a_raising_sweep(db):
+    cog = Raid(_make_bot(db))
+    cog._sweep = MagicMock(side_effect=RuntimeError("boom"))
+    await cog.sweep_join_times.coro(cog)  # must not raise (review F4)

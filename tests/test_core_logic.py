@@ -108,3 +108,60 @@ async def test_sync_commands_does_not_clear_global_tree_without_guild_id(monkeyp
 
     bot.tree.clear_commands.assert_not_called()
     assert bot.tree.sync.await_count == 1
+
+
+# --- review F6: the bot echoed user-authored text with live mentions ------
+
+def test_client_default_resolves_no_mentions():
+    """tags, buckets and markov chains all replay user-authored text verbatim;
+    with the client default this let any member fire a real @everyone."""
+    bot = ModBot()
+    assert bot.allowed_mentions.everyone is False
+    assert bot.allowed_mentions.roles is False
+    assert bot.allowed_mentions.users is False
+
+
+# --- review F13: an empty command prefix matched every message ---
+
+
+class _StubConfig:
+    def __init__(self, value):
+        self.value = value
+
+    async def get(self, guild_id, key, default=None):
+        return self.value
+
+
+async def _prefix_for(stored):
+    bot = ModBot()
+    bot.stores.config = _StubConfig(stored)
+    bot._connection.user = MagicMock(id=1)  # when_mentioned needs a self user
+    message = MagicMock()
+    message.guild.id = 1
+    message.content = "hello"
+    return await bot._get_prefix(bot, message)
+
+
+@pytest.mark.asyncio
+async def test_get_prefix_falls_back_when_stored_prefix_is_empty():
+    prefixes = await _prefix_for("")
+    assert "!" in prefixes
+
+
+@pytest.mark.asyncio
+async def test_get_prefix_falls_back_when_stored_prefix_is_whitespace():
+    prefixes = await _prefix_for("   ")
+    assert "!" in prefixes
+
+
+@pytest.mark.asyncio
+async def test_get_prefix_falls_back_when_stored_prefix_is_none():
+    prefixes = await _prefix_for(None)
+    assert "!" in prefixes
+
+
+@pytest.mark.asyncio
+async def test_get_prefix_uses_and_strips_a_real_stored_prefix():
+    prefixes = await _prefix_for(" ? ")
+    assert "?" in prefixes
+    assert "" not in prefixes

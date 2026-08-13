@@ -23,9 +23,11 @@ import asyncio
 import logging
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 logger = logging.getLogger("bot.modules.tickets")
+
+LOCK_SWEEP_MINUTES = 10
 
 CLOSE_DELAY_SECONDS = 5
 
@@ -63,10 +65,51 @@ class TicketCloseView(discord.ui.View):
 class Tickets(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # One lock per (guild_id, user_id), held across the
+        # get_open_for_user -> create_text_channel -> create sequence. Without it
+        # two quick clicks on Open Ticket both read "no open ticket" and create two
+        # channels - the duplicate the check exists to prevent. (review F9)
+        # Swept by sweep_locks below - one entry per ticket-open click
+        # otherwise accumulates forever. (review F10)
+        self._open_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+    def _open_lock_for(self, guild_id: int, user_id: int) -> asyncio.Lock:
+        return self._open_locks.setdefault((guild_id, user_id), asyncio.Lock())
 
     async def cog_load(self) -> None:
         self.bot.add_view(TicketPanelView(self))
         self.bot.add_view(TicketCloseView(self))
+        self.sweep_locks.start()
+
+    def cog_unload(self):
+        self.sweep_locks.cancel()
+
+    def _sweep_locks(self) -> int:
+        """Drops every lock that isn't currently held. An asyncio.Lock can only
+        have waiters while it is locked, so an unheld lock is unreachable state
+        and safe to drop - but evicting a HELD one would hand the holder and the
+        next caller two different Lock objects for the same key and silently
+        undo the mutual exclusion. (review F9/F10)"""
+        dropped = 0
+        for key, lock in list(self._open_locks.items()):
+            if lock.locked():
+                continue
+            self._open_locks.pop(key, None)
+            dropped += 1
+        return dropped
+
+    @tasks.loop(minutes=LOCK_SWEEP_MINUTES)
+    async def sweep_locks(self):
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. (review F4)
+        try:
+            self._sweep_locks()
+        except Exception:
+            logger.exception("tickets sweep_locks iteration failed")
+
+    @sweep_locks.before_loop
+    async def before_sweep_locks(self):
+        await self.bot.wait_until_ready()
 
     @commands.hybrid_command(
         name="ticketpanel", description="Post a button members can click to open a support ticket"
@@ -83,45 +126,52 @@ class Tickets(commands.Cog):
         if guild is None:
             return
 
-        existing = await self.bot.stores.tickets.get_open_for_user(guild.id, interaction.user.id)
-        if existing is not None:
-            channel = guild.get_channel(existing[1])
-            mention = channel.mention if channel else "your existing ticket"
-            await interaction.followup.send(f"You already have an open ticket: {mention}", ephemeral=True)
-            return
+        # Serialised per (guild, user) so the duplicate check and the channel
+        # creation it guards can't interleave with a second click. (review F9)
+        async with self._open_lock_for(guild.id, interaction.user.id):
+            existing = await self.bot.stores.tickets.get_open_for_user(guild.id, interaction.user.id)
+            if existing is not None:
+                channel = guild.get_channel(existing[1])
+                mention = channel.mention if channel else "your existing ticket"
+                await interaction.followup.send(
+                    f"You already have an open ticket: {mention}", ephemeral=True
+                )
+                return
 
-        category_id = await self.bot.stores.config.get_int(guild.id, "tickets.category_id", 0)
-        category = guild.get_channel(category_id) if category_id else None
-        if not isinstance(category, discord.CategoryChannel):
-            category = None
+            category_id = await self.bot.stores.config.get_int(guild.id, "tickets.category_id", 0)
+            category = guild.get_channel(category_id) if category_id else None
+            if not isinstance(category, discord.CategoryChannel):
+                category = None
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        }
-        for role in guild.roles:
-            if role.permissions.manage_guild:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            }
+            for role in guild.roles:
+                if role.permissions.manage_guild:
+                    overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
-        safe_name = "".join(c for c in interaction.user.name.lower() if c.isalnum() or c == "-")
-        channel_name = f"ticket-{safe_name or 'user'}"[:90]
+            safe_name = "".join(c for c in interaction.user.name.lower() if c.isalnum() or c == "-")
+            channel_name = f"ticket-{safe_name or 'user'}"[:90]
 
-        try:
-            channel = await guild.create_text_channel(
-                channel_name,
-                category=category,
-                overwrites=overwrites,
-                reason=f"Ticket opened by {interaction.user}",
-            )
-        except discord.Forbidden:
-            await interaction.followup.send("I don't have permission to create channels.", ephemeral=True)
-            return
+            try:
+                channel = await guild.create_text_channel(
+                    channel_name,
+                    category=category,
+                    overwrites=overwrites,
+                    reason=f"Ticket opened by {interaction.user}",
+                )
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "I don't have permission to create channels.", ephemeral=True
+                )
+                return
 
-        try:
-            await self.bot.stores.tickets.create(guild.id, channel.id, interaction.user.id)
-        except RuntimeError:
-            pass  # channel's still usable, just not tracked for the duplicate-ticket check
+            try:
+                await self.bot.stores.tickets.create(guild.id, channel.id, interaction.user.id)
+            except RuntimeError:
+                pass  # channel's still usable, just not tracked for the duplicate-ticket check
 
         embed = discord.Embed(
             title="Support Ticket",

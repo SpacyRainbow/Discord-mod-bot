@@ -9,7 +9,10 @@ env/
 .mypy_cache/
 
 # Secrets and local data - never commit these
-.env
+# `.env` alone matches only that exact name, so strays like .env.local or
+# .env.orphaned-2026-07-19 stayed committable. (review F1)
+.env*
+!.env.example
 data/
 *.db
 *.sqlite
@@ -19,3 +22,8 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+# Local AI-workflow scratch - agent definitions and the review write-up they
+# produced. Useful on disk, not part of the project.
+.claude/
+docs/review-fixes/

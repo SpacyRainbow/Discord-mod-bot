@@ -123,3 +123,31 @@ async def test_join_does_nothing_when_configured_channel_no_longer_exists(db):
     member = _make_member(guild)
 
     await cog.on_member_join(member)  # must not raise
+
+
+# --- review F6: welcome messages opt back in, users-only -----------------
+
+@pytest.mark.asyncio
+async def test_post_pings_the_member_but_not_everyone(db):
+    """{member} is member.mention and a welcome that doesn't ping is broken, so
+    _post opts out of the client-wide AllowedMentions.none(). users only - a mod
+    must not be able to put @everyone in the template and have it fire."""
+    bot = _make_bot(db)
+    await bot.stores.config.set(GUILD, "welcome.channel_id", "777")
+    await bot.stores.config.set(GUILD, "welcome.message", "@everyone welcome {member}")
+
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    member = MagicMock()
+    member.mention = "<@5>"
+    member.__str__ = lambda self: "someone"
+    guild = _make_guild(channel)
+    member.guild = guild
+
+    cog = Greetings(bot)
+    await cog._post(guild, member, "welcome", "hi {member}")
+
+    mentions = channel.send.await_args.kwargs["allowed_mentions"]
+    assert mentions.users is True
+    assert mentions.everyone is False
+    assert mentions.roles is False

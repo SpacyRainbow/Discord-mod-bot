@@ -243,3 +243,67 @@ async def test_reaction_for_a_guild_the_bot_no_longer_sees_is_ignored(db):
     bot.get_guild = MagicMock(return_value=None)
 
     await cog._handle_reaction(_make_payload())  # must not raise
+
+
+# --- review F9: concurrent reactions produced a duplicate starboard post --
+
+@pytest.mark.asyncio
+async def test_two_simultaneous_reactions_post_only_once(db):
+    """_handle_reaction decided to post by checking get(...) is None first. Two
+    reactions crossing the threshold together both saw None, both posted, and
+    the second set() raised IntegrityError past the `except RuntimeError`."""
+    import asyncio
+
+    bot = _make_bot(db)
+    await bot.stores.config.set(GUILD, "starboard.channel", str(STARBOARD_CHANNEL))
+    await bot.stores.config.set(GUILD, "starboard.threshold", "2")
+
+    posted = []
+
+    async def send(**kwargs):
+        await asyncio.sleep(0)  # yield mid-post, so an unguarded second call interleaves
+        message = MagicMock()
+        message.id = 700 + len(posted)
+        posted.append(message)
+        return message
+
+    starboard_channel = MagicMock()
+    starboard_channel.send = AsyncMock(side_effect=send)
+    starboard_channel.fetch_message = AsyncMock(return_value=MagicMock(edit=AsyncMock()))
+
+    source_channel = MagicMock()
+    source_channel.fetch_message = AsyncMock(
+        side_effect=lambda _: _make_message(999, [_make_reaction(3, [1, 2, 3])])
+    )
+    guild = _make_guild(source_channel, starboard_channel)
+    bot.get_guild = MagicMock(return_value=guild)
+
+    cog = Starboard(bot)
+    await asyncio.gather(cog._handle_reaction(_make_payload()), cog._handle_reaction(_make_payload()))
+
+    assert len(posted) == 1
+    assert await bot.stores.starboard.get(GUILD, 555) == posted[0].id
+
+
+# --- review F10: _locks grew one entry per starred message, forever ---
+
+
+async def test_sweep_locks_drops_an_unheld_lock(db):
+    cog = Starboard(_make_bot(db))
+    cog._lock_for(GUILD, 500)
+    assert cog._sweep_locks() == 1
+    assert cog._locks == {}
+
+
+async def test_sweep_locks_never_evicts_a_held_lock(db):
+    cog = Starboard(_make_bot(db))
+    lock = cog._lock_for(GUILD, 500)
+    async with lock:
+        assert cog._sweep_locks() == 0
+        assert cog._lock_for(GUILD, 500) is lock
+
+
+async def test_sweep_locks_loop_body_survives_a_raising_sweep(db):
+    cog = Starboard(_make_bot(db))
+    cog._sweep_locks = MagicMock(side_effect=RuntimeError("boom"))
+    await cog.sweep_locks.coro(cog)  # must not raise (review F4)

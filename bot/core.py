@@ -56,7 +56,15 @@ class ModBot(commands.Bot):
         intents.message_content = True
         # help_command=None: status.py defines its own /help hybrid command,
         # which would collide with discord.py's default one otherwise.
-        super().__init__(command_prefix=self._get_prefix, intents=intents, help_command=None)
+        super().__init__(
+            command_prefix=self._get_prefix,
+            intents=intents,
+            help_command=None,
+            # Everything this bot echoes back can contain user-authored text (tags,
+            # buckets, markov chains). Default to resolving no mentions at all; the
+            # handful of sends that are *meant* to ping opt in explicitly. (review F6)
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
         db_path = os.getenv("DB_PATH", "/app/data/bot.db")
         self.db = Database(db_path)
@@ -72,6 +80,13 @@ class ModBot(commands.Bot):
         if message.guild is None:
             return DEFAULT_PREFIX
         prefix = await self.stores.config.get(message.guild.id, "commandprefix", DEFAULT_PREFIX)
+        # An empty/whitespace prefix makes when_mentioned_or("") match every
+        # message in the guild, so the bot tries full command resolution on all
+        # traffic - and there'd be no working way to set it back. /setconfig can
+        # still write one directly, so coerce defensively here. (review F13)
+        prefix = prefix.strip() if isinstance(prefix, str) else ""
+        if not prefix:
+            prefix = DEFAULT_PREFIX
         return commands.when_mentioned_or(prefix)(bot, message)
 
     async def setup_hook(self) -> None:

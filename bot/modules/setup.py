@@ -683,6 +683,48 @@ class _LeaveChannelSelect(discord.ui.ChannelSelect):
         await self.setup_view.refresh(interaction)
 
 
+# Accepted ranges for every numeric config key these modals write. They mirror
+# the bounds the readers pass to ConfigStore.get_int, so a value accepted here
+# is a value that will actually be honoured at read time - previously the modals
+# checked int-ness only, so "-5" and "999999999" were stored happily and then
+# silently disabled detection or broke the Discord call. (review F14)
+_INT_BOUNDS: dict[str, tuple[int, int]] = {
+    "spam.max_messages": (1, 100),
+    "spam.window_seconds": (1, 3600),
+    "spam.max_duplicates": (2, 100),
+    "spam.max_mentions": (1, 100),
+    "spam.timeout_seconds": (1, 2419200),  # Discord's 28-day timeout cap
+    "automod.caps_threshold": (0, 100),
+    "automod.caps_minlen": (1, 2000),
+    "bored.idle_seconds": (60, 86400),
+    "raid.min_account_age_hours": (0, 8760),
+    "raid.join_threshold": (0, 1000),
+    "raid.join_window_seconds": (1, 3600),
+    "antinuke.action_threshold": (1, 1000),
+    "antinuke.window_seconds": (1, 3600),
+    "starboard.threshold": (1, 100),
+}
+
+
+def _int_field_error(key: str, value: str) -> Optional[str]:
+    """Returns the ephemeral "nothing was saved" message if `value` isn't a
+    whole number inside `key`'s accepted range, else None. (review F14)"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return f"`{value}` isn't a whole number - nothing was saved."
+    bounds = _INT_BOUNDS.get(key)
+    if bounds is None:
+        return None
+    minimum, maximum = bounds
+    if not minimum <= parsed <= maximum:
+        return (
+            f"`{value}` is out of range for `{key}` (accepted: {minimum}-{maximum}) "
+            "- nothing was saved."
+        )
+    return None
+
+
 class _PrefixModal(discord.ui.Modal, title="General settings"):
     def __init__(self, view: SetupView):
         super().__init__()
@@ -691,8 +733,16 @@ class _PrefixModal(discord.ui.Modal, title="General settings"):
         self.add_item(self.prefix)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Discord's required=True doesn't reject whitespace, and an empty prefix
+        # makes every message in the guild a command parse. (review F13)
+        prefix = (self.prefix.value or "").strip()
+        if not prefix:
+            await interaction.response.send_message(
+                "The command prefix can't be empty or only spaces - nothing was saved.", ephemeral=True
+            )
+            return
         await self.setup_view.cog.bot.stores.config.set(
-            self.setup_view.guild.id, "commandprefix", self.prefix.value
+            self.setup_view.guild.id, "commandprefix", prefix
         )
         await self.setup_view.refresh(interaction)
 
@@ -732,12 +782,9 @@ class _AntiSpamModal(discord.ui.Modal, title="Anti-spam thresholds"):
             "spam.timeout_seconds": self.timeout_seconds.value,
         }
         for key, value in fields.items():
-            try:
-                int(value)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"`{value}` isn't a whole number - nothing was saved.", ephemeral=True
-                )
+            error = _int_field_error(key, value)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
                 return
         for key, value in fields.items():
             await self.setup_view.cog.bot.stores.config.set(self.setup_view.guild.id, key, value)
@@ -770,13 +817,10 @@ class _AutomodModal(discord.ui.Modal, title="Automod thresholds"):
             "automod.caps_threshold": self.caps_threshold.value,
             "automod.caps_minlen": self.caps_minlen.value,
         }
-        for value in fields.values():
-            try:
-                int(value)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"`{value}` isn't a whole number - nothing was saved.", ephemeral=True
-                )
+        for key, value in fields.items():
+            error = _int_field_error(key, value)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
                 return
         for key, value in fields.items():
             await self.setup_view.cog.bot.stores.config.set(self.setup_view.guild.id, key, value)
@@ -804,12 +848,9 @@ class _BoredModal(discord.ui.Modal, title="Bored detector"):
         self.add_item(self.message)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            int(self.idle_seconds.value)
-        except ValueError:
-            await interaction.response.send_message(
-                f"`{self.idle_seconds.value}` isn't a whole number - nothing was saved.", ephemeral=True
-            )
+        error = _int_field_error("bored.idle_seconds", self.idle_seconds.value)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
         await self.setup_view.cog.bot.stores.config.set(
             self.setup_view.guild.id, "bored.idle_seconds", self.idle_seconds.value
@@ -848,13 +889,10 @@ class _RaidModal(discord.ui.Modal, title="Raid protection"):
             "raid.join_threshold": self.join_threshold.value,
             "raid.join_window_seconds": self.join_window_seconds.value,
         }
-        for value in fields.values():
-            try:
-                int(value)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"`{value}` isn't a whole number - nothing was saved.", ephemeral=True
-                )
+        for key, value in fields.items():
+            error = _int_field_error(key, value)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
                 return
         for key, value in fields.items():
             await self.setup_view.cog.bot.stores.config.set(self.setup_view.guild.id, key, value)
@@ -885,13 +923,10 @@ class _AntiNukeModal(discord.ui.Modal, title="Anti-nuke thresholds"):
             "antinuke.action_threshold": self.action_threshold.value,
             "antinuke.window_seconds": self.window_seconds.value,
         }
-        for value in fields.values():
-            try:
-                int(value)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"`{value}` isn't a whole number - nothing was saved.", ephemeral=True
-                )
+        for key, value in fields.items():
+            error = _int_field_error(key, value)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
                 return
         for key, value in fields.items():
             await self.setup_view.cog.bot.stores.config.set(self.setup_view.guild.id, key, value)
@@ -913,12 +948,9 @@ class _StarboardModal(discord.ui.Modal, title="Starboard"):
         self.add_item(self.threshold)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            int(self.threshold.value)
-        except ValueError:
-            await interaction.response.send_message(
-                f"`{self.threshold.value}` isn't a whole number - nothing was saved.", ephemeral=True
-            )
+        error = _int_field_error("starboard.threshold", self.threshold.value)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
         await self.setup_view.cog.bot.stores.config.set(
             self.setup_view.guild.id, "starboard.threshold", self.threshold.value

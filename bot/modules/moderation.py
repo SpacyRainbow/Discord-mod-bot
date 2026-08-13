@@ -132,6 +132,20 @@ class Moderation(commands.Cog):
                 reason="Auto-created mute role",
             )
             await self.bot.stores.config.set(guild.id, "moderation.mute_role", str(role.id))
+            # Backfill only on creation. This used to run unconditionally, so
+            # every mute issued one API call per text channel (200 channels =
+            # 200 requests, rate-limited, and _mute_with_role awaits all of it
+            # *before* the mute lands). on_guild_channel_create keeps channels
+            # made later in sync, and /syncmuterole is the manual repair path.
+            # (review F15)
+            await self._sync_mute_role_channels(guild, role)
+        return role
+
+    async def _sync_mute_role_channels(self, guild: discord.Guild, role: discord.Role) -> int:
+        """Applies MUTE_ROLE_OVERWRITE to every text channel. One API call per
+        channel, so this is a one-time/manual operation, never on the mute hot
+        path. Returns how many channels were successfully updated."""
+        synced = 0
         for channel in guild.text_channels:
             try:
                 await channel.set_permissions(
@@ -139,7 +153,27 @@ class Moderation(commands.Cog):
                 )
             except discord.Forbidden:
                 continue
-        return role
+            synced += 1
+        return synced
+
+    @commands.hybrid_command(
+        name="syncmuterole",
+        description="Re-apply the mute role's permission overwrite to every text channel",
+    )
+    @commands.guild_only()
+    @commands.has_permissions(manage_roles=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def sync_mute_role(self, ctx: commands.Context):
+        """Manual repair for the one-time backfill that ensure_mute_role now
+        only does at creation time. (review F15)"""
+        role = await self.get_mute_role(ctx.guild)
+        if role is None:
+            await ctx.send("There's no mute role yet - it's created the first time someone is muted.")
+            return
+        await ctx.defer()
+        synced = await self._sync_mute_role_channels(ctx.guild, role)
+        total = len(ctx.guild.text_channels)
+        await ctx.send(f"Synced `{role.name}` overwrites in {synced}/{total} text channels.")
 
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
@@ -155,20 +189,33 @@ class Moderation(commands.Cog):
 
     @tasks.loop(seconds=MUTE_EXPIRY_CHECK_SECONDS)
     async def mute_expiry_check(self):
-        now_iso = discord.utils.utcnow().isoformat()
-        for guild_id, user_id in await self.bot.stores.mutes.due(now_iso):
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                await self.bot.stores.mutes.clear(guild_id, user_id)
-                continue
-            member = guild.get_member(user_id)
-            role = await self.get_mute_role(guild)
-            if member is not None and role is not None:
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. (review F4)
+        try:
+            now_iso = discord.utils.utcnow().isoformat()
+            for guild_id, user_id in await self.bot.stores.mutes.due(now_iso):
+                # Per-row isolation: one guild we can't reach must not skip the rest.
                 try:
-                    await member.remove_roles(role, reason="Mute expired")
-                except discord.Forbidden:
-                    logger.warning("Missing permission to lift expired mute in guild %s", guild_id)
-            await self.bot.stores.mutes.clear(guild_id, user_id)
+                    guild = self.bot.get_guild(guild_id)
+                    if guild is None:
+                        await self.bot.stores.mutes.clear(guild_id, user_id)
+                        continue
+                    member = guild.get_member(user_id)
+                    role = await self.get_mute_role(guild)
+                    if member is not None and role is not None:
+                        try:
+                            await member.remove_roles(role, reason="Mute expired")
+                        except discord.Forbidden:
+                            logger.warning(
+                                "Missing permission to lift expired mute in guild %s", guild_id
+                            )
+                    await self.bot.stores.mutes.clear(guild_id, user_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to lift expired mute for user %s in guild %s", user_id, guild_id
+                    )
+        except Exception:
+            logger.exception("mute_expiry_check iteration failed")
 
     @mute_expiry_check.before_loop
     async def before_mute_expiry_check(self):
@@ -184,20 +231,50 @@ class Moderation(commands.Cog):
         role = await self.ensure_mute_role(ctx.guild)
         if not await self._try_action(ctx, member, member.add_roles(role, reason=f"Mute: {reason}")):
             return
+        # The mute has already landed on Discord by this point. Every write
+        # below raises RuntimeError when the DB is unavailable (phase 1's write
+        # contract), and letting that escape showed the moderator a generic
+        # "Something went wrong" while a *timed* mute had silently become
+        # permanent. Always confirm the mute that really happened, and say
+        # plainly what wasn't recorded or scheduled. Note there's no case_id to
+        # interpolate on the failure paths. (review F16)
         if delta is None:
-            await self.bot.stores.mutes.clear(ctx.guild.id, member.id)
-            case_id = await self.bot.stores.cases.add(
-                ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} (indefinite)"
-            )
+            try:
+                await self.bot.stores.mutes.clear(ctx.guild.id, member.id)
+                case_id = await self.bot.stores.cases.add(
+                    ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} (indefinite)"
+                )
+            except RuntimeError:
+                await ctx.send(
+                    f"Muted {member} indefinitely: {reason}\n"
+                    "The database is unavailable, so this wasn't recorded in the case history."
+                )
+                return
             await ctx.send(f"Muted {member} indefinitely (case #{case_id}): {reason}")
-        else:
-            expires_at = discord.utils.utcnow() + delta
+            return
+
+        expires_at = discord.utils.utcnow() + delta
+        until = discord.utils.format_dt(expires_at, "f")
+        try:
             await self.bot.stores.mutes.schedule(ctx.guild.id, member.id, expires_at.isoformat())
+        except RuntimeError:
+            await ctx.send(
+                f"Muted {member}: {reason}\n"
+                "Couldn't schedule the automatic unmute (database unavailable) - this mute will "
+                f"NOT lift on its own at {until}, use `/unmute` to lift it."
+            )
+            return
+        try:
             case_id = await self.bot.stores.cases.add(
                 ctx.guild.id, member.id, ctx.author.id, "mute", f"{reason} (until {expires_at.isoformat()})"
             )
-            until = discord.utils.format_dt(expires_at, "f")
-            await ctx.send(f"Muted {member} until {until} (case #{case_id}): {reason}")
+        except RuntimeError:
+            await ctx.send(
+                f"Muted {member} until {until}: {reason}\n"
+                "The database is unavailable, so this wasn't recorded in the case history."
+            )
+            return
+        await ctx.send(f"Muted {member} until {until} (case #{case_id}): {reason}")
 
     # ---- commands ----
 

@@ -23,11 +23,31 @@ import time
 from collections import defaultdict, deque
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from .logging_module import post_log
 
 logger = logging.getLogger("bot.modules.raid")
+
+# 3600 is the ceiling raid.join_window_seconds is clamped to, so no live
+# window can outlive a swept entry. (review F10)
+JOIN_TIMES_MAX_AGE_SECONDS = 3600
+JOIN_TIMES_SWEEP_MINUTES = 10
+
+
+def _previous_level(stored) -> discord.VerificationLevel:
+    """Coerces the stored raid.previous_verification_level into a real
+    VerificationLevel. /setconfig lets any manage_guild user write arbitrary
+    text to that key, and an unguarded int()/enum lookup crashed `/raidmode
+    off` - leaving the guild stuck at maximum verification with no way down
+    through the bot. (review F12)"""
+    if not stored:
+        return discord.VerificationLevel.medium
+    try:
+        return discord.VerificationLevel(int(stored))
+    except (ValueError, TypeError):
+        logger.warning("Ignoring malformed raid.previous_verification_level=%r", stored)
+        return discord.VerificationLevel.medium
 
 
 class Raid(commands.Cog):
@@ -35,11 +55,46 @@ class Raid(commands.Cog):
         self.bot = bot
         self._join_times: dict[int, deque[float]] = defaultdict(deque)
 
+    async def cog_load(self) -> None:
+        self.sweep_join_times.start()
+
+    def cog_unload(self):
+        self.sweep_join_times.cancel()
+
+    def _sweep(self, now: float, max_age: float = JOIN_TIMES_MAX_AGE_SECONDS) -> int:
+        """Drops the join-time deque for any guild with no recent joins. The
+        dict previously grew one entry per guild and never shrank, and each
+        entry retained its whole deque. (review F10)"""
+        dropped = 0
+        for guild_id in list(self._join_times):
+            times = self._join_times[guild_id]
+            if times and now - times[-1] <= max_age:
+                continue
+            del self._join_times[guild_id]
+            dropped += 1
+        return dropped
+
+    @tasks.loop(minutes=JOIN_TIMES_SWEEP_MINUTES)
+    async def sweep_join_times(self):
+        # tasks.loop only auto-restarts on network errors; anything else would stop
+        # this loop permanently, so nothing may escape the body. (review F4)
+        try:
+            self._sweep(time.monotonic())
+        except Exception:
+            logger.exception("raid sweep_join_times iteration failed")
+
+    @sweep_join_times.before_loop
+    async def before_sweep_join_times(self):
+        await self.bot.wait_until_ready()
+
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
 
-        min_age_hours = await self.bot.stores.config.get_int(guild.id, "raid.min_account_age_hours", 0)
+        # 0 disables, so 0 is the legitimate floor here. (review F14)
+        min_age_hours = await self.bot.stores.config.get_int(
+            guild.id, "raid.min_account_age_hours", 0, minimum=0, maximum=8760
+        )
         if min_age_hours > 0:
             account_age = discord.utils.utcnow() - member.created_at
             if account_age.total_seconds() < min_age_hours * 3600:
@@ -57,10 +112,14 @@ class Raid(commands.Cog):
                     await post_log(self.bot, guild, embed)
                     return  # don't also count a kicked join toward the burst detector
 
-        threshold = await self.bot.stores.config.get_int(guild.id, "raid.join_threshold", 0)
+        threshold = await self.bot.stores.config.get_int(
+            guild.id, "raid.join_threshold", 0, minimum=0, maximum=1000
+        )
         if threshold <= 0:
             return
-        window_seconds = await self.bot.stores.config.get_int(guild.id, "raid.join_window_seconds", 30)
+        window_seconds = await self.bot.stores.config.get_int(
+            guild.id, "raid.join_window_seconds", 30, minimum=1, maximum=3600
+        )
 
         times = self._join_times[guild.id]
         now = time.monotonic()
@@ -116,7 +175,7 @@ class Raid(commands.Cog):
             return
 
         stored = await self.bot.stores.config.get(ctx.guild.id, "raid.previous_verification_level")
-        previous = discord.VerificationLevel(int(stored)) if stored else discord.VerificationLevel.medium
+        previous = _previous_level(stored)
         try:
             await ctx.guild.edit(verification_level=previous, reason=f"Raid mode lifted by {ctx.author}")
         except discord.Forbidden:

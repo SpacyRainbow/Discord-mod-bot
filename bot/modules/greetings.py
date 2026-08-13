@@ -63,7 +63,16 @@ class Greetings(commands.Cog):
         template = await self.bot.stores.config.get(guild.id, f"{prefix}.message", default_message)
         text = format_greeting(template, str(member), member.mention, guild.name, guild.member_count or 0)
         try:
-            await channel.send(text)
+            # Opts back in to the client-wide AllowedMentions.none() default: the
+            # {member} placeholder is member.mention and a welcome that doesn't
+            # ping is broken. users=True only, so a mod can't put @everyone in the
+            # template and have it fire on every join. (review F6)
+            await channel.send(
+                text,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=True
+                ),
+            )
         except discord.Forbidden:
             logger.warning("Missing permission to post a %s message in guild %s", prefix, guild.id)
 

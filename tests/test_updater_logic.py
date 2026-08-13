@@ -183,3 +183,35 @@ async def test_apply_update_closes_bot_then_exits_process(db):
 
     bot.close.assert_awaited_once()
     fake_exit.assert_called_once_with(0)
+
+
+# --- review F4: the loop body must never let an exception escape -----------
+
+
+@pytest.mark.asyncio
+async def test_check_loop_survives_a_failing_update_check(db):
+    bot = _make_bot(db)
+    bot.guilds = [MagicMock(id=GUILD)]
+    cog = _make_cog(bot)
+    cog.apply_update = AsyncMock()
+    boom = AsyncMock(side_effect=RuntimeError("network exploded"))
+
+    with patch("bot.modules.updater.check_for_update", boom):
+        await cog.check_loop.coro(cog)  # must return normally, not propagate
+
+    cog.apply_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_check_loop_survives_a_failing_config_read(db):
+    bot = _make_bot(db)
+    bot.guilds = [MagicMock(id=GUILD)]
+    cog = _make_cog(bot)
+    cog.apply_update = AsyncMock()
+    bot.stores.config.get_bool = AsyncMock(side_effect=RuntimeError("db exploded"))
+    available = AsyncMock(return_value=UpdateStatus(checked=True, available=True, behind=1))
+
+    with patch("bot.modules.updater.check_for_update", available):
+        await cog.check_loop.coro(cog)  # must return normally
+
+    cog.apply_update.assert_not_awaited()

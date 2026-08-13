@@ -1,5 +1,7 @@
 # Secrets - never bake these into the image
-.env
+# `.env` alone matches only that exact name; `.env*` also catches strays. (review F1)
+.env*
+!.env.example
 
 # Local data and caches - not needed in the image, and data/ is a volume mount anyway
 data/
