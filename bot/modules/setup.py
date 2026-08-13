@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, Optional
 import discord
 from discord.ext import commands
 
+from bot.modules.embedfix import PLATFORMS as EMBEDFIX_PLATFORMS
 from bot.modules.updater import UpdateStatus, describe_status
 
 STEP_GENERAL = "general"
@@ -35,6 +36,7 @@ STEP_STARBOARD = "starboard"
 STEP_TICKETS = "tickets"
 STEP_GREETINGS = "greetings"
 STEP_MUSIC = "music"
+STEP_EMBEDFIX = "embedfix"
 STEP_UPDATES = "updates"
 STEP_SUMMARY = "summary"
 
@@ -52,6 +54,7 @@ STEPS = [
     STEP_TICKETS,
     STEP_GREETINGS,
     STEP_MUSIC,
+    STEP_EMBEDFIX,
     STEP_UPDATES,
     STEP_SUMMARY,
 ]
@@ -70,6 +73,7 @@ STEP_TITLES = {
     STEP_TICKETS: "Tickets",
     STEP_GREETINGS: "Welcome/leave messages",
     STEP_MUSIC: "Music",
+    STEP_EMBEDFIX: "Link embed fixer",
     STEP_UPDATES: "Updates",
     STEP_SUMMARY: "Summary",
 }
@@ -119,7 +123,18 @@ CONFIG_MANIFEST = [
     ("leave.channel_id", None, "unset", "Leave message channel"),
     ("leave.message", _LEAVE_DEFAULT, _LEAVE_DEFAULT, "Leave message"),
     ("music.sponsorblock_enabled", "true", "true", "SponsorBlock auto-skip"),
+    ("embedfix.enabled", "true", "true", "Fix links that don't embed"),
+    ("embedfix.suppress_original", "true", "true", "Hide the original's broken embed"),
+    ("embedfix.remove_seconds", "120", "120", "Poster's undo window (seconds)"),
     ("updates.auto_apply", "false", "false", "Automatically restart to apply detected updates"),
+]
+
+# The per-platform embedfix toggles are generated rather than typed out, so
+# adding a site to embedfix.PLATFORMS automatically gives it a manifest row,
+# a summary line and a "Reset to defaults" entry.
+CONFIG_MANIFEST += [
+    (f"embedfix.platform.{name}", "true", "true", f"Fix {name} links")
+    for name in EMBEDFIX_PLATFORMS
 ]
 
 # Prefixes a step's "Reset to defaults" button clears - STEP_MODERATION and
@@ -137,6 +152,7 @@ STEP_RESET_PREFIXES = {
     STEP_TICKETS: ["tickets."],
     STEP_GREETINGS: ["welcome.", "leave."],
     STEP_MUSIC: ["music."],
+    STEP_EMBEDFIX: ["embedfix."],
     STEP_UPDATES: ["updates."],
 }
 
@@ -276,6 +292,13 @@ class SetupView(discord.ui.View):
             self.add_item(
                 await _ToggleButton.create(self, "music.sponsorblock_enabled", "SponsorBlock auto-skip", True)
             )
+        elif step == STEP_EMBEDFIX:
+            self.add_item(await _ToggleButton.create(self, "embedfix.enabled", "Fix links", True))
+            self.add_item(
+                await _ToggleButton.create(self, "embedfix.suppress_original", "Hide original", True)
+            )
+            self.add_item(await _PlatformSelect.create(self))
+            self.add_item(_ModalButton("Edit undo window", lambda: _build_embedfix_modal(self)))
         elif step == STEP_UPDATES:
             self.add_item(await _ToggleButton.create(self, "updates.auto_apply", "Auto-update", False))
 
@@ -389,6 +412,28 @@ class SetupView(discord.ui.View):
             enabled = await self.cfg_bool("music.sponsorblock_enabled", True)
             embed.description = f"**SponsorBlock auto-skip**: {format_status(enabled)}"
             embed.color = discord.Color.green() if enabled else discord.Color.red()
+        elif step == STEP_EMBEDFIX:
+            enabled = await self.cfg_bool("embedfix.enabled", True)
+            suppress = await self.cfg_bool("embedfix.suppress_original", True)
+            on = [
+                name
+                for name in EMBEDFIX_PLATFORMS
+                if await self.cfg_bool(f"embedfix.platform.{name}", True)
+            ]
+            embed.description = (
+                f"**Fix links that don't embed**: {format_status(enabled)}\n"
+                f"**Hide the original's broken embed**: {format_status(suppress)}\n"
+                f"**Platforms**: {', '.join(on) if on else 'none'}\n"
+                f"**Poster's undo window**: {await self._value_line('embedfix.remove_seconds')} seconds\n\n"
+                "When someone posts an X/TikTok/Instagram-style link that Discord won't embed, "
+                "the bot replies with an equivalent link on a proxy host that does embed, and "
+                "hides the original's empty embed. Anyone can opt a single link out by wrapping "
+                "it in `<angle brackets>`. The cross-mark on the bot's reply undoes the fix - the "
+                "poster within the undo window, moderators at any time.\n\n"
+                "Hiding the original needs the **Manage Messages** permission; without it the "
+                "reply still works."
+            )
+            embed.color = combined_status_color([enabled, bool(on)])
         elif step == STEP_UPDATES:
             auto_apply = await self.cfg_bool("updates.auto_apply", False)
             updater_cog = self.cog.bot.get_cog("Updater")
@@ -683,6 +728,48 @@ class _LeaveChannelSelect(discord.ui.ChannelSelect):
         await self.setup_view.refresh(interaction)
 
 
+class _PlatformSelect(discord.ui.Select):
+    """Which sites the embed fixer rewrites. One multi-value select rather than
+    seven toggle buttons - the row budget is five components wide and the step
+    also needs two toggles, a modal button, reset and navigation."""
+
+    def __init__(self, view: SetupView, enabled: set[str]):
+        super().__init__(
+            placeholder="Platforms to fix",
+            min_values=0,
+            max_values=len(EMBEDFIX_PLATFORMS),
+            options=[
+                discord.SelectOption(
+                    label=name,
+                    value=name,
+                    description=f"-> {EMBEDFIX_PLATFORMS[name][1]}",
+                    default=name in enabled,
+                )
+                for name in EMBEDFIX_PLATFORMS
+            ],
+        )
+        self.setup_view = view
+
+    @classmethod
+    async def create(cls, view: SetupView) -> "_PlatformSelect":
+        enabled = {
+            name
+            for name in EMBEDFIX_PLATFORMS
+            if await view.cfg_bool(f"embedfix.platform.{name}", True)
+        }
+        return cls(view, enabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        # Unselected means off, so every key is written on every submit -
+        # otherwise there'd be no way to turn a platform back off.
+        chosen = set(self.values)
+        for name in EMBEDFIX_PLATFORMS:
+            await self.setup_view.cog.bot.stores.config.set(
+                self.setup_view.guild.id, f"embedfix.platform.{name}", str(name in chosen)
+            )
+        await self.setup_view.refresh(interaction)
+
+
 # Accepted ranges for every numeric config key these modals write. They mirror
 # the bounds the readers pass to ConfigStore.get_int, so a value accepted here
 # is a value that will actually be honoured at read time - previously the modals
@@ -703,6 +790,7 @@ _INT_BOUNDS: dict[str, tuple[int, int]] = {
     "antinuke.action_threshold": (1, 1000),
     "antinuke.window_seconds": (1, 3600),
     "starboard.threshold": (1, 100),
+    "embedfix.remove_seconds": (0, 3600),
 }
 
 
@@ -831,6 +919,33 @@ async def _build_automod_modal(view: SetupView) -> _AutomodModal:
     modal = _AutomodModal(view)
     modal.caps_threshold.default = await view.cfg("automod.caps_threshold", "70")
     modal.caps_minlen.default = await view.cfg("automod.caps_minlen", "10")
+    return modal
+
+
+class _EmbedFixModal(discord.ui.Modal, title="Link embed fixer"):
+    def __init__(self, view: SetupView):
+        super().__init__()
+        self.setup_view = view
+        self.remove_seconds = discord.ui.TextInput(
+            label="Poster's undo window (secs, def 120)", required=True
+        )
+        self.add_item(self.remove_seconds)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = self.remove_seconds.value
+        error = _int_field_error("embedfix.remove_seconds", value)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        await self.setup_view.cog.bot.stores.config.set(
+            self.setup_view.guild.id, "embedfix.remove_seconds", value
+        )
+        await self.setup_view.refresh(interaction)
+
+
+async def _build_embedfix_modal(view: SetupView) -> _EmbedFixModal:
+    modal = _EmbedFixModal(view)
+    modal.remove_seconds.default = await view.cfg("embedfix.remove_seconds", "120")
     return modal
 
 

@@ -22,6 +22,8 @@ The bot has these functions:
 - Personality functions: quotes, tags, buckets, witty replies, a bored
   detector, and a text generator.
 - Minecraft server status and control, through Crafty Controller 4.
+- A link embed fixer: posts a working link when someone shares an X,
+  TikTok, or Instagram link that Discord will not embed.
 
 This project replaces [Sweetie Bot](https://github.com/ErikMcClure/sweetiebot).
 Sweetie Bot was a bot written in the Go language. The developer archived the
@@ -74,6 +76,7 @@ bot/
     ├── poll.py            /poll with button voting
     ├── tickets.py         /ticketpanel support-ticket channels
     ├── greetings.py       welcome/leave messages
+    ├── embedfix.py        rewrites links Discord will not embed; see below
     ├── updater.py          detects/applies updates from GitHub; see "Updates"
     ├── counters.py        not complete; see the file for design notes
     └── leveling.py         not complete; see the file for design notes
@@ -125,6 +128,7 @@ case history until the connection is available again.
 | 15 | Scheduler engine and `/remind` (the rest of Phase 6 - `counters`, `leveling` - is still not complete) | Done |
 | 16 | Music volume, loop, and a dedicated `/shuffle` command | Done |
 | 17 | Update detection and one-click/auto-apply updates from GitHub | Done |
+| 18 | Link embed fixer (X/Twitter, TikTok, Instagram, Reddit, Bluesky, Pixiv, Twitch) | Done |
 
 Automated tests exist for this bot, and all of them pass. Run the tests
 with the command `pytest -q`. The tests check three parts of the bot: the
@@ -317,6 +321,10 @@ to one server only. If a key has no stored value, the bot uses the default.
 | `leave.channel_id` | unset | The channel leave messages are posted to |
 | `leave.message` | generic leave message | The leave message template |
 | `updates.auto_apply` | false | If true, the bot restarts itself automatically when it detects a newer commit on GitHub - see "Updates" |
+| `embedfix.enabled` | true | If true, replies with a working link when someone posts one Discord will not embed - see "Link embed fixer" |
+| `embedfix.suppress_original` | true | If true, also hides the original message's empty embed. Needs Manage Messages |
+| `embedfix.remove_seconds` | 120 | How long the poster has to undo a fix, in seconds. Moderators have no time limit |
+| `embedfix.platform.<name>` | true | One key per supported site: `twitter`, `tiktok`, `instagram`, `reddit`, `bluesky`, `pixiv`, `twitch` |
 
 Some settings have their own command: `setlogchannel`, `setautorole`,
 `setboredchannel`, `setstarboard`, and `filter add`. You can change every
@@ -345,21 +353,22 @@ the buttons and menus no longer work.
 
 | Step | Title | Content | Setting keys |
 |---|---|---|---|
-| 1/15 | General | A button, "Edit prefix", opens a form with one field: the command prefix | `commandprefix` |
-| 2/15 | Logging | A menu selects the log channel. Three on/off buttons: "Log edits", "Log deletes", "Log joins/leaves" | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
-| 3/15 | Moderation | No button or menu. The bot creates the Mute role if it does not exist, or confirms the role if it does, and shows its name. Run `/setup` again to re-apply the role's channel permissions everywhere, for example after adding a new channel | `moderation.mute_role` |
-| 4/15 | Anti-spam | A button, "Edit thresholds", opens a form with 5 fields: max messages per window, window length, max duplicate messages, max mentions, and timeout duration. All five must be whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
-| 5/15 | Automod | An on/off button, "Block invites". A separate button, "Edit caps thresholds", opens a form with 2 fields: the caps percent threshold, and the minimum message length for the caps check. This step does not include the banned-word list - that list is a set of words, not one value, and is managed instead with `filter add`, `filter remove`, and `filter` (list) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
-| 6/15 | Raid protection | An on/off button, "Auto-lockdown on burst". A button, "Edit raid thresholds", opens a form with 3 fields: minimum account age in hours, join burst size, and the burst window in seconds. Both checks are 0 (off) by default | `raid.min_account_age_hours`, `raid.join_threshold`, `raid.join_window_seconds`, `raid.auto_lockdown` |
-| 7/15 | Anti-nuke | An on/off button, "Anti-nuke enabled" (off by default). A button, "Edit anti-nuke thresholds", opens a form with 2 fields: the number of destructive actions before punishing, and the window in seconds | `antinuke.enabled`, `antinuke.action_threshold`, `antinuke.window_seconds` |
-| 8/15 | Roles | A menu selects the auto-role for new members | `roles.autorole` |
-| 9/15 | Bored detector | A menu selects the nudge channel. A button, "Edit bored settings", opens a form with 2 fields: idle seconds before the nudge, and the nudge message | `bored.channel`, `bored.idle_seconds`, `bored.message` |
-| 10/15 | Starboard | A menu selects the starboard channel. A button, "Edit star threshold", opens a form with one field: the number of stars needed to post | `starboard.channel`, `starboard.threshold` |
-| 11/15 | Tickets | A menu selects the category new ticket channels are created under | `tickets.category_id` |
-| 12/15 | Welcome/leave messages | Two menus select the welcome channel and the leave channel. A button, "Edit welcome/leave text", opens a form with 2 fields: the welcome message template and the leave message template | `welcome.channel_id`, `welcome.message`, `leave.channel_id`, `leave.message` |
-| 13/15 | Music | An on/off button, "SponsorBlock auto-skip" | `music.sponsorblock_enabled` |
-| 14/15 | Updates | An on/off button, "Auto-update", plus a live status line showing whether an update is currently detected. See "Updates" | `updates.auto_apply` |
-| 15/15 | Summary | A read-only summary of every setting above, its current value or default, and one line for Spotify that shows only "Configured" or "Not configured" - this step never shows or accepts the real Spotify credentials | None - display only |
+| 1/16 | General | A button, "Edit prefix", opens a form with one field: the command prefix | `commandprefix` |
+| 2/16 | Logging | A menu selects the log channel. Three on/off buttons: "Log edits", "Log deletes", "Log joins/leaves" | `logging.channel`, `logging.edits`, `logging.deletes`, `logging.joins` |
+| 3/16 | Moderation | No button or menu. The bot creates the Mute role if it does not exist, or confirms the role if it does, and shows its name. Run `/setup` again to re-apply the role's channel permissions everywhere, for example after adding a new channel | `moderation.mute_role` |
+| 4/16 | Anti-spam | A button, "Edit thresholds", opens a form with 5 fields: max messages per window, window length, max duplicate messages, max mentions, and timeout duration. All five must be whole numbers | `spam.max_messages`, `spam.window_seconds`, `spam.max_duplicates`, `spam.max_mentions`, `spam.timeout_seconds` |
+| 5/16 | Automod | An on/off button, "Block invites". A separate button, "Edit caps thresholds", opens a form with 2 fields: the caps percent threshold, and the minimum message length for the caps check. This step does not include the banned-word list - that list is a set of words, not one value, and is managed instead with `filter add`, `filter remove`, and `filter` (list) | `automod.block_invites`, `automod.caps_threshold`, `automod.caps_minlen` |
+| 6/16 | Raid protection | An on/off button, "Auto-lockdown on burst". A button, "Edit raid thresholds", opens a form with 3 fields: minimum account age in hours, join burst size, and the burst window in seconds. Both checks are 0 (off) by default | `raid.min_account_age_hours`, `raid.join_threshold`, `raid.join_window_seconds`, `raid.auto_lockdown` |
+| 7/16 | Anti-nuke | An on/off button, "Anti-nuke enabled" (off by default). A button, "Edit anti-nuke thresholds", opens a form with 2 fields: the number of destructive actions before punishing, and the window in seconds | `antinuke.enabled`, `antinuke.action_threshold`, `antinuke.window_seconds` |
+| 8/16 | Roles | A menu selects the auto-role for new members | `roles.autorole` |
+| 9/16 | Bored detector | A menu selects the nudge channel. A button, "Edit bored settings", opens a form with 2 fields: idle seconds before the nudge, and the nudge message | `bored.channel`, `bored.idle_seconds`, `bored.message` |
+| 10/16 | Starboard | A menu selects the starboard channel. A button, "Edit star threshold", opens a form with one field: the number of stars needed to post | `starboard.channel`, `starboard.threshold` |
+| 11/16 | Tickets | A menu selects the category new ticket channels are created under | `tickets.category_id` |
+| 12/16 | Welcome/leave messages | Two menus select the welcome channel and the leave channel. A button, "Edit welcome/leave text", opens a form with 2 fields: the welcome message template and the leave message template | `welcome.channel_id`, `welcome.message`, `leave.channel_id`, `leave.message` |
+| 13/16 | Music | An on/off button, "SponsorBlock auto-skip" | `music.sponsorblock_enabled` |
+| 14/16 | Link embed fixer | Two on/off buttons, "Fix links" and "Hide original". A menu selects which sites to fix - unselected sites are off. A button, "Edit undo window", opens a form with one field: how many seconds the poster has to undo a fix. See "Link embed fixer" | `embedfix.enabled`, `embedfix.suppress_original`, `embedfix.remove_seconds`, `embedfix.platform.<name>` |
+| 15/16 | Updates | An on/off button, "Auto-update", plus a live status line showing whether an update is currently detected. See "Updates" | `updates.auto_apply` |
+| 16/16 | Summary | A read-only summary of every setting above, its current value or default, and one line for Spotify that shows only "Configured" or "Not configured" - this step never shows or accepts the real Spotify credentials | None - display only |
 
 **Clear on/off status, and a default always shown.** Every setting that
 can genuinely be turned on or off - block invites, both raid checks,
@@ -564,6 +573,51 @@ just a channel and a text template each. Set `welcome.channel_id` and
 `leave.message` to customize the text. Every template accepts these
 placeholders: `{member}` (a mention), `{member_name}` (the plain name),
 `{server}` (the server name), and `{member_count}`.
+
+## Link embed fixer
+
+Discord does not embed links from several popular sites. An X/Twitter or
+TikTok link posts as bare text, so everyone has to leave the chat and open
+the platform to see the content.
+
+When a member posts one of these links, the bot replies with the same link
+on a proxy host that does serve embed metadata, and hides the original
+message's empty embed. The video or post then plays inline.
+
+| Site | Rewritten to |
+|---|---|
+| `x.com`, `twitter.com` | `fxtwitter.com` |
+| `tiktok.com` (including `vm.` and `vt.` short links) | `vxtiktok.com` |
+| `instagram.com` | `kkinstagram.com` |
+| `reddit.com` | `rxddit.com` |
+| `bsky.app` | `fxbsky.app` |
+| `pixiv.net` | `phixiv.net` |
+| `twitch.tv` clips | `fxtwitch.seria.moe` |
+
+The rewrite is pure text work on the URL. The bot fetches nothing, and no
+new dependency is needed. The path and query are kept, minus that site's
+known tracking parameters. A link that is already on a proxy host is left
+alone, so the bot never re-fixes a fixed link.
+
+**Opting one link out.** Wrap it in angle brackets - `<https://x.com/...>`.
+This is Discord's own "do not embed this" syntax, so the bot honors it.
+Links inside code blocks and inline code are ignored too. At most 3 links
+per message are rewritten, so one message cannot become a wall of replies.
+
+**Undoing a fix.** The bot puts a ❌ on its own reply. Click it and the
+reply is deleted and the original message's embed is restored. The member
+who posted the link can do this for `embedfix.remove_seconds` (120 by
+default) after the fix. Anyone with the Manage Messages permission can do
+it at any time, with no time limit. Anyone else who clicks just has their
+reaction removed. This check reads the messages themselves rather than
+in-memory state, so undo still works after a bot restart.
+
+**Permissions.** Hiding the original message's embed needs Manage
+Messages. Without it the bot still posts the fixed link - only the empty
+embed stays visible.
+
+Turn the whole feature off with `embedfix.enabled`, or turn off one site
+with `embedfix.platform.<name>`. Step 14 of `/setup` has all of it.
 
 ## Scheduler and reminders
 
