@@ -2,6 +2,13 @@
 updater - detects when origin has commits this checkout doesn't have yet,
 and (optionally) restarts the process to pick them up.
 
+Two callers, different freshness needs: the background loop runs every
+CHECK_INTERVAL_MINUTES and exists to drive auto-apply unattended, while
+/about calls current_status() and gets a live check (behind a short TTL).
+Serving /about from the loop's cached value made it report "Up to date"
+for up to half an hour after a push, which is the opposite of what someone
+who just asked is looking for.
+
 Applying an update deliberately does not mean "pull inside the running
 process" - a running Python program can't safely replace its own already-
 imported modules out from under itself. Instead, `entrypoint.sh` runs
@@ -17,6 +24,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -28,6 +36,18 @@ logger = logging.getLogger(__name__)
 REPO_DIR = Path(__file__).resolve().parents[2]
 CHECK_INTERVAL_MINUTES = 30
 AUTO_APPLY_KEY = "updates.auto_apply"
+
+# How long a status may be reused to answer an interactive command. The
+# 30-minute loop exists to drive auto-apply unattended; someone typing /about
+# wants to know about a commit pushed a minute ago, not one from the last
+# sweep. Short enough to be "now", long enough that a room full of people
+# running /about doesn't mean a git fetch each.
+STATUS_TTL_SECONDS = 60
+
+# Budget for a check made inside an interaction that hasn't been deferred and
+# so must be answered within Discord's 3s window. Leaves room for the rest of
+# the embed build and the HTTP round trip back.
+INTERACTIVE_FETCH_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass
@@ -100,21 +120,72 @@ async def check_for_update() -> UpdateStatus:
     return UpdateStatus(checked=True, available=True, behind=behind, latest_summary=latest_summary)
 
 
+_head_date: Optional[str] = None
+_head_date_looked_up = False
+
+
+async def head_commit_date() -> Optional[str]:
+    """The date of the commit this process is running, or None if that can't
+    be determined. Memoized: `git pull` happens in entrypoint.sh before the
+    interpreter starts, so HEAD cannot move underneath a running process."""
+    global _head_date, _head_date_looked_up
+    if _head_date_looked_up:
+        return _head_date
+    _head_date_looked_up = True
+    if (REPO_DIR / ".git").exists():
+        code, out = await _run_git("log", "-1", "--format=%cs")
+        if code == 0 and out:
+            _head_date = out
+    return _head_date
+
+
 class Updater(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.status = UpdateStatus(checked=False)
+        self._checked_at: Optional[float] = None
+        self._check_lock = asyncio.Lock()
         self.check_loop.start()
 
     def cog_unload(self):
         self.check_loop.cancel()
+
+    async def _refresh(self) -> UpdateStatus:
+        self.status = await check_for_update()
+        self._checked_at = time.monotonic()
+        return self.status
+
+    async def _locked_status(self) -> UpdateStatus:
+        """Held under a lock so two people asking at once share one fetch
+        rather than racing two, and re-checks the TTL inside it so the loser
+        of that race returns the winner's result instead of fetching again."""
+        async with self._check_lock:
+            if self._checked_at is not None and time.monotonic() - self._checked_at < STATUS_TTL_SECONDS:
+                return self.status
+            return await self._refresh()
+
+    async def current_status(self, timeout: Optional[float] = None) -> UpdateStatus:
+        """Fresh status for an interactive command.
+
+        `timeout` is for callers that must answer Discord inside a deadline
+        they can't extend - /setup's wizard edits a component interaction
+        without deferring, and a slow `git fetch` there would break the
+        navigation entirely. Falling back to the last known status is a
+        strictly better failure than a dead button. Callers that have
+        deferred (/about) pass nothing and wait for the real answer."""
+        try:
+            return await asyncio.wait_for(self._locked_status(), timeout)
+        except TimeoutError:
+            logger.warning("Update check exceeded %ss - serving the last known status", timeout)
+            return self.status
 
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
     async def check_loop(self):
         # tasks.loop only auto-restarts on network errors; anything else would stop
         # this loop permanently, so nothing may escape the body. (review F4)
         try:
-            self.status = await check_for_update()
+            async with self._check_lock:
+                await self._refresh()
             if not self.status.available:
                 return
             for guild in self.bot.guilds:

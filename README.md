@@ -834,9 +834,13 @@ The bot can tell when GitHub has commits it doesn't have yet, and can
 restart itself to pick them up - either manually, with a button, or
 automatically.
 
-**How detection works.** A background check (`bot/modules/updater.py`)
-runs roughly every 30 minutes: it runs `git fetch` inside the container,
-then compares the running checkout's commit against the fetched branch.
+**How detection works.** There are two paths. `/about` checks live, when
+you ask: it runs `git fetch` inside the container and compares the running
+checkout's commit against the fetched branch, so a commit pushed a minute
+ago shows up immediately. Repeated calls within 60 seconds reuse that
+answer rather than fetching again. Separately, a background check
+(`bot/modules/updater.py`) does the same thing roughly every 30 minutes,
+which is what drives automatic updates when nobody is asking.
 This needs the deployed image to be a real git checkout with an `origin`
 remote - true by default, since `Dockerfile` now bakes in the whole repo
 (including `.git`, excluding secrets - see `.dockerignore`), not just the
@@ -868,10 +872,12 @@ bot occasionally restarting itself (a few seconds of downtime) without
 you choosing the exact moment.
 
 **Why 30 minutes, not instant.** Checking is a `git fetch` against
-GitHub - frequent enough to notice a new release within the hour, without
-fetching on every command or hammering GitHub. `entrypoint.sh`'s pull at
-every container start is unrelated to this timer - a fresh restart always
-gets the latest code regardless of when the background check last ran.
+GitHub - frequent enough for the unattended auto-apply path to notice a
+new release within the hour, without hammering GitHub. This timer does not
+gate `/about`, which fetches on demand; it used to, and the result was
+`/about` reporting "Up to date" for up to half an hour after a push.
+`entrypoint.sh`'s pull at every container start is unrelated to both - a
+fresh restart always gets the latest code regardless of either.
 
 ## Roadmap and next steps
 

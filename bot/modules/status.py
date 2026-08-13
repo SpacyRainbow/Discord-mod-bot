@@ -11,15 +11,18 @@ import time
 import discord
 from discord.ext import commands
 
-from bot.modules.updater import UpdateStatus, describe_status
+from bot.modules.updater import UpdateStatus, describe_status, head_commit_date
 
 GITHUB_URL = "https://github.com/SpacyRainbow/Discord-mod-bot"
 # Bumped by hand when shipping a meaningful set of changes - there's no
-# packaging/release process here to derive this from automatically, and the
-# Docker image only copies bot/, not .git, so a git-log-based date wouldn't
-# work in production anyway.
+# packaging/release process here to derive this from.
 VERSION = "1.0.1"
-LAST_UPDATED = "2026-07-22"
+# Only a fallback. "Last updated" is read from the HEAD commit's date at
+# runtime, because a hand-maintained constant silently rots - this one sat
+# at 2026-07-22 through several releases. The image does contain .git
+# (entrypoint.sh needs it to pull), so the lookup works in production too;
+# this string is what shows if it somehow isn't a checkout.
+LAST_UPDATED = "unknown"
 
 
 class _ApplyUpdateButton(discord.ui.Button):
@@ -69,12 +72,17 @@ class Status(commands.Cog):
 
     @commands.hybrid_command(name="about")
     async def about(self, ctx: commands.Context):
+        # current_status() shells out to `git fetch`, which can outlast the 3s
+        # window Discord gives an un-deferred slash command.
+        await ctx.defer()
         updater_cog = self.bot.get_cog("Updater")
-        update_status = updater_cog.status if updater_cog is not None else UpdateStatus(checked=False)
+        update_status = (
+            await updater_cog.current_status() if updater_cog is not None else UpdateStatus(checked=False)
+        )
 
         embed = discord.Embed(title="Bot status")
         embed.add_field(name="Version", value=VERSION)
-        embed.add_field(name="Last updated", value=LAST_UPDATED)
+        embed.add_field(name="Last updated", value=await head_commit_date() or LAST_UPDATED)
         embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms")
         embed.add_field(name="Database", value="connected" if self.bot.db.available else "degraded (no DB)")
         embed.add_field(name="Modules loaded", value=str(len(self.bot.cogs)), inline=False)

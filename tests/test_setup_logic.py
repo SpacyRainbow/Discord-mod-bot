@@ -253,7 +253,11 @@ async def test_updates_step_shows_unable_to_check_when_no_updater_cog(db):
 async def test_updates_step_shows_live_status_from_updater_cog(db):
     cog = _make_cog(db)
     updater_cog = MagicMock()
-    updater_cog.status = UpdateStatus(checked=True, available=True, behind=1, latest_summary="fix x")
+    updater_cog.current_status = AsyncMock(
+        return_value=UpdateStatus(checked=True, available=True, behind=1, latest_summary="fix x")
+    )
+    # The background loop's cached attribute, which this step used to read.
+    updater_cog.status = UpdateStatus(checked=True, available=False)
     cog.bot.get_cog = MagicMock(return_value=updater_cog)
     guild = MagicMock(id=GUILD)
     view = SetupView(cog, guild, invoker_id=1)
@@ -263,6 +267,7 @@ async def test_updates_step_shows_live_status_from_updater_cog(db):
 
     assert "1 commit(s) behind" in embed.description
     assert "fix x" in embed.description
+    updater_cog.current_status.assert_awaited_once()
 
 
 @pytest.mark.asyncio

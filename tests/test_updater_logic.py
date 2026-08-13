@@ -215,3 +215,156 @@ async def test_check_loop_survives_a_failing_config_read(db):
         await cog.check_loop.coro(cog)  # must return normally
 
     cog.apply_update.assert_not_awaited()
+
+
+# --- current_status: the live check behind /about --------------------------
+
+
+@pytest.mark.asyncio
+async def test_current_status_fetches_when_there_is_no_cached_check(db):
+    cog = _make_cog(_make_bot(db))
+    fresh = AsyncMock(return_value=UpdateStatus(checked=True, available=True, behind=1))
+
+    with patch("bot.modules.updater.check_for_update", fresh):
+        status = await cog.current_status()
+
+    assert status.available is True
+    fresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_current_status_reuses_a_recent_check(db):
+    # A room full of people running /about must not mean a git fetch each.
+    cog = _make_cog(_make_bot(db))
+    fresh = AsyncMock(return_value=UpdateStatus(checked=True, available=False))
+
+    with patch("bot.modules.updater.check_for_update", fresh):
+        await cog.current_status()
+        await cog.current_status()
+
+    assert fresh.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_current_status_re_fetches_once_the_ttl_has_passed(db):
+    cog = _make_cog(_make_bot(db))
+    fresh = AsyncMock(return_value=UpdateStatus(checked=True, available=False))
+
+    with patch("bot.modules.updater.check_for_update", fresh):
+        await cog.current_status()
+        cog._checked_at -= updater.STATUS_TTL_SECONDS + 1
+        await cog.current_status()
+
+    assert fresh.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_current_status_calls_share_one_fetch(db):
+    # The lock is only half of it - the loser must also re-check the TTL
+    # inside the lock, or it fetches again the moment the winner releases.
+    import asyncio
+
+    cog = _make_cog(_make_bot(db))
+    started = 0
+
+    async def slow_check():
+        nonlocal started
+        started += 1
+        await asyncio.sleep(0.01)
+        return UpdateStatus(checked=True, available=False)
+
+    with patch("bot.modules.updater.check_for_update", slow_check):
+        await asyncio.gather(*(cog.current_status() for _ in range(5)))
+
+    assert started == 1
+
+
+@pytest.mark.asyncio
+async def test_the_background_loop_also_refreshes_the_cache(db):
+    # So /about right after an auto-check doesn't pay for a second fetch.
+    bot = _make_bot(db)
+    bot.guilds = []
+    cog = _make_cog(bot)
+    fresh = AsyncMock(return_value=UpdateStatus(checked=True, available=False))
+
+    with patch("bot.modules.updater.check_for_update", fresh):
+        await cog.check_loop.coro(cog)
+        await cog.current_status()
+
+    assert fresh.await_count == 1
+
+
+# --- head_commit_date ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_head_commit_date_reads_the_real_repo(monkeypatch):
+    monkeypatch.setattr(updater, "_head_date", None)
+    monkeypatch.setattr(updater, "_head_date_looked_up", False)
+
+    date = await updater.head_commit_date()
+
+    assert date is not None
+    assert len(date) == 10 and date[4] == "-" and date[7] == "-"
+
+
+@pytest.mark.asyncio
+async def test_head_commit_date_is_none_outside_a_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(updater, "_head_date", None)
+    monkeypatch.setattr(updater, "_head_date_looked_up", False)
+
+    assert await updater.head_commit_date() is None
+
+
+@pytest.mark.asyncio
+async def test_head_commit_date_only_shells_out_once(monkeypatch):
+    # HEAD can't move under a running process - entrypoint.sh pulls before
+    # the interpreter starts - so this is looked up once, not per /about.
+    monkeypatch.setattr(updater, "_head_date", None)
+    monkeypatch.setattr(updater, "_head_date_looked_up", False)
+    run_git = AsyncMock(return_value=(0, "2026-08-13"))
+    monkeypatch.setattr(updater, "_run_git", run_git)
+
+    assert await updater.head_commit_date() == "2026-08-13"
+    assert await updater.head_commit_date() == "2026-08-13"
+    run_git.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_current_status_falls_back_to_the_last_known_status_on_timeout(db):
+    # /setup edits a component interaction without deferring, so a slow fetch
+    # has to degrade rather than blow Discord's 3s window.
+    import asyncio
+
+    cog = _make_cog(_make_bot(db))
+    cog.status = UpdateStatus(checked=True, available=False)
+
+    async def never_finishes():
+        await asyncio.sleep(10)
+        raise AssertionError("should have been cancelled")
+
+    with patch("bot.modules.updater.check_for_update", never_finishes):
+        status = await cog.current_status(timeout=0.01)
+
+    assert status is cog.status
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_check_leaves_the_lock_usable(db):
+    # The cancelled call must unwind cleanly, or every later check deadlocks.
+    import asyncio
+
+    cog = _make_cog(_make_bot(db))
+    async def slow():
+        await asyncio.sleep(10)
+        return UpdateStatus(checked=True, available=False)
+
+    with patch("bot.modules.updater.check_for_update", slow):
+        await cog.current_status(timeout=0.01)
+
+    fresh = AsyncMock(return_value=UpdateStatus(checked=True, available=True, behind=3))
+    with patch("bot.modules.updater.check_for_update", fresh):
+        status = await asyncio.wait_for(cog.current_status(), timeout=2)
+
+    assert status.behind == 3

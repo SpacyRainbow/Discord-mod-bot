@@ -21,7 +21,7 @@ import discord
 from discord.ext import commands
 
 from bot.modules.embedfix import PLATFORMS as EMBEDFIX_PLATFORMS
-from bot.modules.updater import UpdateStatus, describe_status
+from bot.modules.updater import INTERACTIVE_FETCH_TIMEOUT_SECONDS, UpdateStatus, describe_status
 
 STEP_GENERAL = "general"
 STEP_LOGGING = "logging"
@@ -437,7 +437,16 @@ class SetupView(discord.ui.View):
         elif step == STEP_UPDATES:
             auto_apply = await self.cfg_bool("updates.auto_apply", False)
             updater_cog = self.cog.bot.get_cog("Updater")
-            live_status = updater_cog.status if updater_cog is not None else UpdateStatus(checked=False)
+            # current_status(), not .status: the latter is the background
+            # loop's last result and can be half an hour old, which is not
+            # what a line labelled "Current status" should be showing. Bounded,
+            # because refresh() edits the interaction without deferring - a
+            # slow fetch here would break the wizard's navigation.
+            live_status = (
+                await updater_cog.current_status(timeout=INTERACTIVE_FETCH_TIMEOUT_SECONDS)
+                if updater_cog is not None
+                else UpdateStatus(checked=False)
+            )
             embed.description = (
                 f"**Auto-update**: {format_status(auto_apply)}\n"
                 f"**Current status**: {describe_status(live_status)}\n\n"
