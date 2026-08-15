@@ -44,7 +44,7 @@ CROSS_MARK = "\N{CROSS MARK}"
 # The host pattern is matched against the whole hostname, case-insensitively.
 PLATFORMS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "twitter": (r"(?:www\.|mobile\.)?(?:twitter|x)\.com", "fxtwitter.com", ("t", "s")),
-    "tiktok": (r"(?:www\.|vm\.|vt\.|m\.)?tiktok\.com", "vxtiktok.com", ("_t", "_r")),
+    "tiktok": (r"(?:www\.|vm\.|vt\.|m\.)?tiktok\.com", "tiktokfix.com", ("_t", "_r")),
     "instagram": (r"(?:www\.)?instagram\.com", "kkinstagram.com", ("igsh", "igshid")),
     "reddit": (r"(?:www\.|old\.|new\.)?reddit\.com", "rxddit.com", ("share_id", "utm_source")),
     "bluesky": (r"(?:www\.)?bsky\.app", "fxbsky.app", ()),
@@ -64,6 +64,7 @@ PROXY_HOSTS = frozenset(
         "vxtwitter.com",
         "twittpr.com",
         "girlcockx.com",
+        "tiktokfix.com",
         "vxtiktok.com",
         "tnktok.com",
         "tfxktok.com",

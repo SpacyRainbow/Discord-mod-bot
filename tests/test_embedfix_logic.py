@@ -26,8 +26,9 @@ ALL = set(PLATFORMS)
         ("https://twitter.com/user/status/123", "https://fxtwitter.com/user/status/123"),
         ("https://www.twitter.com/user/status/123", "https://fxtwitter.com/user/status/123"),
         ("https://mobile.x.com/user/status/123", "https://fxtwitter.com/user/status/123"),
-        ("https://www.tiktok.com/@who/video/7", "https://vxtiktok.com/@who/video/7"),
-        ("https://vm.tiktok.com/ZMabc/", "https://vxtiktok.com/ZMabc/"),
+        ("https://www.tiktok.com/@who/video/7", "https://tiktokfix.com/@who/video/7"),
+        ("https://vm.tiktok.com/ZMabc/", "https://tiktokfix.com/ZMabc/"),
+        ("https://www.tiktok.com/t/ZMabc/", "https://tiktokfix.com/t/ZMabc/"),
         ("https://instagram.com/reel/abc/", "https://kkinstagram.com/reel/abc/"),
         ("https://old.reddit.com/r/x/comments/1/t/", "https://rxddit.com/r/x/comments/1/t/"),
         ("https://bsky.app/profile/a.bsky.social/post/1", "https://fxbsky.app/profile/a.bsky.social/post/1"),
@@ -128,7 +129,7 @@ def test_fix_links_handles_mixed_platforms_in_one_message():
     content = "https://x.com/u/status/1 https://vm.tiktok.com/ZMabc/ https://example.com/x"
     assert fix_links(content, ALL) == [
         "https://fxtwitter.com/u/status/1",
-        "https://vxtiktok.com/ZMabc/",
+        "https://tiktokfix.com/ZMabc/",
     ]
 
 

@@ -587,7 +587,7 @@ message's empty embed. The video or post then plays inline.
 | Site | Rewritten to |
 |---|---|
 | `x.com`, `twitter.com` | `fxtwitter.com` |
-| `tiktok.com` (including `vm.` and `vt.` short links) | `vxtiktok.com` |
+| `tiktok.com` (including `vm.` and `vt.` short links) | `tiktokfix.com` |
 | `instagram.com` | `kkinstagram.com` |
 | `reddit.com` | `rxddit.com` |
 | `bsky.app` | `fxbsky.app` |
