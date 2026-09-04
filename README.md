@@ -325,6 +325,11 @@ to one server only. If a key has no stored value, the bot uses the default.
 | `embedfix.suppress_original` | true | If true, also hides the original message's empty embed. Needs Manage Messages |
 | `embedfix.remove_seconds` | 120 | How long the poster has to undo a fix, in seconds. The ❌ is removed when the window closes; `0` means no ❌ at all. Moderators have no time limit |
 | `embedfix.platform.<name>` | true | One key per supported site: `twitter`, `tiktok`, `instagram`, `reddit`, `bluesky`, `pixiv`, `twitch` |
+| `llm.enabled` | false | Whether an @mention of the bot gets an LLM reply. Off means pings are ignored, and the witty-line responder keeps the mention instead |
+| `llm.persona` | (built-in) | The bot's voice and personality. This is the *editable half* of the system prompt only — the safety preamble above it lives in code and cannot be changed from Discord |
+| `llm.maxtokens` | 200 | Longest reply, in tokens (32–600). The single biggest lever on how long a reply takes |
+| `llm.cooldown` | 60 | Seconds each user must wait between pings (0–3600; `0` disables the cooldown) |
+| `llm.channels` | (all) | Comma-separated channel IDs the bot will answer in. Empty means every channel |
 
 Some settings have their own command: `setlogchannel`, `setautorole`,
 `setboredchannel`, `setstarboard`, and `filter add`. You can change every
@@ -827,6 +832,66 @@ for an action (`add`, `remove`, or `list`) and a player name, blank for
 function sends the vanilla Minecraft `whitelist add`/`whitelist remove`/
 `whitelist list` console commands through the same mechanism the Console
 button uses - it only works while the target server is running.
+
+## Ask the bot (`@Aguiliar ...`)
+
+Ping the bot and it answers, using a local LLM. Nothing else triggers it — not
+a prefix, not a keyword, not replying to it. Set `llm.enabled` to `true` to
+switch it on; it is off by default.
+
+**It runs on a CPU, and it is slow.** The model is served from the NAS, which
+has no GPU. Measured against the live server: prompt processing about 5
+tokens/sec, generation about 2.3. A plain reply takes roughly two minutes and
+one that looks something up takes four to six. The bot posts a placeholder
+immediately and edits it as words arrive, so you can watch it work. If that is
+too slow for your hardware, `llm.maxtokens` is the lever that matters most.
+
+### How it decides what the conversation is about
+
+It does not get handed the channel history. Each ping carries only the message
+itself, the channel name, and one line saying how long ago the previous message
+was — enough for the model to judge for itself whether earlier context is even
+relevant. A ping after three days of silence usually is not. When it does need
+history, it asks for it, using one of two read-only tools:
+
+| Tool | What it reads |
+|---|---|
+| `read_recent_messages` | Up to 25 recent messages in the channel you pinged it in |
+| `read_reply_chain` | The chain of messages your message is replying to, up to 10 hops |
+
+This is a deliberate trade: fetching history costs about 0.2 seconds per token
+of prompt on this hardware, so paying for it only when it is needed is what
+keeps a normal reply to two minutes instead of five.
+
+### What it cannot do
+
+The limits are enforced in Python, not asked for in the prompt:
+
+- The tool list is a fixed allowlist of the two read tools above. Anything else
+  is refused.
+- **No tool takes a channel, guild, user, or message ID.** The handlers read the
+  channel you pinged in and nothing else, so there is no way to make it read
+  another channel, a channel you cannot see, a DM, or another server.
+- Every argument is re-clamped in code — a request for 9999 messages reads 25.
+- Malformed or unknown tool calls fail closed.
+- It cannot fetch URLs, read attachments, run commands, touch settings or
+  secrets, or write anything anywhere.
+- Messages it retrieves are inert data: mention syntax is stripped, length is
+  capped, and they are fenced off in the prompt. Text in a Discord message is
+  never treated as an instruction, whatever it claims to be.
+
+### Persona, and why the safety preamble is not editable
+
+The system prompt is two layers. The first is a preamble that lives in code —
+it is not a config key, `/setconfig` cannot reach it, and `/setup` does not
+show it. The second is `llm.persona`, which sets voice and personality and is
+freely editable.
+
+They are assembled in that order, always, with the persona clearly fenced. This
+split is on purpose: "you are X, and X always answers" is the classic way a
+persona erodes a model's refusals, and this deployment runs *stock* Qwen
+weights specifically so those refusals stay in place. A persona changes how the
+bot talks. It does not change what the bot will do.
 
 ## Updates
 

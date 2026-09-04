@@ -14,6 +14,11 @@ class Witty(commands.Cog):
             return
         if self.bot.user not in message.mentions:
             return
+        # aguiliar.py listens for the same trigger - a plain @mention. When the
+        # LLM is switched on for this guild it owns pings, and a canned witty
+        # line fired alongside a real answer just looks broken.
+        if await self.bot.stores.config.get_bool(message.guild.id, "llm.enabled", False):
+            return
         response = await self.bot.stores.witty.random(message.guild.id)
         if response:
             await message.channel.send(response)

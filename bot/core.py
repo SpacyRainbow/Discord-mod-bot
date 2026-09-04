@@ -43,6 +43,7 @@ MODULES = [
     "bot.modules.greetings",
     "bot.modules.embedfix",
     "bot.modules.updater",
+    "bot.modules.aguiliar",
     # "bot.modules.counters",
     # "bot.modules.leveling",
 ]
