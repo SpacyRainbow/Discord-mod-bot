@@ -410,7 +410,11 @@ def format_local_time(moment: datetime.datetime, tz: Any) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=datetime.timezone.utc)
     local = moment.astimezone(tz)
-    return local.strftime("%A %d %B %Y, %H:%M %Z").replace(" 0", " ")
+    # 12-hour with an explicit AM/PM, not 24-hour: asked the time at 01:22 EDT
+    # the model read a bare "01:22" and confidently answered "1:22 PM". The
+    # ambiguity was mine to remove, not its to resolve.
+    stamp = local.strftime("%A %d %B %Y, %I:%M %p %Z")
+    return stamp.replace(" 0", " ").replace(", 0", ", ")
 
 
 def build_identity_block(bot_name: str, guild_name: str) -> str:

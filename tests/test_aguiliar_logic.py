@@ -437,7 +437,7 @@ def test_a_utc_instant_is_rendered_in_the_configured_zone():
     tz, _name = resolve_timezone("America/New_York")
     moment = datetime.datetime(2026, 9, 4, 15, 30, tzinfo=datetime.timezone.utc)
     rendered = format_local_time(moment, tz)
-    assert "11:30" in rendered and "EDT" in rendered
+    assert "11:30 AM" in rendered and "EDT" in rendered
 
 
 def test_a_naive_timestamp_is_treated_as_utc():
@@ -445,7 +445,18 @@ def test_a_naive_timestamp_is_treated_as_utc():
 
     tz, _name = resolve_timezone("America/New_York")
     rendered = format_local_time(datetime.datetime(2026, 9, 4, 15, 30), tz)
-    assert "11:30" in rendered
+    assert "11:30 AM" in rendered
+
+
+def test_the_clock_is_unambiguous_about_am_and_pm():
+    """A bare 24-hour "01:22" was read back by the model as "1:22 PM"."""
+    import datetime
+
+    tz, _name = resolve_timezone("America/New_York")
+    early = format_local_time(datetime.datetime(2026, 9, 4, 5, 22, tzinfo=datetime.timezone.utc), tz)
+    assert "1:22 AM" in early
+    late = format_local_time(datetime.datetime(2026, 9, 4, 17, 22, tzinfo=datetime.timezone.utc), tz)
+    assert "1:22 PM" in late
 
 
 # --- deeper history paging ----------------------------------------------------
