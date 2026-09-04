@@ -862,7 +862,7 @@ history, it asks for it, using one of two read-only tools:
 |---|---|
 | `read_recent_messages` | Up to 100 recent messages in the channel you pinged it in, with an `offset` so it can page further back |
 | `read_reply_chain` | The chain of messages your message is replying to, up to 10 hops |
-| `read_member_profile` | One member of this server, looked up by the name they are shown under: their names, roles, join date and account age |
+| `read_member_profile` | One member of this server, looked up by the name they are shown under: their names, roles, join date, account age, and their online status and current game when the Presence intent is enabled |
 
 It also remembers the last couple of exchanges in the same channel (see
 `llm.memoryturns`), which are added to the prompt directly. That is cheaper than
@@ -871,9 +871,18 @@ two tokens a second — so a follow-up question usually needs no lookup at all.
 
 **A name is not a key.** Two people can share a display name, so
 `read_member_profile` returns the candidates and makes the bot ask which one you
-meant rather than guessing. It cannot read anyone's "About Me" bio or their
-status: Discord does not expose those to bots, and the workaround for that is a
-user token, which is against Discord's rules and is not something this bot does.
+meant rather than guessing. It can never read anyone's "About Me" bio: Discord
+does not expose it to bots at all, and the workaround for that is a user token,
+which is against Discord's rules and is not something this bot does.
+
+**Online status needs the Presence intent.** It is a privileged intent, so it
+must be ticked at
+[the developer portal](https://discord.com/developers/applications) under your
+application -> Bot -> Privileged Gateway Intents -> Presence Intent. The bot asks
+for it on startup; if it is not enabled, it logs an error and starts again
+without it rather than failing to log in, and the profile field then reads
+"status: not available (presence intent off)" instead of claiming that everyone
+is offline. Restart the bot after enabling it.
 
 This is a deliberate trade: fetching history costs about 0.2 seconds per token
 of prompt on this hardware, so paying for it only when it is needed is what

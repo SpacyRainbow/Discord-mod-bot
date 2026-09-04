@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 
+import discord
+
 from dotenv import load_dotenv
 
 from .core import ModBot
@@ -25,8 +27,23 @@ def main() -> None:
         )
         sys.exit(1)
 
-    bot = ModBot()
-    bot.run(token, log_handler=None)
+    try:
+        bot = ModBot(presences=True)
+        bot.run(token, log_handler=None)
+    except discord.PrivilegedIntentsRequired:
+        # Presence Intent is not ticked in the developer portal. Start again
+        # without it rather than crash-looping the whole bot behind
+        # `restart: unless-stopped` - moderation, music and tickets do not
+        # depend on presence, and only the member-profile lookup loses a field.
+        logging.getLogger("bot").error(
+            "Presence Intent is not enabled for this application, so member "
+            "status will not be available. Enable it at "
+            "https://discord.com/developers/applications -> your app -> Bot -> "
+            "Privileged Gateway Intents -> Presence Intent, then restart. "
+            "Starting without it."
+        )
+        bot = ModBot(presences=False)
+        bot.run(token, log_handler=None)
 
 
 if __name__ == "__main__":

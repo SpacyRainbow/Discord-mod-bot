@@ -165,3 +165,23 @@ async def test_get_prefix_uses_and_strips_a_real_stored_prefix():
     prefixes = await _prefix_for(" ? ")
     assert "?" in prefixes
     assert "" not in prefixes
+
+
+# --- the presence intent must never be able to take the bot down --------------
+
+
+def test_the_bot_asks_for_presence_by_default():
+    from bot.core import ModBot
+
+    assert ModBot().intents.presences is True
+
+
+def test_the_bot_can_be_built_without_presence():
+    """__main__ falls back to this when the developer portal toggle is off, so a
+    privileged intent that has not been enabled costs one profile field rather
+    than crash-looping every other feature."""
+    from bot.core import ModBot
+
+    bot = ModBot(presences=False)
+    assert bot.intents.presences is False
+    assert bot.intents.members is True and bot.intents.message_content is True

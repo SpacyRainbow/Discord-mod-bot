@@ -52,10 +52,19 @@ DEFAULT_PREFIX = os.getenv("DEFAULT_PREFIX", "!")
 
 
 class ModBot(commands.Bot):
-    def __init__(self):
+    def __init__(self, *, presences: bool = True):
         intents = discord.Intents.default()
         intents.members = True
         intents.message_content = True
+        # Presence is a privileged intent: it must ALSO be ticked in the Discord
+        # developer portal, and asking for it without that is a hard login
+        # failure, not a degraded start. __main__.py therefore tries it, catches
+        # PrivilegedIntentsRequired and starts again without it, so the bot can
+        # never be taken down by a toggle that has not been flipped yet.
+        # aguiliar.py reads self.intents.presences before offering to report
+        # anyone's status - with the intent off, every member looks offline, and
+        # reporting that would be a confident lie.
+        intents.presences = presences
         # help_command=None: status.py defines its own /help hybrid command,
         # which would collide with discord.py's default one otherwise.
         super().__init__(

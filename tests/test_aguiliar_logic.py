@@ -23,6 +23,7 @@ from bot.modules.aguiliar import (
     clamp_offset,
     default_persona,
     describe_member,
+    describe_presence,
     find_members,
     format_local_time,
     memory_turns,
@@ -788,3 +789,68 @@ async def test_memory_is_replayed_as_prior_turns(db):
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
     assert "earlier question" in messages[1]["content"]
     assert messages[2]["content"] == "earlier answer"
+
+
+# --- presence, only when the intent is really on ------------------------------
+
+
+def _presence_member(status="online", activities=()):
+    member = _member("Spacy", "spacyrainbow")
+    member.status = MagicMock(value=status)
+    member.activities = list(activities)
+    return member
+
+
+def test_a_profile_says_status_is_unavailable_when_the_intent_is_off():
+    """Without the intent every member reads as offline. Reporting that would
+    be a confident lie, so the field says it is unavailable instead."""
+    rendered = describe_member(_presence_member(), is_moderator=False, presence=False)
+    assert "presence intent off" in rendered
+    assert "online" not in rendered
+
+
+def test_a_profile_reports_status_when_the_intent_is_on():
+    rendered = describe_member(_presence_member(), is_moderator=False, presence=True)
+    assert "status: online" in rendered
+
+
+def test_a_custom_status_is_read_from_its_state_text():
+    activity = discord.CustomActivity(name="Custom Status", state="fixing the NAS")
+    assert "fixing the NAS" in describe_presence(_presence_member(activities=[activity]))
+
+
+def test_a_game_is_reported_as_playing():
+    game = discord.Game(name="VRChat")
+    assert "playing VRChat" in describe_presence(_presence_member(activities=[game]))
+
+
+def test_no_activity_is_reported_as_nothing_listed():
+    assert "nothing listed" in describe_presence(_presence_member())
+
+
+def test_presence_text_is_sanitised():
+    activity = discord.CustomActivity(name="Custom Status", state="hi <@123456789>")
+    assert "123456789" not in describe_presence(_presence_member(activities=[activity]))
+
+
+def test_a_bio_is_never_claimed_either_way():
+    for presence in (True, False):
+        rendered = describe_member(_presence_member(), is_moderator=False, presence=presence)
+        assert "bio / about me: not available to bots at all" in rendered
+
+
+@pytest.mark.asyncio
+async def test_the_profile_tool_follows_the_bot_s_actual_intents():
+    cog = _make_cog()
+    cog.bot.intents = discord.Intents.default()
+    cog.bot.intents.presences = False
+    message = MagicMock(spec=discord.Message)
+    message.guild = MagicMock()
+    message.guild.members = [_presence_member()]
+
+    rendered = await cog._tool_read_member_profile(message, {"display_name": "Spacy"})
+    assert "presence intent off" in rendered
+
+    cog.bot.intents.presences = True
+    rendered = await cog._tool_read_member_profile(message, {"display_name": "Spacy"})
+    assert "status: online" in rendered
