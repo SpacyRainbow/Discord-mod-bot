@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, Optional
 import discord
 from discord.ext import commands
 
+from bot.modules.aguiliar import resolve_timezone
 from bot.modules.embedfix import PLATFORMS as EMBEDFIX_PLATFORMS
 from bot.modules.updater import INTERACTIVE_FETCH_TIMEOUT_SECONDS, UpdateStatus, describe_status
 
@@ -37,6 +38,7 @@ STEP_TICKETS = "tickets"
 STEP_GREETINGS = "greetings"
 STEP_MUSIC = "music"
 STEP_EMBEDFIX = "embedfix"
+STEP_LLM = "llm"
 STEP_UPDATES = "updates"
 STEP_SUMMARY = "summary"
 
@@ -55,6 +57,7 @@ STEPS = [
     STEP_GREETINGS,
     STEP_MUSIC,
     STEP_EMBEDFIX,
+    STEP_LLM,
     STEP_UPDATES,
     STEP_SUMMARY,
 ]
@@ -74,6 +77,7 @@ STEP_TITLES = {
     STEP_GREETINGS: "Welcome/leave messages",
     STEP_MUSIC: "Music",
     STEP_EMBEDFIX: "Link embed fixer",
+    STEP_LLM: "Aguiliar (LLM replies)",
     STEP_UPDATES: "Updates",
     STEP_SUMMARY: "Summary",
 }
@@ -126,6 +130,14 @@ CONFIG_MANIFEST = [
     ("embedfix.enabled", "true", "true", "Fix links that don't embed"),
     ("embedfix.suppress_original", "true", "true", "Hide the original's broken embed"),
     ("embedfix.remove_seconds", "120", "120", "Poster's undo window (seconds)"),
+    ("llm.enabled", "false", "false", "Answer @pings with the local LLM"),
+    ("llm.maxtokens", "200", "200", "Maximum reply length (tokens)"),
+    ("llm.cooldown", "60", "60", "Per-user cooldown (seconds)"),
+    ("llm.channels", None, "unset (every channel)", "Channels the LLM answers in"),
+    ("llm.timezone", "America/New_York", "America/New_York", "Timezone the bot is told it is in"),
+    ("llm.memoryturns", "2", "2", "Prior exchanges remembered per channel"),
+    ("llm.memoryminutes", "30", "30", "How stale a remembered exchange may be (minutes)"),
+    ("llm.logdays", "30", "30", "Exchange log retention (days)"),
     ("updates.auto_apply", "false", "false", "Automatically restart to apply detected updates"),
 ]
 
@@ -153,6 +165,12 @@ STEP_RESET_PREFIXES = {
     STEP_GREETINGS: ["welcome.", "leave."],
     STEP_MUSIC: ["music."],
     STEP_EMBEDFIX: ["embedfix."],
+    # Deliberately not "llm." - that would wipe llm.persona, which is a long
+    # hand-written document, not a threshold. /setpersona owns that key.
+    STEP_LLM: [
+        "llm.enabled", "llm.maxtokens", "llm.cooldown", "llm.channels",
+        "llm.timezone", "llm.memoryturns", "llm.memoryminutes", "llm.logdays",
+    ],
     STEP_UPDATES: ["updates."],
 }
 
@@ -299,6 +317,9 @@ class SetupView(discord.ui.View):
             )
             self.add_item(await _PlatformSelect.create(self))
             self.add_item(_ModalButton("Edit undo window", lambda: _build_embedfix_modal(self)))
+        elif step == STEP_LLM:
+            self.add_item(await _ToggleButton.create(self, "llm.enabled", "Answer @pings", False))
+            self.add_item(_ModalButton("Edit LLM settings", lambda: _build_llm_modal(self)))
         elif step == STEP_UPDATES:
             self.add_item(await _ToggleButton.create(self, "updates.auto_apply", "Auto-update", False))
 
@@ -408,6 +429,18 @@ class SetupView(discord.ui.View):
                 + "\n".join(await self._manifest_lines("leave."))
             )
             embed.color = combined_status_color([bool(welcome_channel), bool(leave_channel)])
+        elif step == STEP_LLM:
+            enabled = await self.cfg_bool("llm.enabled", False)
+            persona = await self.cfg("llm.persona")
+            embed.description = (
+                f"**Answer @pings with the LLM**: {format_status(enabled)}\n"
+                f"**Personality**: {'customised' if persona else 'default'} - "
+                "edit it with `/setpersona` (it is far too long for a chat message)\n\n"
+                + "\n".join(await self._manifest_lines("llm."))
+                + "\n\nReplies come from a CPU-only model and take 30 seconds to a few "
+                "minutes. `/llmlog` shows what it has been saying, including failures."
+            )
+            embed.color = discord.Color.green() if enabled else discord.Color.red()
         elif step == STEP_MUSIC:
             enabled = await self.cfg_bool("music.sponsorblock_enabled", True)
             embed.description = f"**SponsorBlock auto-skip**: {format_status(enabled)}"
@@ -842,6 +875,59 @@ class _PrefixModal(discord.ui.Modal, title="General settings"):
             self.setup_view.guild.id, "commandprefix", prefix
         )
         await self.setup_view.refresh(interaction)
+
+
+class _LLMModal(discord.ui.Modal, title="Aguiliar (LLM replies)"):
+    def __init__(self, view: SetupView):
+        super().__init__()
+        self.setup_view = view
+        self.maxtokens = discord.ui.TextInput(label="Max reply length in tokens (default 200)", required=True)
+        self.cooldown = discord.ui.TextInput(label="Per-user cooldown, seconds (default 60)", required=True)
+        self.memoryturns = discord.ui.TextInput(label="Remembered exchanges, 0-5 (default 2)", required=True)
+        self.memoryminutes = discord.ui.TextInput(label="Memory age limit, minutes (default 30)", required=True)
+        self.timezone = discord.ui.TextInput(label="Timezone (default America/New_York)", required=True)
+        for item in (
+            self.maxtokens, self.cooldown, self.memoryturns, self.memoryminutes, self.timezone
+        ):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        numeric = {
+            "llm.maxtokens": self.maxtokens.value,
+            "llm.cooldown": self.cooldown.value,
+            "llm.memoryturns": self.memoryturns.value,
+            "llm.memoryminutes": self.memoryminutes.value,
+        }
+        for key, value in numeric.items():
+            error = _int_field_error(key, value)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
+                return
+        zone = (self.timezone.value or "").strip()
+        # Validated here rather than at read time: a typo'd zone would otherwise
+        # be discovered only as a silently wrong clock in the bot's replies.
+        _tz, resolved = resolve_timezone(zone)
+        if resolved != zone:
+            await interaction.response.send_message(
+                f"`{zone}` is not a timezone I know (expected something like "
+                "`America/New_York`) - nothing was saved.",
+                ephemeral=True,
+            )
+            return
+        for key, value in numeric.items():
+            await self.setup_view.cog.bot.stores.config.set(self.setup_view.guild.id, key, value)
+        await self.setup_view.cog.bot.stores.config.set(self.setup_view.guild.id, "llm.timezone", zone)
+        await self.setup_view.refresh(interaction)
+
+
+async def _build_llm_modal(view: SetupView) -> _LLMModal:
+    modal = _LLMModal(view)
+    modal.maxtokens.default = await view.cfg("llm.maxtokens", "200")
+    modal.cooldown.default = await view.cfg("llm.cooldown", "60")
+    modal.memoryturns.default = await view.cfg("llm.memoryturns", "2")
+    modal.memoryminutes.default = await view.cfg("llm.memoryminutes", "30")
+    modal.timezone.default = await view.cfg("llm.timezone", "America/New_York")
+    return modal
 
 
 async def _build_prefix_modal(view: SetupView) -> _PrefixModal:

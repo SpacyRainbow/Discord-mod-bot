@@ -668,6 +668,87 @@ class TicketStore(_Store):
         )
 
 
+class LLMLogStore(_Store):
+    """One row per LLM exchange, successful or not.
+
+    This is the only record of what Aguiliar actually said - the cog used to log
+    nothing but exceptions, so a bad answer left no trace. Two callers depend on
+    it: /llmlog (reading it back) and the cog's short-term channel memory, which
+    replays the last few rows as prior turns. That second use is why the index
+    is on (channel_id, created_at) and why `status` exists: a failed exchange
+    must be visible to a human but must never be replayed to the model as if it
+    were a real reply.
+    """
+
+    async def add(
+        self,
+        guild_id: int,
+        channel_id: int,
+        channel_name: Optional[str],
+        user_id: int,
+        user_name: Optional[str],
+        prompt: Optional[str],
+        reply: Optional[str],
+        tool_calls: Optional[list],
+        rounds: int,
+        duration_ms: Optional[int],
+        model: Optional[str],
+        status: str,
+        error: Optional[str],
+    ) -> None:
+        await self._write(
+            "INSERT INTO llm_log (guild_id, channel_id, channel_name, user_id, user_name, "
+            "prompt, reply, tool_calls, rounds, duration_ms, model, status, error, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                guild_id,
+                channel_id,
+                channel_name,
+                user_id,
+                user_name,
+                prompt,
+                reply,
+                json.dumps(tool_calls or []),
+                rounds,
+                duration_ms,
+                model,
+                status,
+                error,
+                datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            ),
+            "Database unavailable, LLM exchange not logged",
+        )
+
+    async def recent_for_channel(self, channel_id: int, limit: int, since_iso: str) -> list:
+        """Newest-first rows for the memory feature. Only successful exchanges
+        with a real reply - a timeout row would otherwise be replayed to the
+        model as something it said."""
+        return await self._read_all(
+            "SELECT user_name, prompt, reply, created_at FROM llm_log "
+            "WHERE channel_id = ? AND created_at >= ? AND status = 'ok' "
+            "AND reply IS NOT NULL AND reply != '' "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (channel_id, since_iso, limit),
+        )
+
+    async def recent_for_guild(self, guild_id: int, limit: int) -> list:
+        """Newest-first, successes and failures alike - this one is /llmlog."""
+        return await self._read_all(
+            "SELECT created_at, channel_name, user_name, prompt, reply, tool_calls, "
+            "rounds, duration_ms, status, error FROM llm_log "
+            "WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (guild_id, limit),
+        )
+
+    async def prune(self, older_than_iso: str) -> int:
+        cursor = await self._write(
+            "DELETE FROM llm_log WHERE created_at < ?",
+            (older_than_iso,),
+            "Database unavailable, LLM log not pruned",
+        )
+        return cursor.rowcount if cursor is not None else 0
+
+
 class Stores:
     """Bag of all store instances, attached to the bot as bot.stores."""
 
@@ -688,3 +769,4 @@ class Stores:
         self.giveaways = GiveawayStore(db)
         self.polls = PollStore(db)
         self.tickets = TicketStore(db)
+        self.llm_log = LLMLogStore(db)

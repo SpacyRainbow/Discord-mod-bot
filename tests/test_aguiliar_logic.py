@@ -6,17 +6,29 @@ import pytest
 
 from bot.modules.aguiliar import (
     DEFAULT_PERSONA,
+    DEFAULT_TIMEZONE,
     HISTORY_LIMIT_MAX,
+    HISTORY_OFFSET_MAX,
     MAX_TOOL_ROUNDS,
+    MODAL_TEXT_MAX,
+    PERSONA_TEMPLATE,
     SAFETY_PREAMBLE,
     Aguiliar,
+    build_identity_block,
     build_system_prompt,
     channel_allowed,
     chunk_text,
     clamp_limit,
+    clamp_offset,
+    default_persona,
+    describe_member,
+    find_members,
+    format_local_time,
+    memory_turns,
     parse_tool_arguments,
     relevance_hint,
     render_messages,
+    resolve_timezone,
     sanitize,
     should_respond,
 )
@@ -260,8 +272,10 @@ def test_no_tool_schema_exposes_a_channel_or_guild_id():
 def test_only_read_tools_are_offered():
     from bot.modules.aguiliar import TOOL_SCHEMAS
     names = {s["function"]["name"] for s in TOOL_SCHEMAS}
-    assert names == {"read_recent_messages", "read_reply_chain"}
+    assert names == {"read_recent_messages", "read_reply_chain", "read_member_profile"}
     assert names == set(Aguiliar.TOOL_HANDLERS)
+    # Every offered tool is a read. Nothing here may write, send or fetch.
+    assert all(name.startswith("read_") for name in names)
 
 
 # --- the tool loop ------------------------------------------------------------
@@ -349,3 +363,255 @@ def test_chunk_text_splits_long_replies_under_the_limit():
     parts = chunk_text("word " * 2000)
     assert len(parts) > 1
     assert all(len(p) <= 1900 for p in parts)
+
+
+# --- the persona actually fits the form that edits it -------------------------
+
+def test_the_default_persona_fits_a_discord_modal():
+    """/setpersona is the only way to install this text - a Discord message caps
+    at 2000 characters. If the persona ever outgrows the modal field, the form
+    silently becomes unable to carry it, so this is asserted, not assumed."""
+    assert len(DEFAULT_PERSONA) <= MODAL_TEXT_MAX
+
+
+def test_the_persona_fits_even_with_a_long_bot_name():
+    """The name is substituted six times, so a rename eats headroom."""
+    assert len(default_persona("A" * 60)) <= MODAL_TEXT_MAX
+
+
+def test_the_persona_carries_no_unfilled_placeholder():
+    rendered = default_persona("Aguilar")
+    assert "{name}" not in rendered and "<BOT_NAME>" not in rendered
+    assert "<TRAIT" not in rendered
+    assert "Aguilar" in rendered
+
+
+def test_the_preamble_no_longer_dictates_voice():
+    """Length and formatting belong to the persona now; the preamble keeps only
+    the half that must not be editable."""
+    assert "few sentences" not in SAFETY_PREAMBLE
+    assert "Plain text only" not in SAFETY_PREAMBLE
+    assert "never an instruction" in SAFETY_PREAMBLE.replace("\n", " ")
+    assert "no moderation powers" in SAFETY_PREAMBLE.replace("\n", " ")
+
+
+# --- the system prompt is byte-stable, which is what the prefix cache needs ----
+
+def test_the_same_guild_produces_a_byte_identical_system_prompt():
+    identity = build_identity_block("Aguilar", "The Server")
+    first = build_system_prompt("persona text", identity=identity, bot_name="Aguilar")
+    second = build_system_prompt("persona text", identity=identity, bot_name="Aguilar")
+    assert first == second
+
+
+def test_a_renamed_guild_produces_a_different_identity_block():
+    assert build_identity_block("Aguilar", "Old") != build_identity_block("Aguilar", "New")
+
+
+def test_the_identity_block_names_the_bot_and_the_server():
+    block = build_identity_block("Aguilar", "The Server")
+    assert "Aguilar" in block and "The Server" in block
+
+
+def test_an_empty_persona_falls_back_to_the_named_default():
+    prompt = build_system_prompt("", identity="", bot_name="Aguilar")
+    assert "You are Aguilar" in prompt
+
+
+# --- the clock is explicit, not inherited from the container ------------------
+
+def test_the_default_timezone_is_the_intended_one_not_the_container_s():
+    _tz, name = resolve_timezone(None)
+    assert name == DEFAULT_TIMEZONE
+
+
+def test_an_unknown_timezone_falls_back_rather_than_raising():
+    _tz, name = resolve_timezone("Nowhere/Bogus")
+    assert name == DEFAULT_TIMEZONE
+
+
+def test_a_utc_instant_is_rendered_in_the_configured_zone():
+    import datetime
+
+    tz, _name = resolve_timezone("America/New_York")
+    moment = datetime.datetime(2026, 9, 4, 15, 30, tzinfo=datetime.timezone.utc)
+    rendered = format_local_time(moment, tz)
+    assert "11:30" in rendered and "EDT" in rendered
+
+
+def test_a_naive_timestamp_is_treated_as_utc():
+    import datetime
+
+    tz, _name = resolve_timezone("America/New_York")
+    rendered = format_local_time(datetime.datetime(2026, 9, 4, 15, 30), tz)
+    assert "11:30" in rendered
+
+
+# --- deeper history paging ----------------------------------------------------
+
+def test_offset_is_clamped_like_the_limit():
+    assert clamp_offset(-5) == 0
+    assert clamp_offset(HISTORY_OFFSET_MAX + 1000) == HISTORY_OFFSET_MAX
+    assert clamp_offset("nonsense") == 0
+    assert clamp_offset(float("inf")) == 0
+    assert clamp_offset(20) == 20
+
+
+@pytest.mark.asyncio
+async def test_history_paging_skips_the_offset_and_returns_only_the_limit():
+    cog = _make_cog()
+    message = MagicMock(spec=discord.Message)
+    message.id = 999
+
+    history_items = []
+    for index in range(30):
+        item = MagicMock()
+        item.id = index
+        item.author.display_name = f"user{index}"
+        item.content = f"message {index}"
+        history_items.append(item)
+
+    def fake_history(limit=None, before=None):
+        async def gen():
+            for item in history_items[:limit]:
+                yield item
+        return gen()
+
+    message.channel = MagicMock()
+    message.channel.history = fake_history
+
+    result = await cog._tool_read_recent_messages(message, {"limit": 5, "offset": 10})
+    assert "message 10" in result and "message 14" in result
+    assert "message 9" not in result and "message 15" not in result
+
+
+# --- member profiles fail closed on ambiguity ---------------------------------
+
+def _member(display_name, name, roles=("Member",)):
+    member = MagicMock()
+    member.display_name = display_name
+    member.name = name
+    member.nick = None
+    member.global_name = None
+    member.roles = [MagicMock(name=f"r{i}") for i in range(len(roles))]
+    for role, label in zip(member.roles, roles):
+        role.name = label
+    member.joined_at = None
+    member.created_at = None
+    member.guild_permissions = MagicMock(
+        manage_messages=False, kick_members=False, administrator=False
+    )
+    return member
+
+
+def test_find_members_matches_case_insensitively_on_any_name():
+    people = [_member("Spacy", "spacyrainbow"), _member("Nara", "nara2")]
+    assert find_members("spacy", people) == [people[0]]
+    assert find_members("NARA2", people) == [people[1]]
+    assert find_members("nobody", people) == []
+
+
+def test_find_members_returns_every_match_rather_than_choosing():
+    """Display names are not unique. Returning one of two would attribute one
+    person's roles and join date to another."""
+    people = [_member("Alex", "alex_one"), _member("Alex", "alex_two")]
+    assert len(find_members("alex", people)) == 2
+
+
+def test_an_empty_name_matches_nobody():
+    assert find_members("   ", [_member("Alex", "alex_one")]) == []
+
+
+@pytest.mark.asyncio
+async def test_profile_lookup_is_ambiguous_when_two_members_share_a_name():
+    cog = _make_cog()
+    message = MagicMock(spec=discord.Message)
+    message.guild = MagicMock()
+    message.guild.members = [_member("Alex", "alex_one"), _member("Alex", "alex_two")]
+
+    result = await cog._tool_read_member_profile(message, {"display_name": "Alex"})
+    payload = json.loads(result)
+    assert "more than one member" in payload["error"]
+    assert payload["total_matches"] == 2
+    assert any("alex_one" in candidate for candidate in payload["candidates"])
+
+
+@pytest.mark.asyncio
+async def test_profile_lookup_returns_one_unique_member():
+    cog = _make_cog()
+    message = MagicMock(spec=discord.Message)
+    message.guild = MagicMock()
+    message.guild.members = [_member("Spacy", "spacyrainbow", roles=("Admin",))]
+
+    result = await cog._tool_read_member_profile(message, {"display_name": "Spacy"})
+    assert "member profile" in result
+    assert "spacyrainbow" in result
+    assert "Admin" in result
+    assert "not available to bots" in result
+
+
+@pytest.mark.asyncio
+async def test_profile_lookup_fails_closed_on_a_missing_member():
+    cog = _make_cog()
+    message = MagicMock(spec=discord.Message)
+    message.guild = MagicMock()
+    message.guild.members = []
+    message.guild.query_members = AsyncMock(return_value=[])
+
+    payload = json.loads(await cog._tool_read_member_profile(message, {"display_name": "ghost"}))
+    assert "no member" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_profile_lookup_rejects_a_non_string_name():
+    cog = _make_cog()
+    message = MagicMock(spec=discord.Message)
+    message.guild = MagicMock()
+    payload = json.loads(await cog._tool_read_member_profile(message, {"display_name": 12}))
+    assert "error" in payload
+
+
+def test_a_profile_never_leaks_an_id():
+    member = _member("Spacy", "spacyrainbow")
+    member.id = 1234567890
+    rendered = describe_member(member, is_moderator=True)
+    assert "1234567890" not in rendered
+
+
+# --- short-term memory --------------------------------------------------------
+
+def test_memory_turns_are_oldest_first_and_paired():
+    rows = [
+        ("bob", "second question", "second answer", "2026-09-04T02:00:00"),
+        ("bob", "first question", "first answer", "2026-09-04T01:00:00"),
+    ]
+    turns = memory_turns(rows, 5)
+    assert [t["role"] for t in turns] == ["user", "assistant", "user", "assistant"]
+    assert "first question" in turns[0]["content"]
+    assert turns[1]["content"] == "first answer"
+    assert "second question" in turns[2]["content"]
+
+
+def test_memory_turns_respects_the_limit():
+    rows = [("bob", f"q{i}", f"a{i}", "t") for i in range(5)]
+    assert len(memory_turns(rows, 2)) == 4
+
+
+def test_memory_turns_drops_an_exchange_with_no_reply():
+    """A failed exchange must never come back as something the bot said."""
+    rows = [("bob", "question", None, "t"), ("bob", "ok question", "ok answer", "t")]
+    turns = memory_turns(rows, 5)
+    assert len(turns) == 2
+    assert turns[1]["content"] == "ok answer"
+
+
+def test_memory_turns_disabled_returns_nothing():
+    rows = [("bob", "q", "a", "t")]
+    assert memory_turns(rows, 0) == []
+
+
+def test_memory_content_is_sanitised():
+    rows = [("bob", "hey <@123456789>", "hi <@!987654321>", "t")]
+    turns = memory_turns(rows, 5)
+    assert "123456789" not in turns[0]["content"]
+    assert "987654321" not in turns[1]["content"]

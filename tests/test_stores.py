@@ -467,3 +467,77 @@ async def test_get_int_boundaries_are_inclusive(db):
     assert await stores.config.get_int(GUILD, "automod.caps_threshold", 70, minimum=0, maximum=100) == 0
     await stores.config.set(GUILD, "automod.caps_threshold", "100")
     assert await stores.config.get_int(GUILD, "automod.caps_threshold", 70, minimum=0, maximum=100) == 100
+
+
+# --- the LLM exchange log -----------------------------------------------------
+
+
+async def _log(stores, **overrides):
+    row = dict(
+        guild_id=GUILD,
+        channel_id=555,
+        channel_name="general",
+        user_id=77,
+        user_name="bob",
+        prompt="hello",
+        reply="hi",
+        tool_calls=[],
+        rounds=1,
+        duration_ms=1234,
+        model="qwen38-27b-stock",
+        status="ok",
+        error=None,
+    )
+    row.update(overrides)
+    await stores.llm_log.add(**row)
+
+
+async def test_llm_log_round_trips_an_exchange(db):
+    stores = Stores(db)
+    await _log(stores, tool_calls=[{"name": "read_recent_messages", "arguments": "{}"}])
+    rows = await stores.llm_log.recent_for_guild(GUILD, 5)
+    assert len(rows) == 1
+    assert rows[0][3] == "hello" and rows[0][4] == "hi"
+    assert "read_recent_messages" in rows[0][5]
+
+
+async def test_llm_log_records_a_failure_with_no_reply(db):
+    """A timeout has to leave a trace - that is the whole point of the table."""
+    stores = Stores(db)
+    await _log(stores, reply=None, status="timeout", error="no response within 600s")
+    rows = await stores.llm_log.recent_for_guild(GUILD, 5)
+    assert rows[0][8] == "timeout"
+    assert rows[0][9] == "no response within 600s"
+    assert rows[0][4] is None
+
+
+async def test_memory_read_excludes_failed_exchanges(db):
+    """A failed row must never be replayed to the model as something it said."""
+    stores = Stores(db)
+    await _log(stores, reply=None, status="timeout", error="boom")
+    await _log(stores, prompt="good", reply="answer")
+    rows = await stores.llm_log.recent_for_channel(555, 10, "2000-01-01T00:00:00")
+    assert len(rows) == 1
+    assert rows[0][1] == "good"
+
+
+async def test_memory_read_is_scoped_to_one_channel(db):
+    stores = Stores(db)
+    await _log(stores, channel_id=555, prompt="here")
+    await _log(stores, channel_id=666, prompt="elsewhere")
+    rows = await stores.llm_log.recent_for_channel(555, 10, "2000-01-01T00:00:00")
+    assert [r[1] for r in rows] == ["here"]
+
+
+async def test_memory_read_honours_the_staleness_cutoff(db):
+    stores = Stores(db)
+    await _log(stores)
+    assert await stores.llm_log.recent_for_channel(555, 10, "2999-01-01T00:00:00") == []
+
+
+async def test_llm_log_prune_removes_only_old_rows(db):
+    stores = Stores(db)
+    await _log(stores)
+    assert await stores.llm_log.prune("2000-01-01T00:00:00") == 0
+    assert await stores.llm_log.prune("2999-01-01T00:00:00") == 1
+    assert await stores.llm_log.recent_for_guild(GUILD, 5) == []

@@ -153,6 +153,27 @@ CREATE TABLE IF NOT EXISTS poll_votes (
     PRIMARY KEY (poll_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS llm_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    channel_name TEXT,
+    user_id INTEGER NOT NULL,
+    user_name TEXT,
+    prompt TEXT,
+    reply TEXT,
+    tool_calls TEXT,
+    rounds INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER,
+    model TEXT,
+    status TEXT NOT NULL DEFAULT 'ok',
+    error TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_log_channel_time
+    ON llm_log (channel_id, created_at);
+
 CREATE TABLE IF NOT EXISTS tickets (
     guild_id INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,

@@ -326,10 +326,14 @@ to one server only. If a key has no stored value, the bot uses the default.
 | `embedfix.remove_seconds` | 120 | How long the poster has to undo a fix, in seconds. The ❌ is removed when the window closes; `0` means no ❌ at all. Moderators have no time limit |
 | `embedfix.platform.<name>` | true | One key per supported site: `twitter`, `tiktok`, `instagram`, `reddit`, `bluesky`, `pixiv`, `twitch` |
 | `llm.enabled` | false | Whether an @mention of the bot gets an LLM reply. Off means pings are ignored, and the witty-line responder keeps the mention instead |
-| `llm.persona` | (built-in) | The bot's voice and personality. This is the *editable half* of the system prompt only — the safety preamble above it lives in code and cannot be changed from Discord |
+| `llm.persona` | (built-in) | The bot's voice and personality. This is the *editable half* of the system prompt only — the safety preamble above it lives in code and cannot be changed from Discord. Edit it with `/setpersona`, which opens a form: the default text is about 3,500 characters and a Discord message stops at 2,000 |
 | `llm.maxtokens` | 200 | Longest reply, in tokens (32–600). The single biggest lever on how long a reply takes |
 | `llm.cooldown` | 60 | Seconds each user must wait between pings (0–3600; `0` disables the cooldown) |
 | `llm.channels` | (all) | Comma-separated channel IDs the bot will answer in. Empty means every channel |
+| `llm.timezone` | America/New_York | The IANA timezone the bot is told it is in. Set deliberately: the container has no `TZ`, so anything that trusted the system clock would report UTC as local time |
+| `llm.memoryturns` | 2 | How many previous exchanges in the same channel the bot is reminded of (0–5). `0` turns short-term memory off |
+| `llm.memoryminutes` | 30 | How old a remembered exchange may be before it is ignored (1–1440) |
+| `llm.logdays` | 30 | How long exchanges stay in the log that `/llmlog` reads (1–365) |
 
 Some settings have their own command: `setlogchannel`, `setautorole`,
 `setboredchannel`, `setstarboard`, and `filter add`. You can change every
@@ -856,8 +860,20 @@ history, it asks for it, using one of two read-only tools:
 
 | Tool | What it reads |
 |---|---|
-| `read_recent_messages` | Up to 25 recent messages in the channel you pinged it in |
+| `read_recent_messages` | Up to 100 recent messages in the channel you pinged it in, with an `offset` so it can page further back |
 | `read_reply_chain` | The chain of messages your message is replying to, up to 10 hops |
+| `read_member_profile` | One member of this server, looked up by the name they are shown under: their names, roles, join date and account age |
+
+It also remembers the last couple of exchanges in the same channel (see
+`llm.memoryturns`), which are added to the prompt directly. That is cheaper than
+a tool call — a tool costs a whole extra request to a model that generates about
+two tokens a second — so a follow-up question usually needs no lookup at all.
+
+**A name is not a key.** Two people can share a display name, so
+`read_member_profile` returns the candidates and makes the bot ask which one you
+meant rather than guessing. It cannot read anyone's "About Me" bio or their
+status: Discord does not expose those to bots, and the workaround for that is a
+user token, which is against Discord's rules and is not something this bot does.
 
 This is a deliberate trade: fetching history costs about 0.2 seconds per token
 of prompt on this hardware, so paying for it only when it is needed is what
@@ -867,25 +883,48 @@ keeps a normal reply to two minutes instead of five.
 
 The limits are enforced in Python, not asked for in the prompt:
 
-- The tool list is a fixed allowlist of the two read tools above. Anything else
-  is refused.
+- The tool list is a fixed allowlist of the read tools above. Anything else is
+  refused.
 - **No tool takes a channel, guild, user, or message ID.** The handlers read the
   channel you pinged in and nothing else, so there is no way to make it read
   another channel, a channel you cannot see, a DM, or another server.
-- Every argument is re-clamped in code — a request for 9999 messages reads 25.
+- Every argument is re-clamped in code — a request for 9999 messages reads 100.
 - Malformed or unknown tool calls fail closed.
 - It cannot fetch URLs, read attachments, run commands, touch settings or
   secrets, or write anything anywhere.
+- It cannot see images. The model it runs on is text-only, so an attached
+  picture is invisible to it rather than misdescribed.
 - Messages it retrieves are inert data: mention syntax is stripped, length is
   capped, and they are fenced off in the prompt. Text in a Discord message is
   never treated as an instruction, whatever it claims to be.
+
+### Seeing what it said (`/llmlog`)
+
+Every ping is recorded: the question, the answer, which tools it called, how
+long it took, and whether it worked at all. Failures are recorded too — a
+timeout, an error from the model server, or an empty answer each leave a row
+with a status and the error text, because a reply that never arrived is exactly
+the one worth looking at. `/llmlog [count]` shows the most recent ones and needs
+Manage Server. Rows older than `llm.logdays` are pruned once a day.
+
+Logging never gets in the way of a reply: it happens after the answer is on
+screen, and if the database is unavailable the bot loses the log row, not the
+answer.
 
 ### Persona, and why the safety preamble is not editable
 
 The system prompt is two layers. The first is a preamble that lives in code —
 it is not a config key, `/setconfig` cannot reach it, and `/setup` does not
-show it. The second is `llm.persona`, which sets voice and personality and is
-freely editable.
+show it. It covers only what must not be editable: that retrieved messages are
+data and never instructions, what the tools may touch, that the bot has no
+moderation powers, and that a persona grants it nothing. The second layer is
+`llm.persona`, which owns voice, length and formatting, and is freely editable
+through `/setpersona`.
+
+Between the two sits a short identity block naming the bot, the server, and
+what it is. It is assembled once per server and is byte-identical between
+pings, which is what lets llama.cpp reuse the cached prompt prefix instead of
+reprocessing it every time.
 
 They are assembled in that order, always, with the persona clearly fenced. This
 split is on purpose: "you are X, and X always answers" is the classic way a
