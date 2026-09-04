@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -615,3 +616,164 @@ def test_memory_content_is_sanitised():
     turns = memory_turns(rows, 5)
     assert "123456789" not in turns[0]["content"]
     assert "987654321" not in turns[1]["content"]
+
+
+# --- the log survives the failure paths, end to end ---------------------------
+
+
+def _logging_cog(db):
+    from bot.stores import Stores
+
+    bot = MagicMock()
+    bot.stores = Stores(db)
+    bot.user = MagicMock(display_name="Aguilar")
+    cog = Aguiliar(bot)
+    cog.model = "test-model"
+    return cog
+
+
+def _live_message(content="hello there"):
+    message = MagicMock(spec=discord.Message)
+    message.id = 1
+    message.content = content
+    message.guild = MagicMock()
+    message.guild.id = 7
+    message.channel = MagicMock()
+    message.channel.id = 9
+    message.channel.name = "general"
+    message.author = MagicMock()
+    message.author.id = 11
+    message.author.display_name = "spacy"
+    placeholder = MagicMock()
+    placeholder.edit = AsyncMock()
+    message.reply = AsyncMock(return_value=placeholder)
+    message.channel.send = AsyncMock()
+    message.channel.typing = MagicMock()
+    message.channel.typing.return_value.__aenter__ = AsyncMock()
+    # Must return falsey: a truthy __aexit__ suppresses exceptions, which would
+    # quietly make every failure-path test pass for the wrong reason.
+    message.channel.typing.return_value.__aexit__ = AsyncMock(return_value=False)
+    return message
+
+
+@pytest.mark.asyncio
+async def test_a_successful_reply_is_logged(db):
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+    cog._converse = AsyncMock(return_value="a real answer")
+
+    await cog._respond(_live_message(), 200)
+
+    rows = await cog.bot.stores.llm_log.recent_for_guild(7, 5)
+    assert len(rows) == 1
+    assert rows[0][4] == "a real answer"
+    assert rows[0][8] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_is_logged_even_though_there_is_no_reply(db):
+    """The case the log exists for: nothing came back, and that used to vanish."""
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+    cog._converse = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    await cog._respond(_live_message(), 200)
+
+    rows = await cog.bot.stores.llm_log.recent_for_guild(7, 5)
+    assert rows[0][8] == "timeout"
+    assert rows[0][4] is None
+    assert "600" in (rows[0][9] or "")
+
+
+@pytest.mark.asyncio
+async def test_a_model_error_is_logged_with_its_type(db):
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+    cog._converse = AsyncMock(side_effect=RuntimeError("llama-server returned 500"))
+
+    await cog._respond(_live_message(), 200)
+
+    rows = await cog.bot.stores.llm_log.recent_for_guild(7, 5)
+    assert rows[0][8] == "error"
+    assert "RuntimeError" in rows[0][9]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_answer_is_logged_as_a_failure(db):
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+    cog._converse = AsyncMock(return_value="   ")
+
+    await cog._respond(_live_message(), 200)
+
+    rows = await cog.bot.stores.llm_log.recent_for_guild(7, 5)
+    assert rows[0][8] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_database_costs_a_log_row_not_the_reply(db):
+    """Logging must never be able to break a reply."""
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+    cog._converse = AsyncMock(return_value="the answer")
+    cog.bot.stores.llm_log.add = AsyncMock(side_effect=RuntimeError("database gone"))
+
+    message = _live_message()
+    await cog._respond(message, 200)
+
+    placeholder = await message.reply()
+    assert any("the answer" in str(call) for call in placeholder.edit.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_carries_the_time_the_asker_and_the_identity(db):
+    cog = _logging_cog(db)
+    message = _live_message("what time is it")
+    message.created_at = __import__("datetime").datetime(
+        2026, 9, 4, 15, 30, tzinfo=__import__("datetime").timezone.utc
+    )
+    message.guild.name = "Spacy's server"
+    message.author.roles = []
+    message.author.guild_permissions = MagicMock(
+        manage_messages=True, kick_members=False, administrator=False
+    )
+
+    async def empty_history(limit=None, before=None):
+        return
+        yield  # pragma: no cover
+
+    message.channel.history = lambda limit=None, before=None: empty_history()
+
+    messages = await cog._build_messages(message)
+    system, user = messages[0]["content"], messages[-1]["content"]
+    assert "Aguilar" in system and "Spacy's server" in system
+    assert "11:30" in user and "EDT" in user
+    assert "spacy" in user and "moderator" in user
+
+
+@pytest.mark.asyncio
+async def test_memory_is_replayed_as_prior_turns(db):
+    cog = _logging_cog(db)
+    await cog.bot.stores.llm_log.add(
+        guild_id=7, channel_id=9, channel_name="general", user_id=11, user_name="spacy",
+        prompt="earlier question", reply="earlier answer", tool_calls=[], rounds=1,
+        duration_ms=100, model="test-model", status="ok", error=None,
+    )
+    message = _live_message("follow up")
+    message.created_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    message.guild.name = "Spacy's server"
+    message.author.roles = []
+    message.author.guild_permissions = MagicMock(
+        manage_messages=False, kick_members=False, administrator=False
+    )
+
+    async def empty_history(limit=None, before=None):
+        return
+        yield  # pragma: no cover
+
+    message.channel.history = lambda limit=None, before=None: empty_history()
+
+    messages = await cog._build_messages(message)
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert "earlier question" in messages[1]["content"]
+    assert messages[2]["content"] == "earlier answer"

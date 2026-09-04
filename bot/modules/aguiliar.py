@@ -1081,6 +1081,10 @@ class Aguiliar(commands.Cog):
             except discord.HTTPException:
                 pass
 
+        # Pre-bound: if the typing() context manager ever swallowed an exception,
+        # control would resume here with nothing assigned and the reply would die
+        # of an UnboundLocalError instead of saying anything.
+        answer = ""
         try:
             messages = await self._build_messages(message)
             async with message.channel.typing():
@@ -1113,9 +1117,14 @@ class Aguiliar(commands.Cog):
             message.guild.id, message.channel.id, message.author.id, status,
             trace["rounds"], [c["name"] for c in trace["tool_calls"]], duration_ms, len(answer),
         )
-        await self._log_exchange(message, raw_answer, trace, duration_ms, status, error)
+        # Only a real answer is logged as one. On a failure the text on screen is
+        # this module's apology, not something the model produced, and logging
+        # it as a reply would put words in its mouth.
+        await self._log_exchange(
+            message, raw_answer if status == "ok" else None, trace, duration_ms, status, error
+        )
 
-    async def _log_exchange(self, message: discord.Message, reply: str, trace: dict,
+    async def _log_exchange(self, message: discord.Message, reply: Optional[str], trace: dict,
                             duration_ms: int, status: str, error: Optional[str]) -> None:
         """Best-effort, in both directions: it runs after the reply is already on
         screen, and a database that is down costs a log row rather than an
