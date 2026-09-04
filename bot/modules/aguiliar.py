@@ -636,6 +636,7 @@ class Aguiliar(commands.Cog):
         self._identity_cache: Dict[int, Tuple[str, str, str]] = {}
         # on_ready fires again on every gateway resume; the warm-up must not.
         self._warmed = False
+        self._warm_task: Optional[asyncio.Task] = None
 
     @property
     def configured(self) -> bool:
@@ -649,6 +650,7 @@ class Aguiliar(commands.Cog):
 
     async def cog_unload(self) -> None:
         self.prune_log.cancel()
+        self._cancel_warmup()
         if self.session:
             await self.session.close()
             self.session = None
@@ -1009,10 +1011,10 @@ class Aguiliar(commands.Cog):
         guild, max_tokens 1, taking the same slot semaphore as a real reply so
         it can never queue-jump someone. Failure is silent by design: a cold
         cache is slow, not broken."""
-        if getattr(self, "_warmed", False):
+        if self._warmed:
             return
         self._warmed = True
-        self.bot.loop.create_task(self._warm_prefix_cache())
+        self._warm_task = self.bot.loop.create_task(self._warm_prefix_cache())
 
     async def _warm_prefix_cache(self) -> None:
         if not self.configured or self.session is None:
@@ -1052,8 +1054,16 @@ class Aguiliar(commands.Cog):
                     "aguiliar: prefix cache warm for guild %s in %.0fs (http %s)",
                     guild.id, time.monotonic() - started, "ok" if ok else resp.status,
                 )
+            except asyncio.CancelledError:
+                logger.info("aguiliar: prefix warm-up cancelled - somebody pinged")
+                raise
             except Exception:
                 logger.warning("aguiliar: prefix warm-up failed", exc_info=True)
+
+    def _cancel_warmup(self) -> None:
+        task, self._warm_task = self._warm_task, None
+        if task is not None and not task.done():
+            task.cancel()
 
     # --- reading and editing it ---------------------------------------------
 
@@ -1181,10 +1191,12 @@ class Aguiliar(commands.Cog):
             guild_id, "llm.maxtokens", DEFAULT_MAX_TOKENS,
             minimum=MIN_MAX_TOKENS, maximum=MAX_MAX_TOKENS,
         )
+        # A real ping outranks a cache warm-up. Cancelling it frees the slot now
+        # instead of after a full prompt-processing pass.
+        self._cancel_warmup()
         self._queued += 1
         try:
-            async with self._slot:
-                await self._respond(message, max_tokens, replying_to_me=replying_to_me)
+            await self._respond(message, max_tokens, replying_to_me=replying_to_me)
         finally:
             self._queued -= 1
 
@@ -1217,6 +1229,12 @@ class Aguiliar(commands.Cog):
             return
         started = time.monotonic()
         trace: dict = {"rounds": 0, "tool_calls": []}
+        # NOTE the ordering: the placeholder above is posted BEFORE the slot is
+        # taken, and the slot is taken below, around the model call only. It was
+        # the other way round and the warm-up held the slot, so a ping during it
+        # produced no thinking message and no typing indicator - the bot looked
+        # dead rather than busy. Whatever holds the slot, the person pinging
+        # must see something immediately.
         status = "ok"
         error: Optional[str] = None
         last_edit = 0.0
@@ -1241,7 +1259,8 @@ class Aguiliar(commands.Cog):
         try:
             messages = await self._build_messages(message, replying_to or replying_to_me)
             async with message.channel.typing():
-                answer = await self._converse(message, messages, max_tokens, on_text, trace)
+                async with self._slot:
+                    answer = await self._converse(message, messages, max_tokens, on_text, trace)
         except asyncio.TimeoutError:
             status, error = "timeout", f"no response within {self.timeout_seconds}s"
             answer = "That took too long - the model is on a slow box. Try a shorter question."

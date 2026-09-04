@@ -988,3 +988,50 @@ async def test_a_reply_is_not_duplicated_when_memory_already_has_it(db):
 
     messages = await cog._build_messages(message, parent)
     assert [m["content"] for m in messages].count("the first one is fine") == 1
+
+
+# --- a busy bot must still look busy, not dead --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_placeholder_is_posted_even_while_the_slot_is_held(db):
+    """Regression: the warm-up held the request slot and the placeholder was
+    posted inside it, so a ping during a warm-up produced no "thinking" message
+    and no typing indicator. The bot looked dead rather than busy."""
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+    cog._converse = AsyncMock(return_value="eventually")
+    message = _live_message()
+
+    await cog._slot.acquire()
+    try:
+        task = asyncio.create_task(cog._respond(message, 200))
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if message.reply.await_count:
+                break
+        assert message.reply.await_count == 1, "no placeholder while the slot was busy"
+        assert not task.done(), "should still be waiting for the slot"
+    finally:
+        cog._slot.release()
+    await task
+    assert cog._converse.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_ping_cancels_a_running_warm_up():
+    cog = _make_cog()
+
+    async def never():
+        await asyncio.sleep(3600)
+
+    cog._warm_task = asyncio.get_running_loop().create_task(never())
+    cog._cancel_warmup()
+    await asyncio.sleep(0)
+    assert cog._warm_task is None
+
+
+def test_cancelling_a_warm_up_that_never_started_is_harmless():
+    cog = _make_cog()
+    cog._warm_task = None
+    cog._cancel_warmup()
