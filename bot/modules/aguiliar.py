@@ -578,9 +578,16 @@ def render_messages(entries: List[Tuple[str, str]]) -> str:
 
 
 def should_respond(message: discord.Message, bot_user: Optional[discord.abc.User],
-                   *, is_command: bool) -> bool:
-    """The full ping-only trigger, as a pure function so the truth table is
-    testable without a gateway."""
+                   *, is_command: bool, is_reply_to_bot: bool = False) -> bool:
+    """The full trigger, as a pure function so the truth table is testable
+    without a gateway.
+
+    Two ways in: an @mention, or a Discord reply to something the bot said.
+    The second is not a convenience - replying is how people continue a
+    conversation, and requiring a ping to continue one you are already in reads
+    as the bot ignoring you. Note that a reply only lands in `mentions` when the
+    replier has the ping-on-reply toggle on, so `mentions` alone cannot cover
+    this case."""
     if bot_user is None:
         return False
     if message.author.bot or message.guild is None:
@@ -591,6 +598,8 @@ def should_respond(message: discord.Message, bot_user: Optional[discord.abc.User
         return False
     if message.mention_everyone:
         return False
+    if is_reply_to_bot:
+        return True
     return any(user.id == bot_user.id for user in message.mentions)
 
 
@@ -625,6 +634,8 @@ class Aguiliar(commands.Cog):
         # themselves so a rename produces a new block instead of a stale one,
         # while an unchanged guild gets a byte-identical string every ping.
         self._identity_cache: Dict[int, Tuple[str, str, str]] = {}
+        # on_ready fires again on every gateway resume; the warm-up must not.
+        self._warmed = False
 
     @property
     def configured(self) -> bool:
@@ -920,7 +931,8 @@ class Aguiliar(commands.Cog):
         )
         return memory_turns(rows, turns)
 
-    async def _build_messages(self, message: discord.Message) -> List[dict]:
+    async def _build_messages(self, message: discord.Message,
+                              replying_to: Optional[discord.Message] = None) -> List[dict]:
         guild_id = message.guild.id
         persona = await self.bot.stores.config.get(guild_id, "llm.persona", None)
         previous_ts: Optional[float] = None
@@ -945,9 +957,16 @@ class Aguiliar(commands.Cog):
             and (permissions.manage_messages or permissions.kick_members or permissions.administrator)
         )
         who = sanitize(str(getattr(author, "display_name", "")), 40)
+        continuation = (
+            "This is a direct reply to what you said just above - continue that "
+            "conversation.\n"
+            if replying_to is not None
+            else ""
+        )
         # Volatile facts live here, in the user turn, never in the system prompt.
         context = (
             f"Channel: #{sanitize(str(channel_name), 60)}\n"
+            f"{continuation}"
             f"Current time: {format_local_time(message.created_at, tz)}\n"
             f"{hint}\n"
             f"Speaking to you: {who}"
@@ -959,9 +978,82 @@ class Aguiliar(commands.Cog):
             persona, identity=self._identity_block(message.guild), bot_name=self._bot_name()
         )
         messages: List[dict] = [{"role": "system", "content": system}]
-        messages.extend(await self._memory_messages(message))
+        history = await self._memory_messages(message)
+        if replying_to is not None:
+            # A reply is a definite continuation, so the thing being replied to
+            # is appended verbatim as the bot's own last turn - no staleness
+            # test, no judgement call, and no tool round to go and find it. If
+            # short-term memory already ended with that same text, it is not
+            # repeated.
+            said = sanitize(replying_to.content or "", TOOL_RESULT_CHAR_CAP)
+            if said and not (history and history[-1].get("content") == said):
+                history.append({"role": "assistant", "content": said})
+        messages.extend(history)
         messages.append({"role": "user", "content": context})
         return messages
+
+    # --- warming the prefix cache -------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Prime llama-server's prefix cache once the bot is up.
+
+        Measured on the live server: a ping whose prefix is cold costs 429 s of
+        prompt processing (1789 tokens at 4.17 tok/s), against 23 s when 95% of
+        it is cached. A restart empties that cache, so without this the next
+        person to ping waits seven minutes for a "hello" - which is exactly what
+        happened after the deploy on 2026-09-04.
+
+        start-aguiliar.sh already warms the *model*; this warms the *prompt*,
+        which is a different thing and is the expensive half. One request per
+        guild, max_tokens 1, taking the same slot semaphore as a real reply so
+        it can never queue-jump someone. Failure is silent by design: a cold
+        cache is slow, not broken."""
+        if getattr(self, "_warmed", False):
+            return
+        self._warmed = True
+        self.bot.loop.create_task(self._warm_prefix_cache())
+
+    async def _warm_prefix_cache(self) -> None:
+        if not self.configured or self.session is None:
+            return
+        for guild in list(self.bot.guilds):
+            try:
+                if not await self.bot.stores.config.get_bool(guild.id, "llm.enabled", False):
+                    continue
+                persona = await self.bot.stores.config.get(guild.id, "llm.persona", None)
+                system = build_system_prompt(
+                    persona, identity=self._identity_block(guild), bot_name=self._bot_name()
+                )
+                # The tools are part of the rendered prompt, so they have to be
+                # here too - warming without them primes a prefix no real
+                # request will ever ask for.
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": "warmup"},
+                    ],
+                    "max_tokens": 1,
+                    "stream": False,
+                    "tools": TOOL_SCHEMAS,
+                    "tool_choice": "auto",
+                }
+                started = time.monotonic()
+                async with self._slot:
+                    async with self.session.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
+                    ) as resp:
+                        await resp.read()
+                        ok = resp.status == 200
+                logger.info(
+                    "aguiliar: prefix cache warm for guild %s in %.0fs (http %s)",
+                    guild.id, time.monotonic() - started, "ok" if ok else resp.status,
+                )
+            except Exception:
+                logger.warning("aguiliar: prefix warm-up failed", exc_info=True)
 
     # --- reading and editing it ---------------------------------------------
 
@@ -1057,7 +1149,10 @@ class Aguiliar(commands.Cog):
         # Cheap checks before the expensive one: get_context parses the message
         # against the whole command tree, and this listener sees every message
         # in the server. Only pay for that once we know it is a ping for us.
-        if not should_respond(message, self.bot.user, is_command=False):
+        replying_to_me = await self._is_reply_to_me(message)
+        if not should_respond(
+            message, self.bot.user, is_command=False, is_reply_to_bot=replying_to_me
+        ):
             return
         ctx = await self.bot.get_context(message)
         if ctx.valid:
@@ -1089,11 +1184,33 @@ class Aguiliar(commands.Cog):
         self._queued += 1
         try:
             async with self._slot:
-                await self._respond(message, max_tokens)
+                await self._respond(message, max_tokens, replying_to_me=replying_to_me)
         finally:
             self._queued -= 1
 
-    async def _respond(self, message: discord.Message, max_tokens: int) -> None:
+    async def _is_reply_to_me(self, message: discord.Message) -> Optional[discord.Message]:
+        """The message this one is replying to, but only when the bot wrote it.
+
+        Returns the parent message rather than a bool because the caller wants
+        its text: a reply is a continuation, and the thing being continued is
+        right there. Resolved from the cache when possible; a fetch is one API
+        call and only happens for messages that are replies to begin with."""
+        reference = message.reference
+        if reference is None or reference.message_id is None or self.bot.user is None:
+            return None
+        parent = reference.resolved
+        if isinstance(parent, discord.DeletedReferencedMessage):
+            return None
+        if not isinstance(parent, discord.Message):
+            try:
+                parent = await message.channel.fetch_message(reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        return parent if parent.author.id == self.bot.user.id else None
+
+    async def _respond(self, message: discord.Message, max_tokens: int,
+                       replying_to: Optional[discord.Message] = None,
+                       *, replying_to_me: Optional[discord.Message] = None) -> None:
         try:
             placeholder = await message.reply("*thinking…*", mention_author=False)
         except (discord.Forbidden, discord.HTTPException):
@@ -1122,7 +1239,7 @@ class Aguiliar(commands.Cog):
         # of an UnboundLocalError instead of saying anything.
         answer = ""
         try:
-            messages = await self._build_messages(message)
+            messages = await self._build_messages(message, replying_to or replying_to_me)
             async with message.channel.typing():
                 answer = await self._converse(message, messages, max_tokens, on_text, trace)
         except asyncio.TimeoutError:

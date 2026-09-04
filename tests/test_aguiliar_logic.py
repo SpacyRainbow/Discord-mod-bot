@@ -854,3 +854,137 @@ async def test_the_profile_tool_follows_the_bot_s_actual_intents():
     cog.bot.intents.presences = True
     rendered = await cog._tool_read_member_profile(message, {"display_name": "Spacy"})
     assert "status: online" in rendered
+
+
+# --- replying to the bot is a continuation, not a new conversation ------------
+
+
+def test_a_reply_to_the_bot_triggers_a_response_without_a_ping():
+    """Requiring an @ to continue a conversation you are already in reads as the
+    bot ignoring you."""
+    me = _bot_user()
+    msg = _make_message(mentions=[])
+    assert should_respond(msg, me, is_command=False, is_reply_to_bot=True) is True
+
+
+def test_a_reply_to_someone_else_is_still_ignored():
+    me = _bot_user()
+    msg = _make_message(mentions=[])
+    assert should_respond(msg, me, is_command=False, is_reply_to_bot=False) is False
+
+
+def test_a_reply_from_a_bot_is_still_ignored():
+    me = _bot_user()
+    msg = _make_message(author_bot=True, mentions=[])
+    assert should_respond(msg, me, is_command=False, is_reply_to_bot=True) is False
+
+
+def test_a_reply_that_is_a_command_is_left_to_the_command_framework():
+    me = _bot_user()
+    msg = _make_message(mentions=[])
+    assert should_respond(msg, me, is_command=True, is_reply_to_bot=True) is False
+
+
+@pytest.mark.asyncio
+async def test_is_reply_to_me_recognises_the_bot_s_own_message():
+    cog = _make_cog()
+    cog.bot.user = _bot_user(42)
+    parent = MagicMock(spec=discord.Message)
+    parent.author = MagicMock()
+    parent.author.id = 42
+    message = MagicMock(spec=discord.Message)
+    message.reference = MagicMock(message_id=5, resolved=parent)
+
+    assert await cog._is_reply_to_me(message) is parent
+
+
+@pytest.mark.asyncio
+async def test_is_reply_to_me_rejects_a_reply_to_someone_else():
+    cog = _make_cog()
+    cog.bot.user = _bot_user(42)
+    parent = MagicMock(spec=discord.Message)
+    parent.author = MagicMock()
+    parent.author.id = 99
+    message = MagicMock(spec=discord.Message)
+    message.reference = MagicMock(message_id=5, resolved=parent)
+
+    assert await cog._is_reply_to_me(message) is None
+
+
+@pytest.mark.asyncio
+async def test_is_reply_to_me_handles_a_deleted_parent():
+    cog = _make_cog()
+    cog.bot.user = _bot_user(42)
+    message = MagicMock(spec=discord.Message)
+    message.reference = MagicMock(
+        message_id=5, resolved=MagicMock(spec=discord.DeletedReferencedMessage)
+    )
+
+    assert await cog._is_reply_to_me(message) is None
+
+
+@pytest.mark.asyncio
+async def test_a_plain_message_is_not_a_reply():
+    cog = _make_cog()
+    cog.bot.user = _bot_user(42)
+    message = MagicMock(spec=discord.Message)
+    message.reference = None
+
+    assert await cog._is_reply_to_me(message) is None
+
+
+@pytest.mark.asyncio
+async def test_the_replied_to_message_is_appended_as_the_bot_s_last_turn(db):
+    """No staleness test and no tool round: the thing being continued is right
+    there in the reply."""
+    cog = _logging_cog(db)
+    message = _live_message("and what about the other one")
+    message.created_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    message.guild.name = "Spacy's server"
+    message.author.roles = []
+    message.author.guild_permissions = MagicMock(
+        manage_messages=False, kick_members=False, administrator=False
+    )
+
+    async def empty_history(limit=None, before=None):
+        return
+        yield  # pragma: no cover
+
+    message.channel.history = lambda limit=None, before=None: empty_history()
+
+    parent = MagicMock(spec=discord.Message)
+    parent.content = "the first one is fine"
+
+    messages = await cog._build_messages(message, parent)
+    assert [m["role"] for m in messages] == ["system", "assistant", "user"]
+    assert messages[1]["content"] == "the first one is fine"
+    assert "direct reply" in messages[2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_is_not_duplicated_when_memory_already_has_it(db):
+    cog = _logging_cog(db)
+    await cog.bot.stores.llm_log.add(
+        guild_id=7, channel_id=9, channel_name="general", user_id=11, user_name="spacy",
+        prompt="earlier question", reply="the first one is fine", tool_calls=[], rounds=1,
+        duration_ms=100, model="test-model", status="ok", error=None,
+    )
+    message = _live_message("follow up")
+    message.created_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    message.guild.name = "Spacy's server"
+    message.author.roles = []
+    message.author.guild_permissions = MagicMock(
+        manage_messages=False, kick_members=False, administrator=False
+    )
+
+    async def empty_history(limit=None, before=None):
+        return
+        yield  # pragma: no cover
+
+    message.channel.history = lambda limit=None, before=None: empty_history()
+
+    parent = MagicMock(spec=discord.Message)
+    parent.content = "the first one is fine"
+
+    messages = await cog._build_messages(message, parent)
+    assert [m["content"] for m in messages].count("the first one is fine") == 1

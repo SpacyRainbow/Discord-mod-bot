@@ -839,9 +839,11 @@ button uses - it only works while the target server is running.
 
 ## Ask the bot (`@Aguiliar ...`)
 
-Ping the bot and it answers, using a local LLM. Nothing else triggers it — not
-a prefix, not a keyword, not replying to it. Set `llm.enabled` to `true` to
-switch it on; it is off by default.
+Ping the bot and it answers, using a local LLM. Replying to one of its own
+messages works too, and is treated as continuing that conversation — you do not
+have to @ it again. Nothing else triggers it: not a prefix, not a keyword, not
+replying to somebody else. Set `llm.enabled` to `true` to switch it on; it is
+off by default.
 
 **It runs on a CPU, and it is slow.** The model is served from the NAS, which
 has no GPU. Measured against the live server: prompt processing about 5
@@ -849,6 +851,13 @@ tokens/sec, generation about 2.3. A plain reply takes roughly two minutes and
 one that looks something up takes four to six. The bot posts a placeholder
 immediately and edits it as words arrive, so you can watch it work. If that is
 too slow for your hardware, `llm.maxtokens` is the lever that matters most.
+
+**The first reply after a restart used to be far slower than the rest.** The
+model server caches the unchanging front of the prompt, and a restart empties
+that cache: measured on the live server, a cold prefix costs 429 seconds of
+prompt processing against 23 seconds when it is warm. The bot now sends one
+throwaway request when it starts up, so that cost is paid by a background task
+instead of by whoever pings first.
 
 ### How it decides what the conversation is about
 
