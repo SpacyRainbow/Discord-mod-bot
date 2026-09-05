@@ -80,3 +80,69 @@ async def test_close_is_idempotent_and_nulls_the_handle(tmp_path):
     assert database.available is False
     await database.close()  # must not raise
     assert database.conn is None
+
+
+# --- additive migrations ------------------------------------------------------
+#
+# `CREATE TABLE IF NOT EXISTS` does NOTHING to a table that already exists, so a
+# column added to SCHEMA after a database shipped is simply absent on every
+# deployed copy. This is the mechanism that closes that gap, and it has to be
+# safe to run on every single connect.
+
+
+@pytest.mark.asyncio
+async def test_a_column_added_after_the_fact_is_applied_to_an_existing_table(tmp_path):
+    import aiosqlite
+
+    from bot.db import ADDED_COLUMNS, Database
+
+    path = str(tmp_path / "old.db")
+    # A database from before the columns existed, with a row already in it.
+    async with aiosqlite.connect(path) as conn:
+        await conn.execute(
+            "CREATE TABLE llm_log (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, "
+            "created_at TEXT NOT NULL)"
+        )
+        await conn.execute("INSERT INTO llm_log (guild_id, channel_id, created_at) "
+                           "VALUES (1, 2, 'then')")
+        await conn.commit()
+
+    database = Database(path)
+    await database.connect()
+    try:
+        cursor = await database.conn.execute("PRAGMA table_info(llm_log)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+        for table, column, _decl in ADDED_COLUMNS:
+            if table == "llm_log":
+                assert column in columns
+        # Additive means additive: the existing row is still there.
+        cursor = await database.conn.execute("SELECT COUNT(*) FROM llm_log")
+        assert (await cursor.fetchone())[0] == 1
+        await cursor.close()
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_running_the_migration_twice_is_harmless(tmp_path):
+    """It runs on every connect, so "already applied" is the normal case."""
+    from bot.db import Database
+
+    path = str(tmp_path / "twice.db")
+    for _ in range(2):
+        database = Database(path)
+        await database.connect()
+        await database._add_missing_columns()
+        await database.close()
+
+    database = Database(path)
+    await database.connect()
+    try:
+        cursor = await database.conn.execute("PRAGMA table_info(llm_log)")
+        names = [row[1] for row in await cursor.fetchall()]
+        await cursor.close()
+        assert names.count("prompt_tokens") == 1
+    finally:
+        await database.close()

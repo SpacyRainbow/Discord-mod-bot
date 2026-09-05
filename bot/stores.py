@@ -695,11 +695,16 @@ class LLMLogStore(_Store):
         model: Optional[str],
         status: str,
         error: Optional[str],
+        prompt_tokens: Optional[int] = None,
+        cached_tokens: Optional[int] = None,
+        gap_messages: Optional[int] = None,
+        gap_chars: Optional[int] = None,
     ) -> None:
         await self._write(
             "INSERT INTO llm_log (guild_id, channel_id, channel_name, user_id, user_name, "
-            "prompt, reply, tool_calls, rounds, duration_ms, model, status, error, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "prompt, reply, tool_calls, rounds, duration_ms, model, status, error, "
+            "prompt_tokens, cached_tokens, gap_messages, gap_chars, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 guild_id,
                 channel_id,
@@ -714,6 +719,10 @@ class LLMLogStore(_Store):
                 model,
                 status,
                 error,
+                prompt_tokens,
+                cached_tokens,
+                gap_messages,
+                gap_chars,
                 datetime.datetime.now(datetime.timezone.utc).isoformat(),
             ),
             "Database unavailable, LLM exchange not logged",
@@ -735,7 +744,8 @@ class LLMLogStore(_Store):
         """Newest-first, successes and failures alike - this one is /llmlog."""
         return await self._read_all(
             "SELECT created_at, channel_name, user_name, prompt, reply, tool_calls, "
-            "rounds, duration_ms, status, error FROM llm_log "
+            "rounds, duration_ms, status, error, prompt_tokens, cached_tokens, "
+            "gap_messages FROM llm_log "
             "WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             (guild_id, limit),
         )

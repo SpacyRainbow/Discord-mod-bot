@@ -168,6 +168,10 @@ CREATE TABLE IF NOT EXISTS llm_log (
     model TEXT,
     status TEXT NOT NULL DEFAULT 'ok',
     error TEXT,
+    prompt_tokens INTEGER,
+    cached_tokens INTEGER,
+    gap_messages INTEGER,
+    gap_chars INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -195,6 +199,21 @@ CREATE TABLE IF NOT EXISTS tickets (
 );
 """
 
+# Columns added to an EXISTING table after it shipped. `CREATE TABLE IF NOT
+# EXISTS` above cannot add them, so they are applied by _add_missing_columns()
+# on every connect. Additive only - to remove or retype a column, write a real
+# migration.
+ADDED_COLUMNS = [
+    # Prompt accounting for the LLM cog: how much of each prompt the server had
+    # to process fresh against how much it reused from its prefix cache, and how
+    # much of that was the gap transcript. This is the whole point - it turns
+    # "is the gap worth its latency" into a number.
+    ("llm_log", "prompt_tokens", "INTEGER"),
+    ("llm_log", "cached_tokens", "INTEGER"),
+    ("llm_log", "gap_messages", "INTEGER"),
+    ("llm_log", "gap_chars", "INTEGER"),
+]
+
 
 class Database:
     """Owns the single aiosqlite connection and tracks availability."""
@@ -208,9 +227,35 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = await aiosqlite.connect(self.path)
         await self.conn.executescript(SCHEMA)
+        await self._add_missing_columns()
         await self.conn.commit()
         self.available = True
         logger.info("Connected to database at %s", self.path)
+
+    async def _add_missing_columns(self) -> None:
+        """The one migration mechanism this schema has, and deliberately the
+        weakest one that works: ADD COLUMN, never drop, never rewrite.
+
+        `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
+        exists, so a column added to SCHEMA after a database was created is
+        simply absent on every deployed copy. This closes that gap and is
+        idempotent - it reads what is actually there first.
+        """
+        for table, column, decl in ADDED_COLUMNS:
+            try:
+                cursor = await self.conn.execute(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in await cursor.fetchall()}
+                await cursor.close()
+            except Exception:
+                logger.warning("Could not inspect %s for migration", table, exc_info=True)
+                continue
+            if not existing or column in existing:
+                continue
+            try:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                logger.info("Added column %s.%s", table, column)
+            except Exception:
+                logger.warning("Could not add %s.%s", table, column, exc_info=True)
 
     async def close(self) -> None:
         # A connection that is already broken often raises on close() too; that
