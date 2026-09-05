@@ -138,6 +138,7 @@ CONFIG_MANIFEST = [
     ("llm.memoryturns", "2", "2", "Prior exchanges remembered per channel"),
     ("llm.memoryminutes", "30", "30", "How stale a remembered exchange may be (minutes)"),
     ("llm.logdays", "30", "30", "Exchange log retention (days)"),
+    ("llm.narrate", "false", "false", "Say what it is about to look up (slower)"),
     ("updates.auto_apply", "false", "false", "Automatically restart to apply detected updates"),
 ]
 
@@ -170,6 +171,7 @@ STEP_RESET_PREFIXES = {
     STEP_LLM: [
         "llm.enabled", "llm.maxtokens", "llm.cooldown", "llm.channels",
         "llm.timezone", "llm.memoryturns", "llm.memoryminutes", "llm.logdays",
+        "llm.narrate",
     ],
     STEP_UPDATES: ["updates."],
 }

@@ -1368,8 +1368,8 @@ def test_the_status_of_a_round_stacks_every_call_in_it():
         {"name": "read_reply_chain", "arguments": "{}"},
     ])
     assert rendered.splitlines() == [
-        "*searching the web for “astra”…*",
-        "*reading what this replies to…*",
+        "-# 🔎 searching the web for “astra”…",
+        "-# ↩️ reading what this replies to…",
     ]
     assert render_status_line([]) == ""
 
@@ -1510,3 +1510,57 @@ async def test_the_stream_callback_sees_the_whole_answer_so_far():
     cog._stream_completion = fake_stream
     await cog._converse(_make_message(), [], 200, on_text)
     assert seen[-1] == "first half second half"
+
+
+# --- narration (llm.narrate) --------------------------------------------------
+
+def test_narration_is_off_unless_asked_for():
+    from bot.modules.aguiliar import NARRATION_INSTRUCTION, build_system_prompt
+    off = build_system_prompt("voice", identity="id", bot_name="Aguilar")
+    on = build_system_prompt("voice", identity="id", bot_name="Aguilar", narrate=True)
+    assert NARRATION_INSTRUCTION not in off
+    assert NARRATION_INSTRUCTION in on
+    # Turning it on ADDS, it does not rewrite: strip the instruction back out
+    # and the prompt is byte-identical to the one with narration off.
+    assert on.replace(NARRATION_INSTRUCTION + "\n\n", "", 1) == off
+
+
+def test_narration_lives_outside_the_persona():
+    """It is code-owned on purpose - the persona is within a few characters of
+    the modal cap, and this is a config-gated behaviour, not a matter of voice."""
+    from bot.modules.aguiliar import (
+        DEFAULT_PERSONA, MODAL_TEXT_MAX, NARRATION_INSTRUCTION, default_persona,
+    )
+    assert NARRATION_INSTRUCTION not in DEFAULT_PERSONA
+    assert len(default_persona("A" * 32)) <= MODAL_TEXT_MAX
+
+
+def test_the_status_line_is_not_gated_on_narration():
+    """The two are independent: narration is a claim, the status line is a fact
+    rendered from the call. Turning narration on never removes the fact."""
+    from bot.modules.aguiliar import render_status_line
+    assert render_status_line(
+        [{"name": "read_web_search", "arguments": '{"query": "astra"}'}]
+    ).startswith("-# ")
+
+
+@pytest.mark.asyncio
+async def test_the_warm_up_and_a_real_ping_build_the_same_system_prompt():
+    """There is ONE llama-server slot. If the warm-up reads llm.narrate and a
+    ping does not (or vice versa) the warm-up primes a prefix nothing asks for,
+    and every ping pays a cold one - which is worse than never warming at all.
+    Both must read the same keys, so this asserts they agree."""
+    from bot.modules.aguiliar import build_system_prompt
+    for narrate in (False, True):
+        ping = build_system_prompt("voice", identity="id", bot_name="A", narrate=narrate)
+        warm = build_system_prompt("voice", identity="id", bot_name="A", narrate=narrate)
+        assert ping == warm
+
+    # And the source is the same config key in both code paths.
+    import inspect
+    import bot.modules.aguiliar as mod
+    source = inspect.getsource(mod.Aguiliar)
+    assert source.count('"llm.narrate"') == 3, (
+        "llm.narrate must be read in the ping path, the warm-up and the digest - "
+        "all three build a system prompt against the one shared slot"
+    )

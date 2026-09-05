@@ -884,13 +884,39 @@ because they are written by strangers and are, if anything, the more hostile of
 the two.
 
 **You can see what it is doing.** While a tool runs, the *thinking…* placeholder
-is replaced by a line saying what the bot is actually about to do — `searching
-the web for "GPT Astra OpenAI release"…`, `reading the last 15 messages…`,
-`looking up Laffy…`. That line is rendered from the tool call itself, in Python,
-after the model has committed to it and before it is dispatched. The model is
-never asked to narrate its own plans: narration would cost generation time on a
-box that produces about three tokens a second, and it could describe something
-other than what it then does. This costs nothing and cannot be wrong.
+is replaced by a line saying what the bot is actually about to do, as Discord
+subtext:
+
+```
+-# 🔎 searching the web for “GPT Astra OpenAI release”…
+-# 👁️ looking at the image…
+-# 📜 reading the last 15 messages…
+```
+
+That line is rendered from the tool call itself, in Python, after the model has
+committed to it and before it is dispatched. It costs no tokens and no time, and
+it cannot describe something other than what actually runs.
+
+**`llm.narrate` (default off) additionally lets the model say why.** With it on,
+the bot writes one sentence in its own voice before calling a tool — *"I don't
+know this one, so I'm checking what OpenAI actually announced rather than
+guessing from the name"* — and the rendered status line follows underneath it.
+That is the one thing the rendered line cannot produce: the reasoning, and the
+admission that it does not know.
+
+It is off by default because it is not free. Generation runs at about 2.8 tokens
+a second on this hardware, so a sentence is **roughly nine seconds added to every
+tool round**, on top of the ninety a searching reply already takes. What you get
+back is *time to first movement*: the reply starts visibly writing at around 25
+seconds instead of sitting on `thinking…` until 35. Whether that trade is worth
+it is a judgement about your own patience, which is why it is a switch and not a
+decision baked into the code.
+
+**Turning it on or off changes the system prompt, so the next ping pays a cold
+prefix cache — about eight minutes on this box.** Flip it once and leave it.
+Narration and the rendered line are independent: narration is a claim about what
+the bot is about to do, the status line is rendered from the call it actually
+made, and when they disagree the status line is the true one.
 
 **One search per message, five snippets, 300 characters each.** That is a limit
 set by the clock, not by taste. Every snippet is prompt the model has to
