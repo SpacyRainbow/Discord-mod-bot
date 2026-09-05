@@ -174,6 +174,17 @@ CREATE TABLE IF NOT EXISTS llm_log (
 CREATE INDEX IF NOT EXISTS idx_llm_log_channel_time
     ON llm_log (channel_id, created_at);
 
+-- Rolling per-channel topic summary. One row per channel; `covers_to` is the
+-- created_at of the newest exchange already summarised, so the refresh loop can
+-- tell how much is new without re-reading everything.
+CREATE TABLE IF NOT EXISTS channel_digest (
+    channel_id INTEGER PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    covers_to TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tickets (
     guild_id INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,

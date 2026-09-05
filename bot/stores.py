@@ -749,6 +749,58 @@ class LLMLogStore(_Store):
         return cursor.rowcount if cursor is not None else 0
 
 
+class ChannelDigestStore(_Store):
+    """The rolling per-channel topic summary (see aguiliar.py's digest loop).
+
+    Topic-level only, and per channel rather than per person: a summary of what
+    a CHANNEL discussed is attributable to a time window, where a summary of what
+    a PERSON is like is a claim about someone that nobody consented to and that
+    is memorably wrong when it is wrong.
+    """
+
+    async def get(self, channel_id: int) -> Optional[tuple]:
+        return await self._read_one(
+            "SELECT digest, covers_to, updated_at FROM channel_digest "
+            "WHERE channel_id = ?",
+            (channel_id,),
+        )
+
+    async def upsert(self, channel_id: int, guild_id: int, digest: str,
+                     covers_to: str, updated_at: str) -> None:
+        await self._write(
+            "INSERT INTO channel_digest (channel_id, guild_id, digest, covers_to, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET "
+            "digest = excluded.digest, covers_to = excluded.covers_to, "
+            "updated_at = excluded.updated_at",
+            (channel_id, guild_id, digest, covers_to, updated_at),
+            "could not save the channel digest",
+        )
+
+    async def clear(self, channel_id: int) -> None:
+        await self._write(
+            "DELETE FROM channel_digest WHERE channel_id = ?",
+            (channel_id,),
+            "could not clear the channel digest",
+        )
+
+    async def channels_needing_refresh(self, minimum_new: int) -> list:
+        """Channels with at least `minimum_new` successful exchanges newer than
+        whatever their digest already covers. A channel with no digest yet
+        counts all of its exchanges."""
+        return await self._read_all(
+            "SELECT l.channel_id, l.guild_id, COUNT(*) AS fresh "
+            "FROM llm_log l "
+            "LEFT JOIN channel_digest d ON d.channel_id = l.channel_id "
+            "WHERE l.status = 'ok' AND l.reply IS NOT NULL AND l.reply != '' "
+            "AND (d.covers_to IS NULL OR l.created_at > d.covers_to) "
+            "GROUP BY l.channel_id, l.guild_id "
+            "HAVING fresh >= ? "
+            "ORDER BY fresh DESC",
+            (minimum_new,),
+        )
+
+
 class Stores:
     """Bag of all store instances, attached to the bot as bot.stores."""
 
@@ -770,3 +822,4 @@ class Stores:
         self.polls = PollStore(db)
         self.tickets = TicketStore(db)
         self.llm_log = LLMLogStore(db)
+        self.channel_digest = ChannelDigestStore(db)

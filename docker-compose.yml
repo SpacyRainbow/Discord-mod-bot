@@ -6,4 +6,4 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
+      - /mnt/Pool/discord-bot:/app

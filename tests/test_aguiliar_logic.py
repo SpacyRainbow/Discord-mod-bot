@@ -26,10 +26,15 @@ from bot.modules.aguiliar import (
     describe_presence,
     find_members,
     format_local_time,
+    image_attachments,
+    is_image_attachment,
+    last_memory_speaker,
     memory_turns,
     parse_tool_arguments,
     relevance_hint,
     render_messages,
+    strip_tool_markup,
+    scaled_dimensions,
     resolve_timezone,
     sanitize,
     should_respond,
@@ -274,7 +279,8 @@ def test_no_tool_schema_exposes_a_channel_or_guild_id():
 def test_only_read_tools_are_offered():
     from bot.modules.aguiliar import TOOL_SCHEMAS
     names = {s["function"]["name"] for s in TOOL_SCHEMAS}
-    assert names == {"read_recent_messages", "read_reply_chain", "read_member_profile"}
+    assert names == {"read_recent_messages", "read_reply_chain", "read_member_profile",
+                     "read_image", "read_channel"}
     assert names == set(Aguiliar.TOOL_HANDLERS)
     # Every offered tool is a read. Nothing here may write, send or fetch.
     assert all(name.startswith("read_") for name in names)
@@ -591,6 +597,162 @@ def test_a_profile_never_leaks_an_id():
     assert "1234567890" not in rendered
 
 
+# --- vision -------------------------------------------------------------------
+# Image cost is linear in pixels on this hardware (~1 token per 1012 px), so the
+# cap is a safety limit: an unscaled 4K photo is ~25 minutes of prompt
+# processing. These assert the arithmetic, not the model.
+
+def test_scaled_dimensions_caps_the_longest_edge():
+    assert scaled_dimensions(4000, 3000, 512) == (512, 384)
+    assert scaled_dimensions(3000, 4000, 512) == (384, 512)
+
+
+def test_scaled_dimensions_never_upscales():
+    assert scaled_dimensions(320, 240, 512) == (320, 240)
+
+
+def test_scaled_dimensions_survives_nonsense():
+    assert scaled_dimensions(0, 0, 512) == (0, 0)
+    assert scaled_dimensions(-5, 10, 512) == (0, 0)
+
+
+def test_scaled_dimensions_keeps_a_sliver_visible():
+    """A panorama must not round to a zero-height image."""
+    w, h = scaled_dimensions(10000, 8, 512)
+    assert w == 512 and h >= 1
+
+
+def test_only_real_images_are_offered_to_the_model():
+    ok = MagicMock(content_type="image/png", size=1000)
+    svg = MagicMock(content_type="image/svg+xml", size=1000)
+    doc = MagicMock(content_type="application/pdf", size=1000)
+    huge = MagicMock(content_type="image/jpeg", size=99 * 1024 * 1024)
+    empty = MagicMock(content_type="image/jpeg", size=0)
+    assert is_image_attachment(ok)
+    assert not is_image_attachment(svg)     # markup, not a photograph
+    assert not is_image_attachment(doc)
+    assert not is_image_attachment(huge)
+    assert not is_image_attachment(empty)
+
+
+def test_only_one_image_per_message_reaches_the_model():
+    """Two images would double the wait for everyone else in the channel."""
+    msg = MagicMock()
+    msg.attachments = [MagicMock(content_type="image/png", size=10),
+                       MagicMock(content_type="image/png", size=10)]
+    assert len(image_attachments(msg)) == 1
+
+
+def test_a_message_with_no_attachments_is_fine():
+    msg = MagicMock()
+    msg.attachments = []
+    assert image_attachments(msg) == []
+
+
+# --- tool markup must never reach a person --------------------------------------
+
+def test_tool_markup_is_stripped_from_an_answer():
+    """REGRESSION 2026-09-05: a member was sent a raw <tool_call> block. On the
+    final round tools are withdrawn, so llama.cpp does not parse the call - the
+    model's emission arrives as ordinary content and would be posted as-is."""
+    raw = ("here is what I found\n<tool_call>\n<function=read_recent_messages>\n"
+           "<parameter=limit>40</parameter>\n</function>\n</tool_call>")
+    assert strip_tool_markup(raw) == "here is what I found"
+
+
+def test_an_unterminated_tool_call_is_also_stripped():
+    """A stream cut mid-call leaves an opener with no closing tag."""
+    raw = "partial answer\n<tool_call>\n<function=read_channel>"
+    assert strip_tool_markup(raw) == "partial answer"
+
+
+def test_ordinary_text_is_untouched():
+    assert strip_tool_markup("just a normal reply") == "just a normal reply"
+    assert strip_tool_markup("") == ""
+
+
+# --- the per-channel digest ---------------------------------------------------
+# Topic-level and per CHANNEL, never per person: a summary of what a channel
+# discussed belongs to a time window; a summary of what somebody is LIKE is a
+# claim about them, and a wrong one is memorable.
+
+@pytest.mark.asyncio
+async def test_digest_is_injected_when_fresh(db):
+    cog = _logging_cog(db)
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    await cog.bot.stores.channel_digest.upsert(
+        9, 7, "people were arguing about tofu", now.isoformat(), now.isoformat())
+    assert await cog.bot.stores.channel_digest.get(9)
+
+    message = _live_message("and another thing")
+    message.created_at = now
+    message.guild.name = "Spacy's server"
+    message.author.roles = []
+    message.author.guild_permissions = MagicMock(
+        manage_messages=False, kick_members=False, administrator=False)
+
+    async def empty_history(limit=None, before=None):
+        return
+        yield  # pragma: no cover
+
+    message.channel.history = lambda limit=None, before=None: empty_history()
+    messages = await cog._build_messages(message)
+    assert "arguing about tofu" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_digest_is_dropped_not_shown(db):
+    """Out of date is worse than absent: it makes the bot confidently wrong."""
+    cog = _logging_cog(db)
+    dt = __import__("datetime")
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+    await cog.bot.stores.channel_digest.upsert(
+        9, 7, "ancient history", old.isoformat(), old.isoformat())
+    message = _live_message("hello")
+    message.created_at = dt.datetime.now(dt.timezone.utc)
+    assert await cog._channel_digest(message) == ""
+
+
+@pytest.mark.asyncio
+async def test_the_empty_sentinel_is_never_injected(db):
+    cog = _logging_cog(db)
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    from bot.modules.aguiliar import DIGEST_EMPTY
+    await cog.bot.stores.channel_digest.upsert(
+        9, 7, DIGEST_EMPTY, now.isoformat(), now.isoformat())
+    message = _live_message("hello")
+    message.created_at = now
+    assert await cog._channel_digest(message) == ""
+
+
+@pytest.mark.asyncio
+async def test_digest_can_be_cleared(db):
+    cog = _logging_cog(db)
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    await cog.bot.stores.channel_digest.upsert(
+        9, 7, "something", now.isoformat(), now.isoformat())
+    await cog.bot.stores.channel_digest.clear(9)
+    assert await cog.bot.stores.channel_digest.get(9) is None
+
+
+@pytest.mark.asyncio
+async def test_a_channel_needs_a_refresh_only_after_enough_new_talk(db):
+    cog = _logging_cog(db)
+    for i in range(3):
+        await cog.bot.stores.llm_log.add(
+            guild_id=7, channel_id=9, channel_name="general", user_id=11,
+            user_name="spacy", prompt=f"q{i}", reply=f"a{i}", tool_calls=[],
+            rounds=1, duration_ms=10, model="m", status="ok", error=None)
+    assert await cog.bot.stores.channel_digest.channels_needing_refresh(6) == []
+    for i in range(4):
+        await cog.bot.stores.llm_log.add(
+            guild_id=7, channel_id=9, channel_name="general", user_id=11,
+            user_name="spacy", prompt=f"more{i}", reply=f"a{i}", tool_calls=[],
+            rounds=1, duration_ms=10, model="m", status="ok", error=None)
+    rows = await cog.bot.stores.channel_digest.channels_needing_refresh(6)
+    assert rows and rows[0][0] == 9
+
+
 # --- short-term memory --------------------------------------------------------
 
 def test_memory_turns_are_oldest_first_and_paired():
@@ -616,6 +778,28 @@ def test_memory_turns_drops_an_exchange_with_no_reply():
     turns = memory_turns(rows, 5)
     assert len(turns) == 2
     assert turns[1]["content"] == "ok answer"
+
+
+def test_a_remembered_reply_is_never_decorated():
+    """REGRESSION 2026-09-05: a "(to bob) " label on the assistant turn came back
+    out in a real reply to a member. A model reads its own prior turns as
+    examples of how to write, so nothing may be prefixed onto them. The speaker
+    is named on the USER turn instead."""
+    rows = [("bob", "q", "a", "t")]
+    turns = memory_turns(rows, 5)
+    assert turns[0]["content"].startswith("bob:")
+    assert turns[1]["content"] == "a"
+    assert "(to" not in turns[1]["content"]
+
+
+def test_last_memory_speaker_is_the_newest_complete_pair():
+    rows = [
+        ("carol", "newest", "answered", "t3"),
+        ("bob", "older", "answered", "t2"),
+    ]
+    assert last_memory_speaker(rows, 5) == "carol"
+    assert last_memory_speaker([("bob", "q", None, "t")], 5) is None
+    assert last_memory_speaker(rows, 0) is None
 
 
 def test_memory_turns_disabled_returns_nothing():
@@ -987,7 +1171,10 @@ async def test_a_reply_is_not_duplicated_when_memory_already_has_it(db):
     parent.content = "the first one is fine"
 
     messages = await cog._build_messages(message, parent)
-    assert [m["content"] for m in messages].count("the first one is fine") == 1
+    # The remembered copy carries a "(to someone) " addressee prefix, so count
+    # occurrences rather than exact matches. The claim under test is that the
+    # reply appears ONCE, not that it appears verbatim.
+    assert sum("the first one is fine" in m["content"] for m in messages) == 1
 
 
 # --- a busy bot must still look busy, not dead --------------------------------
