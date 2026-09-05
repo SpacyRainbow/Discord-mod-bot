@@ -191,6 +191,18 @@ SEARCH_TIMEOUT_SECONDS = 20
 # one-liner. Safe as a plain instance counter because `self._slot` is a
 # Semaphore(1): exactly one exchange is ever in flight.
 SEARCH_CALLS_PER_MESSAGE = 1
+
+# --- the "what it is doing right now" line ------------------------------------
+# Rendered from the tool call the model actually made, never narrated by the
+# model. That is the whole point: it costs no tokens and no time - the call is
+# already in hand before it is dispatched - and it cannot claim to be doing
+# something other than what it is doing. A reply that calls a tool takes a
+# minute and a half on this hardware, and until now all of that was one static
+# "thinking..." with no sign of life.
+STATUS_ARG_CHAR_CAP = 80
+# Anything that would let a query rewrite the status line as markdown, or ping
+# somebody. sanitize() already removes mentions; this removes formatting.
+_STATUS_MARKUP_RE = re.compile(r"[`*_~|>#\\]")
 MESSAGE_CHAR_CAP = 300
 TOOL_RESULT_CHAR_CAP = 3500
 # A name lookup that matches more than one member returns the candidates instead
@@ -915,6 +927,46 @@ def render_search_results(query: str, results: List[dict]) -> str:
     )
 
 
+def describe_tool_call(name: str, raw_args: Any) -> str:
+    """One line saying what the bot is about to do, in the same plain voice the
+    rest of it uses. Unknown tools still render - a name is better than silence -
+    and an unparseable argument just drops to the bare verb rather than failing."""
+    args = parse_tool_arguments(raw_args) or {}
+
+    def _arg(key: str) -> str:
+        value = args.get(key)
+        if not isinstance(value, (str, int)):
+            return ""
+        return _STATUS_MARKUP_RE.sub("", sanitize(str(value), STATUS_ARG_CHAR_CAP)).strip()
+
+    if name == "read_web_search":
+        query = _arg("query")
+        return f"searching the web for \u201c{query}\u201d…" if query else "searching the web…"
+    if name == "read_recent_messages":
+        limit = clamp_limit(args.get("limit"))
+        offset = clamp_offset(args.get("offset"))
+        if offset:
+            return f"reading {limit} messages from further back…"
+        return f"reading the last {limit} messages…"
+    if name == "read_reply_chain":
+        return "reading what this replies to…"
+    if name == "read_member_profile":
+        who = _arg("display_name")
+        return f"looking up {who}…" if who else "looking someone up…"
+    if name == "read_image":
+        return "looking at the image…"
+    if name == "read_channel":
+        return "looking at this channel…"
+    return f"calling {_STATUS_MARKUP_RE.sub('', str(name)[:40])}…"
+
+
+def render_status_line(calls: List[dict]) -> str:
+    """The status for a whole round. Usually one call; more than one is rare
+    enough that stacking them beats trying to be clever about it."""
+    lines = [describe_tool_call(call.get("name", ""), call.get("arguments")) for call in calls]
+    return "\n".join(f"*{line}*" for line in lines if line)
+
+
 def should_respond(message: discord.Message, bot_user: Optional[discord.abc.User],
                    *, is_command: bool, is_reply_to_bot: bool = False) -> bool:
     """The full trigger, as a pure function so the truth table is testable
@@ -1307,7 +1359,8 @@ class Aguiliar(commands.Cog):
 
     async def _converse(self, message: discord.Message, messages: List[dict],
                         max_tokens: int, on_text: Callable,
-                        trace: Optional[dict] = None) -> str:
+                        trace: Optional[dict] = None,
+                        on_status: Optional[Callable] = None) -> str:
         """The tool loop. At most MAX_TOOL_ROUNDS tool rounds, then the tools are
         withdrawn and the model has to answer with what it has.
 
@@ -1349,6 +1402,14 @@ class Aguiliar(commands.Cog):
             trace["tool_calls"].extend(
                 {"name": call["name"], "arguments": call["arguments"][:200]} for call in tool_calls
             )
+            # Said before the tools run, not after: the whole value is covering
+            # the dead minute while they do. Best-effort - a status line that
+            # fails is never allowed to cost somebody their answer.
+            if on_status is not None:
+                try:
+                    await on_status(render_status_line(tool_calls))
+                except Exception:
+                    logger.debug("aguiliar: status line failed", exc_info=True)
             messages.append({
                 "role": "assistant",
                 "content": text,
@@ -1965,6 +2026,21 @@ class Aguiliar(commands.Cog):
             except discord.HTTPException:
                 pass
 
+        async def on_status(line: str) -> None:
+            """Not throttled, and it does not check last_shown: a tool round
+            happens at most twice in a reply, and this is the one edit that has
+            to land. It DOES move last_edit, so the next streamed chunk waits its
+            interval instead of overwriting the status a moment later."""
+            nonlocal last_edit, last_shown
+            if not line:
+                return
+            last_edit = time.monotonic()
+            last_shown = ""
+            try:
+                await placeholder.edit(content=line[:1990])
+            except discord.HTTPException:
+                pass
+
         # Pre-bound: if the typing() context manager ever swallowed an exception,
         # control would resume here with nothing assigned and the reply would die
         # of an UnboundLocalError instead of saying anything.
@@ -1973,7 +2049,9 @@ class Aguiliar(commands.Cog):
             messages = await self._build_messages(message, replying_to or replying_to_me)
             async with message.channel.typing():
                 async with self._slot:
-                    answer = await self._converse(message, messages, max_tokens, on_text, trace)
+                    answer = await self._converse(
+                        message, messages, max_tokens, on_text, trace, on_status=on_status,
+                    )
         except asyncio.TimeoutError:
             status, error = "timeout", f"no response within {self.timeout_seconds}s"
             answer = "That took too long - the model is on a slow box. Try a shorter question."

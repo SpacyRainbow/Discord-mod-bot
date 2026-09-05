@@ -883,6 +883,15 @@ snippets are framed as data in the same way retrieved Discord messages are,
 because they are written by strangers and are, if anything, the more hostile of
 the two.
 
+**You can see what it is doing.** While a tool runs, the *thinking…* placeholder
+is replaced by a line saying what the bot is actually about to do — `searching
+the web for "GPT Astra OpenAI release"…`, `reading the last 15 messages…`,
+`looking up Laffy…`. That line is rendered from the tool call itself, in Python,
+after the model has committed to it and before it is dispatched. The model is
+never asked to narrate its own plans: narration would cost generation time on a
+box that produces about three tokens a second, and it could describe something
+other than what it then does. This costs nothing and cannot be wrong.
+
 **One search per message, five snippets, 300 characters each.** That is a limit
 set by the clock, not by taste. Every snippet is prompt the model has to
 reprocess at roughly five tokens a second, so a search adds well over a minute

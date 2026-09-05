@@ -1323,3 +1323,105 @@ def test_cancelling_a_warm_up_that_never_started_is_harmless():
     cog = _make_cog()
     cog._warm_task = None
     cog._cancel_warmup()
+
+
+# --- the status line ----------------------------------------------------------
+
+def test_the_status_line_says_what_the_tool_call_actually_is():
+    from bot.modules.aguiliar import describe_tool_call
+    assert describe_tool_call(
+        "read_web_search", '{"query": "GPT Astra OpenAI release"}'
+    ) == "searching the web for “GPT Astra OpenAI release”…"
+    assert describe_tool_call("read_recent_messages", '{"limit": 15}') == \
+        "reading the last 15 messages…"
+    assert describe_tool_call("read_recent_messages", '{"limit": 15, "offset": 30}') == \
+        "reading 15 messages from further back…"
+    assert describe_tool_call("read_reply_chain", "{}") == "reading what this replies to…"
+    assert describe_tool_call("read_member_profile", '{"display_name": "Laffy"}') == \
+        "looking up Laffy…"
+
+
+def test_a_status_line_cannot_ping_anyone_or_rewrite_itself_as_markdown():
+    """The query is model-authored text going straight into a Discord message.
+    It is the one part of the line that is not a literal."""
+    from bot.modules.aguiliar import describe_tool_call
+    line = describe_tool_call(
+        "read_web_search",
+        '{"query": "@everyone **bold** `code` <@1234> _x_"}',
+    )
+    assert "@everyone" not in line
+    assert "**" not in line and "`" not in line and "<@1234>" not in line
+
+
+def test_an_unparseable_or_unknown_call_still_renders_something():
+    from bot.modules.aguiliar import describe_tool_call
+    assert describe_tool_call("read_web_search", "{not json") == "searching the web…"
+    assert describe_tool_call("read_web_search", '{"query": 12.5}') == "searching the web…"
+    assert "wat" in describe_tool_call("wat", "{}")
+
+
+def test_the_status_of_a_round_stacks_every_call_in_it():
+    from bot.modules.aguiliar import render_status_line
+    rendered = render_status_line([
+        {"name": "read_web_search", "arguments": '{"query": "astra"}'},
+        {"name": "read_reply_chain", "arguments": "{}"},
+    ])
+    assert rendered.splitlines() == [
+        "*searching the web for “astra”…*",
+        "*reading what this replies to…*",
+    ]
+    assert render_status_line([]) == ""
+
+
+@pytest.mark.asyncio
+async def test_the_status_is_shown_before_the_tool_runs_not_after():
+    """Ordering is the entire feature: a status line posted after the tool has
+    already returned has covered nothing."""
+    cog = _make_cog()
+    events = []
+    rounds = {"n": 0}
+
+    async def fake_stream(payload, on_text):
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            return "", [{"id": "c1", "name": "read_web_search",
+                         "arguments": '{"query": "astra"}'}]
+        return "done", []
+
+    async def fake_dispatch(name, raw_args, message):
+        events.append(("tool", name))
+        return "results"
+
+    async def on_status(line):
+        events.append(("status", line))
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = fake_dispatch
+    answer = await cog._converse(
+        _make_message(), [], 200, AsyncMock(), {}, on_status=on_status,
+    )
+    assert answer == "done"
+    assert [kind for kind, _ in events] == ["status", "tool"]
+    assert "astra" in events[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_broken_status_callback_never_costs_the_reply():
+    cog = _make_cog()
+    rounds = {"n": 0}
+
+    async def fake_stream(payload, on_text):
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            return "", [{"id": "c1", "name": "read_reply_chain", "arguments": "{}"}]
+        return "answered anyway", []
+
+    async def exploding_status(line):
+        raise RuntimeError("discord fell over")
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = AsyncMock(return_value="x")
+    answer = await cog._converse(
+        _make_message(), [], 200, AsyncMock(), {}, on_status=exploding_status,
+    )
+    assert answer == "answered anyway"
