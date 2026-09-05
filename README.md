@@ -865,13 +865,29 @@ It does not get handed the channel history. Each ping carries only the message
 itself, the channel name, and one line saying how long ago the previous message
 was — enough for the model to judge for itself whether earlier context is even
 relevant. A ping after three days of silence usually is not. When it does need
-history, it asks for it, using one of two read-only tools:
+history — or something it cannot know at all — it asks for it, using one of
+these read-only tools:
 
 | Tool | What it reads |
 |---|---|
 | `read_recent_messages` | Up to 100 recent messages in the channel you pinged it in, with an `offset` so it can page further back |
 | `read_reply_chain` | The chain of messages your message is replying to, up to 10 hops |
 | `read_member_profile` | One member of this server, looked up by the name they are shown under: their names, roles, join date, account age, and their online status and current game when the Presence intent is enabled |
+| `read_web_search` | The top few result snippets for one web search, when `LLM_SEARCH_URL` points at a [SearXNG](https://github.com/searxng/searxng) instance. Offered only when that is configured |
+
+**Search is a search, not a browser.** The only thing the model supplies is a
+query string: there is no URL parameter anywhere in the schema, so it cannot
+make the bot fetch an address of its choosing, and no page is ever retrieved —
+only the search host is contacted, and only its snippets come back. Those
+snippets are framed as data in the same way retrieved Discord messages are,
+because they are written by strangers and are, if anything, the more hostile of
+the two.
+
+**One search per message, five snippets, 300 characters each.** That is a limit
+set by the clock, not by taste. Every snippet is prompt the model has to
+reprocess at roughly five tokens a second, so a search adds well over a minute
+to a reply. Asking for more results, longer ones, or a second search is measured
+in minutes of somebody watching a typing indicator.
 
 It also remembers the last couple of exchanges in the same channel (see
 `llm.memoryturns`), which are added to the prompt directly. That is cheaper than
