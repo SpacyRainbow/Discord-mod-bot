@@ -912,6 +912,13 @@ seconds instead of sitting on `thinking…` until 35. Whether that trade is wort
 it is a judgement about your own patience, which is why it is a switch and not a
 decision baked into the code.
 
+**Nothing a tool round shows is thrown away.** The placeholder accumulates: what
+the model said before calling, then the status line for the call, then the answer
+underneath both. An early version replaced the placeholder on every tool round,
+which erased the reasoning the moment the call was made — exactly the thing
+narration exists to produce. What is *logged* is still the answer alone; the
+transcript above it is presentation.
+
 **Turning it on or off changes the system prompt, so the next ping pays a cold
 prefix cache — about eight minutes on this box.** Flip it once and leave it.
 Narration and the rendered line are independent: narration is a claim about what

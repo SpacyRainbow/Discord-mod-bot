@@ -1039,6 +1039,20 @@ def render_status_line(calls: List[dict]) -> str:
     return "\n".join(lines)
 
 
+def render_transcript(settled: List[str], current: str = "") -> str:
+    """What the placeholder shows: everything already settled in this reply, then
+    whatever is streaming right now, oldest first.
+
+    A tool round used to overwrite the placeholder outright, which erased the
+    sentence the model had just written explaining what it was about to look up -
+    the one thing llm.narrate exists to produce. Blank parts are dropped so a
+    round that narrated nothing does not leave a hole."""
+    parts = [part for part in settled if part and part.strip()]
+    if current and current.strip():
+        parts.append(current)
+    return "\n".join(parts)
+
+
 def should_respond(message: discord.Message, bot_user: Optional[discord.abc.User],
                    *, is_command: bool, is_reply_to_bot: bool = False) -> bool:
     """The full trigger, as a pure function so the truth table is testable
@@ -1490,7 +1504,11 @@ class Aguiliar(commands.Cog):
             # fails is never allowed to cost somebody their answer.
             if on_status is not None:
                 try:
-                    await on_status(render_status_line(tool_calls))
+                    # `text` is whatever the model said BEFORE deciding to call -
+                    # its reasoning, when llm.narrate is on. It is handed over
+                    # rather than dropped: the status line goes UNDER it, and the
+                    # placeholder keeps both.
+                    await on_status(render_status_line(tool_calls), strip_tool_markup(text))
                 except Exception:
                     logger.debug("aguiliar: status line failed", exc_info=True)
             messages.append({
@@ -2154,6 +2172,15 @@ class Aguiliar(commands.Cog):
         error: Optional[str] = None
         last_edit = 0.0
         last_shown = ""
+        # Everything already settled in this reply: the model's own words before
+        # each tool call, and the status line for that call. A tool round used to
+        # REPLACE the placeholder, which erased the reasoning the model had just
+        # streamed - the one thing narration exists to show. It accumulates now,
+        # and the final answer is appended under it rather than over it.
+        settled: List[str] = []
+
+        def compose(current: str = "") -> str:
+            return render_transcript(settled, current)
 
         async def on_text(current: str) -> None:
             nonlocal last_edit, last_shown
@@ -2163,22 +2190,30 @@ class Aguiliar(commands.Cog):
             last_edit = now
             last_shown = current
             try:
-                await placeholder.edit(content=current[:1990] + " …")
+                await placeholder.edit(content=compose(current)[:1990] + " …")
             except discord.HTTPException:
                 pass
 
-        async def on_status(line: str) -> None:
+        async def on_status(line: str, said: str = "") -> None:
             """Not throttled, and it does not check last_shown: a tool round
             happens at most twice in a reply, and this is the one edit that has
             to land. It DOES move last_edit, so the next streamed chunk waits its
-            interval instead of overwriting the status a moment later."""
+            interval instead of overwriting the status a moment later.
+
+            `said` is what the model wrote before it called - kept above the
+            status line, because that reasoning is the whole point of narration
+            and re-rendering the placeholder from scratch would throw it away."""
             nonlocal last_edit, last_shown
-            if not line:
+            if not line and not said:
                 return
+            if said.strip():
+                settled.append(said.strip())
+            if line:
+                settled.append(line)
             last_edit = time.monotonic()
             last_shown = ""
             try:
-                await placeholder.edit(content=line[:1990])
+                await placeholder.edit(content=compose()[:1990])
             except discord.HTTPException:
                 pass
 
@@ -2206,7 +2241,11 @@ class Aguiliar(commands.Cog):
             # indistinguishable from a terse reply.
             status, error = "empty", "model returned no text"
         answer = raw_answer or "I don't have anything useful to add there."
-        for index, part in enumerate(chunk_text(answer)):
+        # What is SHOWN keeps the reasoning and the status lines above the
+        # answer; what is LOGGED is the answer alone (see _log_exchange), because
+        # the transcript is presentation, not something the model said in reply.
+        shown = compose(answer) if status == "ok" else answer
+        for index, part in enumerate(chunk_text(shown)):
             try:
                 if index == 0:
                     await placeholder.edit(content=part)

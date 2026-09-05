@@ -1393,7 +1393,7 @@ async def test_the_status_is_shown_before_the_tool_runs_not_after():
         events.append(("tool", name))
         return "results"
 
-    async def on_status(line):
+    async def on_status(line, said=""):
         events.append(("status", line))
 
     cog._stream_completion = fake_stream
@@ -1417,7 +1417,7 @@ async def test_a_broken_status_callback_never_costs_the_reply():
             return "", [{"id": "c1", "name": "read_reply_chain", "arguments": "{}"}], "tool_calls"
         return "answered anyway", [], "stop"
 
-    async def exploding_status(line):
+    async def exploding_status(line, said=""):
         raise RuntimeError("discord fell over")
 
     cog._stream_completion = fake_stream
@@ -1564,3 +1564,56 @@ async def test_the_warm_up_and_a_real_ping_build_the_same_system_prompt():
         "llm.narrate must be read in the ping path, the warm-up and the digest - "
         "all three build a system prompt against the one shared slot"
     )
+
+
+# --- the reasoning survives the tool call -------------------------------------
+
+def test_the_transcript_keeps_what_came_before_the_tool_call():
+    """The bug this exists to prevent: a tool round overwrote the placeholder,
+    so the sentence the model had just written explaining what it was about to
+    look up vanished the moment the call was made."""
+    from bot.modules.aguiliar import render_transcript
+    said = "Let me pull the messages first."
+    status = "-# \U0001f4dc reading the last 20 messages…"
+    assert render_transcript([said, status]) == f"{said}\n{status}"
+    # And the answer lands UNDER both, not over them.
+    assert render_transcript([said, status], "Here is the summary.") == \
+        f"{said}\n{status}\nHere is the summary."
+
+
+def test_a_round_that_narrated_nothing_leaves_no_hole():
+    from bot.modules.aguiliar import render_transcript
+    status = "-# \U0001f4dc reading the last 20 messages…"
+    assert render_transcript(["", status, "   "], "answer") == f"{status}\nanswer"
+    assert render_transcript([], "") == ""
+
+
+@pytest.mark.asyncio
+async def test_the_words_before_a_tool_call_reach_the_status_callback():
+    """_converse must hand the round's own text over, not drop it: that text is
+    the model's reasoning, and it is the caller that decides to keep it."""
+    cog = _make_cog()
+    seen = {}
+    rounds = {"n": 0}
+
+    async def fake_stream(payload, on_text):
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            return ("I don't know this one, so I'm checking what OpenAI announced.",
+                    [{"id": "c1", "name": "read_web_search",
+                      "arguments": '{"query": "gpt astra"}'}],
+                    "tool_calls")
+        return "GPT-6 Astra, apparently.", [], "stop"
+
+    async def on_status(line, said=""):
+        seen["line"] = line
+        seen["said"] = said
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = AsyncMock(return_value="results")
+    answer = await cog._converse(
+        _make_message(), [], 200, AsyncMock(), {}, on_status=on_status,
+    )
+    assert answer == "GPT-6 Astra, apparently."
+    assert seen["said"] == "I don't know this one, so I'm checking what OpenAI announced."
+    assert "gpt astra" in seen["line"]
