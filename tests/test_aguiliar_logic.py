@@ -1617,3 +1617,47 @@ async def test_the_words_before_a_tool_call_reach_the_status_callback():
     assert answer == "GPT-6 Astra, apparently."
     assert seen["said"] == "I don't know this one, so I'm checking what OpenAI announced."
     assert "gpt astra" in seen["line"]
+
+
+@pytest.mark.asyncio
+async def test_narration_is_counted_even_when_the_switch_is_off():
+    """The open question is how often it narrates UNPROMPTED, so the count has
+    to be taken on every tool round regardless of llm.narrate."""
+    cog = _make_cog()
+    rounds = {"n": 0}
+
+    async def fake_stream(payload, on_text):
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            return ("Let me pull them first.",
+                    [{"id": "c1", "name": "read_recent_messages",
+                      "arguments": '{"limit": 20}'}], "tool_calls")
+        return "Here you go.", [], "stop"
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = AsyncMock(return_value="messages")
+    trace = {}
+    # No on_status at all: the count must not depend on anyone listening.
+    await cog._converse(_make_message(), [], 200, AsyncMock(), trace)
+    assert trace["narrated_rounds"] == 1
+    assert trace["narrated_chars"] == len("Let me pull them first.")
+
+
+@pytest.mark.asyncio
+async def test_a_silent_tool_round_counts_as_not_narrated():
+    cog = _make_cog()
+    rounds = {"n": 0}
+
+    async def fake_stream(payload, on_text):
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            return ("", [{"id": "c1", "name": "read_reply_chain",
+                          "arguments": "{}"}], "tool_calls")
+        return "Answer.", [], "stop"
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = AsyncMock(return_value="x")
+    trace = {}
+    await cog._converse(_make_message(), [], 200, AsyncMock(), trace)
+    assert trace["narrated_rounds"] == 0
+    assert trace["narrated_chars"] == 0

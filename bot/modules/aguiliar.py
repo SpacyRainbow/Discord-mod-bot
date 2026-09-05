@@ -1499,6 +1499,15 @@ class Aguiliar(commands.Cog):
             trace["tool_calls"].extend(
                 {"name": call["name"], "arguments": call["arguments"][:200]} for call in tool_calls
             )
+            # Whether the model said anything before deciding to call. Recorded
+            # even with llm.narrate off, because that is the open question: it
+            # narrates unprompted SOMETIMES, and the switch is only worth its
+            # ~9s for the rounds where it would not have. Counted in characters
+            # rather than stored, so this needs no schema change - grep the
+            # container log for narrated= to answer "how often".
+            said_first = strip_tool_markup(text).strip()
+            trace["narrated_rounds"] = trace.get("narrated_rounds", 0) + (1 if said_first else 0)
+            trace["narrated_chars"] = trace.get("narrated_chars", 0) + len(said_first)
             # Said before the tools run, not after: the whole value is covering
             # the dead minute while they do. Best-effort - a status line that
             # fails is never allowed to cost somebody their answer.
@@ -2257,10 +2266,12 @@ class Aguiliar(commands.Cog):
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "aguiliar: guild=%s channel=%s user=%s status=%s rounds=%s tools=%s "
-            "continuations=%s duration=%sms chars=%s",
+            "continuations=%s narrated=%s/%s narrated_chars=%s duration=%sms chars=%s",
             message.guild.id, message.channel.id, message.author.id, status,
             trace["rounds"], [c["name"] for c in trace["tool_calls"]],
-            trace.get("continuations", 0), duration_ms, len(answer),
+            trace.get("continuations", 0),
+            trace.get("narrated_rounds", 0), len(trace["tool_calls"]),
+            trace.get("narrated_chars", 0), duration_ms, len(answer),
         )
         # Only a real answer is logged as one. On a failure the text on screen is
         # this module's apology, not something the model produced, and logging
