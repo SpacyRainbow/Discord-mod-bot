@@ -38,7 +38,11 @@ from bot.modules.aguiliar import (
     scaled_dimensions,
     resolve_timezone,
     SAFETY_PREAMBLE,
+    _gap_var,
+    _images_var,
     _usage_var,
+    image_registry,
+    note_images,
     record_usage,
     render_gap,
     sanitize,
@@ -1976,8 +1980,12 @@ def test_usage_outside_a_reply_is_a_no_op():
 async def test_the_log_row_carries_the_token_split_and_the_gap_size(db):
     cog = _logging_cog(db)
     message = _live_message()
-    message._aguiliar_gap = (4, 260)
-    cog._build_messages = AsyncMock(return_value=[{"role": "user", "content": "hi"}])
+
+    async def build(*args, **kwargs):
+        _gap_var.set((4, 260))
+        return [{"role": "user", "content": "hi"}]
+
+    cog._build_messages = build
 
     async def converse(*args, **kwargs):
         tally = _usage_var.get()
@@ -1989,3 +1997,62 @@ async def test_the_log_row_carries_the_token_split_and_the_gap_size(db):
 
     row = (await cog.bot.stores.llm_log.recent_for_guild(7, 1))[0]
     assert row[10] == 1900 and row[11] == 1750 and row[12] == 4
+
+
+# --- per-reply state cannot live on the message ------------------------------
+#
+# discord.Message defines __slots__, so setattr on it raises. Both of these used
+# to be stashed there inside a try/except: perfect against MagicMock, silently
+# dead in production. These tests use an object that actually has __slots__,
+# which is the only kind that can catch it.
+
+
+class _Slotted:
+    """Stands in for discord.Message: refuses new attributes, exactly like it."""
+    __slots__ = ("id", "attachments")
+
+    def __init__(self):
+        self.id = 1
+        self.attachments = []
+
+
+def test_a_message_that_refuses_attributes_still_carries_the_gap_counts():
+    slotted = _Slotted()
+    with pytest.raises(AttributeError):
+        slotted._aguiliar_gap = (1, 2)      # the old mechanism, proven broken
+
+    token = _gap_var.set(None)
+    try:
+        _gap_var.set((4, 260))
+        assert _gap_var.get() == (4, 260)
+    finally:
+        _gap_var.reset(token)
+
+
+def test_the_image_registry_survives_a_message_that_refuses_attributes():
+    """The bug this inherited: a failed setattr handed every caller a FRESH
+    empty dict, so every image was numbered image1 and read_image could never
+    resolve any of them."""
+    token = _images_var.set({})
+    try:
+        first = image_registry(_Slotted())
+        first["image1"] = "an attachment"
+        second = image_registry(_Slotted())
+        assert second is first and second["image1"] == "an attachment"
+    finally:
+        _images_var.reset(token)
+
+
+def test_two_images_in_one_reply_get_distinct_refs():
+    token = _images_var.set({})
+    try:
+        source = MagicMock()
+        attachment = MagicMock()
+        attachment.content_type = "image/png"
+        attachment.filename = "a.png"
+        attachment.size = 1000
+        source.attachments = [attachment]
+        assert note_images(_Slotted(), source) == " [image1]"
+        assert note_images(_Slotted(), source) == " [image2]"
+    finally:
+        _images_var.reset(token)

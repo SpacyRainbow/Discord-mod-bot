@@ -333,6 +333,19 @@ _usage_var: "contextvars.ContextVar[Optional[Dict[str, int]]]" = contextvars.Con
 )
 
 
+# The same treatment, for the same reason, plus one this module learned the hard
+# way: discord.Message defines __slots__, so setattr on it ALWAYS raises. Both
+# of these used to be stashed as attributes on the message inside a try/except,
+# which meant they silently did nothing in production while working perfectly
+# against MagicMock in the tests.
+_gap_var: "contextvars.ContextVar[Optional[Tuple[int, int]]]" = contextvars.ContextVar(
+    "aguiliar_gap", default=None
+)
+_images_var: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
+    "aguiliar_images", default=None
+)
+
+
 def record_usage(chunk: dict) -> None:
     """Adds one streamed chunk's token counts to the current reply's tally.
 
@@ -971,6 +984,16 @@ def image_registry(message: Any) -> Dict[str, Any]:
     model can read or fill in (see describe_member), and a counter is enough:
     the registry only has to survive one request.
     """
+    # A real reply opens this at the top of _respond. It has to live here rather
+    # than on the message: discord.Message has __slots__, so the setattr this
+    # used to do raised every single time in production and was swallowed - which
+    # handed every caller a FRESH empty dict, numbered every image "image1", and
+    # left read_image unable to resolve any of them.
+    registry = _images_var.get()
+    if registry is not None:
+        return registry
+    # No reply context (a tool handler called directly, or a test): fall back to
+    # the message itself, which works for anything that accepts attributes.
     registry = getattr(message, "_aguiliar_images", None)
     if isinstance(registry, dict):
         return registry
@@ -978,7 +1001,7 @@ def image_registry(message: Any) -> Dict[str, Any]:
     try:
         setattr(message, "_aguiliar_images", registry)
     except (AttributeError, TypeError):
-        return {}  # a frozen or mocked object: degrade to "no images", never raise
+        return {}  # a slotted or frozen object: degrade to "no images", never raise
     return registry
 
 
@@ -1897,12 +1920,9 @@ class Aguiliar(commands.Cog):
         recently = f"Recently in this channel: {digest}\n" if digest else ""
         gap, gap_count, gap_chars, gap_anchor_id = await self._gap_messages(message)
         gap_block = f"{gap}\n" if gap else ""
-        # Stashed on the message so _respond can log what this cost without
-        # threading a return value through the whole call chain.
-        try:
-            setattr(message, "_aguiliar_gap", (gap_count, gap_chars))
-        except (AttributeError, TypeError):
-            pass
+        # Recorded task-locally so _log_exchange can report what this cost
+        # without threading a return value through the whole call chain.
+        _gap_var.set((gap_count, gap_chars))
         attached = ("They attached an image; it is shown to you below.\n"
                     if image_attachments(message) else "")
         # Volatile facts live here, in the user turn, never in the system prompt.
@@ -2392,6 +2412,8 @@ class Aguiliar(commands.Cog):
         # Opens this reply's token tally. Set here, at the top of the task, so
         # every request the reply goes on to make lands in the same one.
         _usage_var.set({"prompt_tokens": 0, "cached_tokens": 0, "requests": 0})
+        _gap_var.set(None)
+        _images_var.set({})
         try:
             placeholder = await message.reply("*thinking…*", mention_author=False)
         except (discord.Forbidden, discord.HTTPException):
@@ -2513,7 +2535,7 @@ class Aguiliar(commands.Cog):
         screen, and a database that is down costs a log row rather than an
         answer. Successes and failures both land here."""
         usage = _usage_var.get() or {}
-        gap_count, gap_chars = getattr(message, "_aguiliar_gap", (0, 0))
+        gap_count, gap_chars = _gap_var.get() or (0, 0)
         try:
             await self.bot.stores.llm_log.add(
                 guild_id=message.guild.id,
