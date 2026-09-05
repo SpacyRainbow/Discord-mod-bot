@@ -10,6 +10,7 @@ from bot.modules.aguiliar import (
     DEFAULT_TIMEZONE,
     HISTORY_LIMIT_MAX,
     HISTORY_OFFSET_MAX,
+    MAX_CONTINUATIONS,
     MAX_TOOL_ROUNDS,
     MODAL_TEXT_MAX,
     PERSONA_TEMPLATE,
@@ -390,8 +391,8 @@ async def test_tool_loop_runs_one_round_then_answers():
     async def fake_stream(payload, on_text):
         calls.append(payload)
         if len(calls) == 1:
-            return "", [{"id": "c1", "name": "read_recent_messages", "arguments": '{"limit": 5}'}]
-        return "You were talking about Minecraft.", []
+            return "", [{"id": "c1", "name": "read_recent_messages", "arguments": '{"limit": 5}'}], "tool_calls"
+        return "You were talking about Minecraft.", [], "stop"
 
     cog._stream_completion = fake_stream
     cog._tool_read_recent_messages = AsyncMock(return_value="alice: minecraft later?")
@@ -414,7 +415,7 @@ async def test_tool_loop_withdraws_tools_after_the_cap():
 
     async def always_calls_a_tool(payload, on_text):
         seen.append("tools" in payload)
-        return "", [{"id": "c", "name": "read_reply_chain", "arguments": "{}"}]
+        return "", [{"id": "c", "name": "read_reply_chain", "arguments": "{}"}], "tool_calls"
 
     cog._stream_completion = always_calls_a_tool
     cog._tool_read_reply_chain = AsyncMock(return_value="(no messages found)")
@@ -429,7 +430,7 @@ async def test_tool_loop_returns_a_plain_answer_without_calling_anything():
     cog = _make_cog()
 
     async def straight_answer(payload, on_text):
-        return "Hello.", []
+        return "Hello.", [], "stop"
 
     cog._stream_completion = straight_answer
     messages = []
@@ -1385,8 +1386,8 @@ async def test_the_status_is_shown_before_the_tool_runs_not_after():
         rounds["n"] += 1
         if rounds["n"] == 1:
             return "", [{"id": "c1", "name": "read_web_search",
-                         "arguments": '{"query": "astra"}'}]
-        return "done", []
+                         "arguments": '{"query": "astra"}'}], "tool_calls"
+        return "done", [], "stop"
 
     async def fake_dispatch(name, raw_args, message):
         events.append(("tool", name))
@@ -1413,8 +1414,8 @@ async def test_a_broken_status_callback_never_costs_the_reply():
     async def fake_stream(payload, on_text):
         rounds["n"] += 1
         if rounds["n"] == 1:
-            return "", [{"id": "c1", "name": "read_reply_chain", "arguments": "{}"}]
-        return "answered anyway", []
+            return "", [{"id": "c1", "name": "read_reply_chain", "arguments": "{}"}], "tool_calls"
+        return "answered anyway", [], "stop"
 
     async def exploding_status(line):
         raise RuntimeError("discord fell over")
@@ -1425,3 +1426,87 @@ async def test_a_broken_status_callback_never_costs_the_reply():
         _make_message(), [], 200, AsyncMock(), {}, on_status=exploding_status,
     )
     assert answer == "answered anyway"
+
+
+# --- continuing a reply that hit the token ceiling ----------------------------
+
+@pytest.mark.asyncio
+async def test_a_truncated_reply_is_continued_in_a_second_request():
+    """`finish_reason == "length"` means the ceiling cut the answer off, not that
+    the model finished. The continuation is appended and delivered as further
+    Discord messages by chunk_text."""
+    cog = _make_cog()
+    payloads = []
+
+    async def fake_stream(payload, on_text):
+        payloads.append(payload)
+        if len(payloads) == 1:
+            return "The answer is 6,773,760 because", [], "length"
+        return "you multiply the two counts.", [], "stop"
+
+    cog._stream_completion = fake_stream
+    messages = [{"role": "user", "content": "how many?"}]
+    trace = {}
+    answer = await cog._converse(_make_message(), messages, 200, AsyncMock(), trace)
+
+    assert answer == "The answer is 6,773,760 because you multiply the two counts."
+    assert trace["continuations"] == 1
+    # The partial answer is fed back, and the caller's own list is untouched.
+    assert payloads[1]["messages"][-2]["role"] == "assistant"
+    assert "6,773,760" in payloads[1]["messages"][-2]["content"]
+    assert "tools" not in payloads[1]
+    assert messages == [{"role": "user", "content": "how many?"}]
+
+
+@pytest.mark.asyncio
+async def test_continuation_is_bounded():
+    """A model that never stops must not be allowed to run for a quarter hour."""
+    cog = _make_cog()
+    calls = []
+
+    async def never_finishes(payload, on_text):
+        calls.append(payload)
+        return "and", [], "length"
+
+    cog._stream_completion = never_finishes
+    answer = await cog._converse(_make_message(), [], 200, AsyncMock())
+
+    assert len(calls) == 1 + MAX_CONTINUATIONS
+    assert answer == "and and and"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_continuation_stops_the_loop():
+    cog = _make_cog()
+    calls = []
+
+    async def then_nothing(payload, on_text):
+        calls.append(payload)
+        return ("partial" if len(calls) == 1 else ""), [], "length"
+
+    cog._stream_completion = then_nothing
+    assert await cog._converse(_make_message(), [], 200, AsyncMock()) == "partial"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_stream_callback_sees_the_whole_answer_so_far():
+    """The live-edit callback gets text produced within ONE request, so a
+    continuation has to re-attach what is already on screen or the message
+    visibly rewinds."""
+    cog = _make_cog()
+    seen = []
+
+    async def fake_stream(payload, on_text):
+        if not seen:
+            await on_text("first half")
+            return "first half", [], "length"
+        await on_text("second half")
+        return "second half", [], "stop"
+
+    async def on_text(text):
+        seen.append(text)
+
+    cog._stream_completion = fake_stream
+    await cog._converse(_make_message(), [], 200, on_text)
+    assert seen[-1] == "first half second half"

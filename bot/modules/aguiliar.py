@@ -150,6 +150,14 @@ MODAL_TEXT_MAX = 4000
 
 # How many times the model may call a tool before it is made to answer.
 MAX_TOOL_ROUNDS = 2
+# How many times a reply that hit `max_tokens` may be continued in a further
+# request. Continuing is nearly free on prompt processing - the continuation
+# shares the whole prompt PLUS the partial answer, so it is an append and an
+# unchanged prefix reprocesses ~4 tokens - and only generation costs anything.
+# It also dodges the request timeout: two shorter generations each finish
+# comfortably where one big cap would flirt with LLM_TIMEOUT_SECONDS. The bound
+# is what keeps a runaway reply from costing a quarter of an hour.
+MAX_CONTINUATIONS = 2
 # --- vision ------------------------------------------------------------------
 # Image cost here is LINEAR in pixels: ~1 prompt token per 1012 px, measured
 # against the live endpoint. 512x384 = 203 tokens = ~20s; 1920x1080 = 2051
@@ -236,6 +244,14 @@ FINAL_ROUND_NOTICE = (
 TOOL_MARKUP_FALLBACK = (
     "I ran out of lookups before I got to the end of that. Ask again and I'll "
     "pick it up from where I stopped."
+)
+# Sent when a reply was cut off by the token ceiling. The partial answer is fed
+# back as the assistant turn, so the model can see exactly where it stopped -
+# the instruction only has to stop it restarting or introducing itself again.
+CONTINUE_NOTICE = (
+    "Your previous message was cut off mid-answer. Continue it from exactly "
+    "where it stopped, in the same voice. Do not repeat anything you already "
+    "said, do not restate the question, and do not add a preamble."
 )
 
 PIN_PREVIEW_MAX = 5
@@ -1312,13 +1328,18 @@ class Aguiliar(commands.Cog):
 
     # --- the model ----------------------------------------------------------
 
-    async def _stream_completion(self, payload: dict, on_text: Callable) -> Tuple[str, List[dict]]:
-        """One streaming request. Returns (text, tool_calls). Tool call deltas
+    async def _stream_completion(self, payload: dict,
+                                 on_text: Callable) -> Tuple[str, List[dict], Optional[str]]:
+        """One streaming request. Returns (text, tool_calls, finish_reason).
+        The finish reason is what tells a reply that was cut off by the token
+        ceiling ("length") from one that simply ended, so it is carried out of
+        here rather than thrown away. Tool call deltas
         arrive in OpenAI's usual shape - id and name on the first chunk for an
         index, then `arguments` accumulated as string fragments - confirmed
         against this server, not assumed."""
         text_parts: List[str] = []
         calls: Dict[int, dict] = {}
+        finish_reason: Optional[str] = None
         url = f"{self.base_url}/chat/completions"
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         async with self.session.post(url, json=payload, timeout=timeout) as resp:
@@ -1339,6 +1360,8 @@ class Aguiliar(commands.Cog):
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0]["finish_reason"]
                 delta = choices[0].get("delta") or {}
                 piece = delta.get("content")
                 if piece:
@@ -1355,7 +1378,7 @@ class Aguiliar(commands.Cog):
                     if fn.get("arguments"):
                         slot["arguments"] += fn["arguments"]
         ordered = [calls[k] for k in sorted(calls)]
-        return "".join(text_parts), ordered
+        return "".join(text_parts), ordered, finish_reason
 
     async def _converse(self, message: discord.Message, messages: List[dict],
                         max_tokens: int, on_text: Callable,
@@ -1390,8 +1413,12 @@ class Aguiliar(commands.Cog):
                 # result - on a no-tool reply there is nothing to announce.
                 messages.append({"role": "user", "content": FINAL_ROUND_NOTICE})
             trace["rounds"] = round_index + 1
-            text, tool_calls = await self._stream_completion(payload, on_text)
+            text, tool_calls, finish_reason = await self._stream_completion(payload, on_text)
             if not tool_calls:
+                if finish_reason == "length":
+                    text = await self._continue_truncated(
+                        messages, text, max_tokens, on_text, trace,
+                    )
                 cleaned = strip_tool_markup(text)
                 if not cleaned and (text or "").strip():
                     logger.warning(
@@ -1430,6 +1457,50 @@ class Aguiliar(commands.Cog):
                     "content": result,
                 })
         return ""
+
+    async def _continue_truncated(self, messages: List[dict], text: str, max_tokens: int,
+                                  on_text: Callable, trace: dict) -> str:
+        """Picks a reply back up after the token ceiling cut it off, and returns
+        the whole thing joined. Delivery is already handled - `chunk_text` splits
+        the joined answer across as many Discord messages as it needs.
+
+        Tools are deliberately not offered here: the model has said its piece
+        about what it needs, and a continuation that starts a fresh lookup would
+        blow past both the round cap and the timeout. `messages` is left as it
+        was found, so the caller's conversation is not polluted by the retry."""
+        parts = [text]
+        for attempt in range(MAX_CONTINUATIONS):
+            so_far = "".join(parts)
+            # The join happens up front so the live edit and the final answer
+            # agree; deciding the separator afterwards made the message shift by
+            # a space at the end of every continuation.
+            joiner = "" if so_far.endswith((" ", "\n")) else " "
+
+            async def on_more(chunk: str, _base: str = so_far + joiner) -> None:
+                # The stream callback gets the text produced so far in ITS
+                # request; the reader wants the whole answer, so re-attach what
+                # is already written.
+                await on_text(_base + chunk)
+
+            payload = {
+                "model": self.model,
+                "messages": messages + [
+                    {"role": "assistant", "content": so_far},
+                    {"role": "user", "content": CONTINUE_NOTICE},
+                ],
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+            more, _calls, finish_reason = await self._stream_completion(payload, on_more)
+            trace["continuations"] = attempt + 1
+            if not (more or "").strip():
+                break
+            parts.append(joiner + more)
+            if finish_reason != "length":
+                break
+        else:
+            logger.info("aguiliar: still truncated after %s continuations", MAX_CONTINUATIONS)
+        return "".join(parts)
 
     def _tool_schemas(self) -> List[dict]:
         """The tools this instance can actually honour. Declaring read_web_search
@@ -2076,9 +2147,11 @@ class Aguiliar(commands.Cog):
 
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.info(
-            "aguiliar: guild=%s channel=%s user=%s status=%s rounds=%s tools=%s duration=%sms chars=%s",
+            "aguiliar: guild=%s channel=%s user=%s status=%s rounds=%s tools=%s "
+            "continuations=%s duration=%sms chars=%s",
             message.guild.id, message.channel.id, message.author.id, status,
-            trace["rounds"], [c["name"] for c in trace["tool_calls"]], duration_ms, len(answer),
+            trace["rounds"], [c["name"] for c in trace["tool_calls"]],
+            trace.get("continuations", 0), duration_ms, len(answer),
         )
         # Only a real answer is logged as one. On a failure the text on screen is
         # this module's apology, not something the model produced, and logging
