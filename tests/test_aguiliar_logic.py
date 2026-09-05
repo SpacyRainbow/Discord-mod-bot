@@ -10,6 +10,7 @@ from bot.modules.aguiliar import (
     DEFAULT_TIMEZONE,
     HISTORY_LIMIT_MAX,
     HISTORY_OFFSET_MAX,
+    LIVE_PREVIEW_CHARS,
     MAX_CONTINUATIONS,
     MAX_TOOL_ROUNDS,
     MODAL_TEXT_MAX,
@@ -18,6 +19,7 @@ from bot.modules.aguiliar import (
     Aguiliar,
     build_identity_block,
     build_system_prompt,
+    live_preview,
     channel_allowed,
     chunk_text,
     clamp_limit,
@@ -2056,3 +2058,29 @@ def test_two_images_in_one_reply_get_distinct_refs():
         assert note_images(_Slotted(), source) == " [image2]"
     finally:
         _images_var.reset(token)
+
+
+def test_live_preview_shows_short_text_whole():
+    assert live_preview("short answer") == "short answer"
+
+
+def test_live_preview_follows_the_tail_once_it_outgrows_a_message():
+    # The regression this exists for: a long reply used to freeze on screen at
+    # its FIRST 1990 characters while generation carried on for minutes.
+    text = "A" * 3000 + "THE-WRITING-EDGE"
+    shown = live_preview(text)
+    assert shown.endswith("THE-WRITING-EDGE")
+    assert shown.startswith("… ")
+    assert len(shown) == LIVE_PREVIEW_CHARS
+
+
+def test_live_preview_leaves_room_for_the_streaming_ellipsis():
+    # on_text appends " …" to whatever this returns; the sum must still fit in
+    # a Discord message.
+    assert len(live_preview("B" * 5000) + " …") <= 2000
+
+
+def test_live_preview_is_exact_at_the_boundary():
+    edge = "C" * LIVE_PREVIEW_CHARS
+    assert live_preview(edge) == edge
+    assert live_preview(edge + "D").endswith("D")

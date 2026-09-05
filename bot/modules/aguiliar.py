@@ -316,6 +316,26 @@ MAX_QUEUED = 2
 # simply nothing new worth showing more often than this.
 EDIT_INTERVAL_SECONDS = 2.0
 
+# A Discord message caps at 2000 characters, and the placeholder is edited in
+# place while the answer streams. Showing the FIRST 1990 characters meant a long
+# reply froze on screen the moment it passed that length: the text stopped
+# changing while generation carried on for minutes, which reads as a hung bot
+# rather than a working one. A 5,735-character maths answer on 2026-09-05 sat
+# visibly still for most of its 18 minutes for exactly this reason.
+# The writing edge is the end worth watching, so past the cap the preview
+# follows the TAIL. Final delivery is untouched - chunk_text still sends the
+# whole answer across as many messages as it needs.
+LIVE_PREVIEW_CHARS = 1990
+
+
+def live_preview(text: str) -> str:
+    """What the placeholder shows mid-stream. Short text is shown whole; once it
+    outgrows one message the newest characters win, so progress stays visible
+    for the entire generation instead of only its first page."""
+    if len(text) <= LIVE_PREVIEW_CHARS:
+        return text
+    return "… " + text[-(LIVE_PREVIEW_CHARS - 2):]
+
 # Voice and formatting deliberately do NOT appear here any more. They used to
 # ("keep replies short", "plain text only"), which meant the code-owned half and
 # the persona were both legislating style and the persona could not win. The
@@ -2443,12 +2463,19 @@ class Aguiliar(commands.Cog):
         async def on_text(current: str) -> None:
             nonlocal last_edit, last_shown
             now = time.monotonic()
-            if now - last_edit < EDIT_INTERVAL_SECONDS or current == last_shown:
+            if now - last_edit < EDIT_INTERVAL_SECONDS:
+                return
+            # Compare what will actually be RENDERED rather than the raw answer.
+            # Past the preview cap two different answers can render to the same
+            # string, and editing a message to the text it already holds spends
+            # a Discord call to show the reader nothing.
+            content = live_preview(compose(current)) + " …"
+            if content == last_shown:
                 return
             last_edit = now
-            last_shown = current
+            last_shown = content
             try:
-                await placeholder.edit(content=compose(current)[:1990] + " …")
+                await placeholder.edit(content=content)
             except discord.HTTPException:
                 pass
 
@@ -2471,7 +2498,7 @@ class Aguiliar(commands.Cog):
             last_edit = time.monotonic()
             last_shown = ""
             try:
-                await placeholder.edit(content=compose()[:1990])
+                await placeholder.edit(content=live_preview(compose()))
             except discord.HTTPException:
                 pass
 
