@@ -2913,8 +2913,10 @@ class Aguiliar(commands.Cog):
         in it is not described to the model AND is refused by _dispatch_tool if
         it asks anyway - two independent gates, because a tool that is merely
         undescribed is still nameable. Autonomous mode passes a much smaller set
-        (AUTONOMOUS_ACT_TOOLS); it therefore also has its own prompt prefix,
-        which is expected: it already has a different system prompt.
+        (AUTONOMOUS_ACT_TOOLS). act_react_to_message is deliberately FIRST in
+        ACT_TOOL_SCHEMAS so that the autonomous list is a strict prefix of the
+        full one: with the system prompt now identical either way, an
+        alternation reprocesses only the acts beyond it, not the whole prefix.
         """
         schemas = TOOL_SCHEMAS + EXTRA_READ_TOOL_SCHEMAS
         if self.search_url:
@@ -4523,8 +4525,16 @@ class Aguiliar(commands.Cog):
             entries.append((hist.author.display_name,
                             resolve_mentions(hist.content or "", channel.guild) + marker))
         persona = await self.bot.stores.config.get(channel.guild.id, "llm.persona", None)
+        # Same narrate value as a ping. There is one llama-server slot, so a
+        # system prompt that differs here evicts the cached ping prefix and the
+        # next member to @ the bot pays a cold one - measured at 429-483s. The
+        # tool block still diverges, but act_react_to_message is first in
+        # ACT_TOOL_SCHEMAS, so the autonomous prompt stays a strict prefix of
+        # the ping's and the reprocessing is a few hundred tokens, not all of it.
+        narrate = await self.bot.stores.config.get_bool(
+            channel.guild.id, "llm.narrate", False)
         system = build_system_prompt(persona, self._identity_block(channel.guild),
-                                     self._bot_name())
+                                     self._bot_name(), narrate=narrate)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": (

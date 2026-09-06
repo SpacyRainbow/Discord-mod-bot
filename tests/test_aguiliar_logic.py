@@ -1631,10 +1631,16 @@ async def test_the_warm_up_and_a_real_ping_build_the_same_system_prompt():
     import inspect
     import bot.modules.aguiliar as mod
     source = inspect.getsource(mod.Aguiliar)
-    assert source.count('"llm.narrate"') == 3, (
-        "llm.narrate must be read in the ping path, the warm-up and the digest - "
-        "all three build a system prompt against the one shared slot"
+    assert source.count('"llm.narrate"') == 4, (
+        "llm.narrate must be read in the ping path, the warm-up, the digest AND "
+        "the autonomous pass - all four build a system prompt against the one "
+        "shared slot, and the autonomous one was the path that forgot"
     )
+    # Named explicitly, because the count alone would be satisfied by any
+    # fourth reader. This is the one that regressed.
+    auto = inspect.getsource(mod.Aguiliar._autonomous_participate)
+    assert '"llm.narrate"' in auto
+    assert "narrate=narrate" in auto
 
 
 # --- the reasoning survives the tool call -------------------------------------
@@ -3674,6 +3680,7 @@ async def test_the_dry_pass_scores_from_fetched_history_not_the_live_window():
     cog._can = MagicMock(return_value=True)
     cog._load_auto_state = AsyncMock(return_value=AutonomyState())
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     cog._last_spoke[5] = 0.0  # idle, so only the channel numbers are in play
     rows, checked, skipped = await cog._autonomous_dry_pass(
         guild, AutonomyConfig(enabled=True, all_channels=True, chance_percent=0))
@@ -3698,6 +3705,7 @@ async def test_the_dry_pass_does_not_touch_the_live_tracker_or_any_cooldown():
     cog._load_auto_state = AsyncMock(return_value=state)
     cog._save_auto_state = AsyncMock()
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     await cog._autonomous_dry_pass(guild, AutonomyConfig(enabled=True, all_channels=True))
     assert list(cog._activity.channels()) == [], "the live window must stay untouched"
     assert state.last_eval == {} and state.last_action_at == 0.0
@@ -3718,6 +3726,7 @@ async def test_the_dry_pass_never_calls_the_model():
     cog._can = MagicMock(return_value=True)
     cog._load_auto_state = AsyncMock(return_value=AutonomyState())
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     await cog._autonomous_dry_pass(guild, AutonomyConfig(enabled=True, all_channels=True))
     cog._converse.assert_not_awaited()
 
@@ -3736,6 +3745,7 @@ async def test_the_dry_pass_reports_why_a_channel_would_be_skipped():
     cog._can = MagicMock(return_value=True)
     cog._load_auto_state = AsyncMock(return_value=AutonomyState())
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     cog._last_spoke[5] = 0.0
     rows, _, _ = await cog._autonomous_dry_pass(
         guild, AutonomyConfig(enabled=True, all_channels=True))
@@ -3754,6 +3764,7 @@ async def test_the_dry_pass_skips_channels_it_cannot_read():
     cog._can = MagicMock(return_value=False)
     cog._load_auto_state = AsyncMock(return_value=AutonomyState())
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     rows, checked, skipped = await cog._autonomous_dry_pass(
         guild, AutonomyConfig(enabled=True, all_channels=True))
     assert checked == 0 and skipped == 1 and rows == []
@@ -3779,6 +3790,7 @@ async def test_a_forced_pass_still_only_gets_the_reaction_allowlist():
     channel.guild = MagicMock()
     channel.guild.id = 5
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     cog._identity_block = MagicMock(return_value="")
     action, detail = await cog._autonomous_participate(
         channel, AutonomyConfig(enabled=True), AutonomyState(), ChannelStats(),
@@ -3799,6 +3811,7 @@ async def test_a_forced_no_action_is_reported_as_a_real_answer():
     channel.guild = MagicMock()
     channel.guild.id = 5
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     cog._identity_block = MagicMock(return_value="")
     action, _ = await cog._autonomous_participate(
         channel, AutonomyConfig(enabled=True), AutonomyState(), ChannelStats(),
@@ -3818,6 +3831,7 @@ async def test_a_forced_action_still_spends_the_cooldowns():
     channel.guild.id = 5
     channel.send = AsyncMock()
     cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog.bot.stores.config.get_bool = AsyncMock(return_value=False)
     cog._identity_block = MagicMock(return_value="")
     action, _ = await cog._autonomous_participate(
         channel, AutonomyConfig(enabled=True), state, ChannelStats(),
