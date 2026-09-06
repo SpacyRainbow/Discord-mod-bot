@@ -18,6 +18,7 @@ from bot.modules.aguiliar import (
     SAFETY_PREAMBLE,
     Aguiliar,
     build_identity_block,
+    resolve_mentions,
     build_system_prompt,
     live_preview,
     channel_allowed,
@@ -2280,3 +2281,82 @@ async def test_context_row_finds_an_exchange_by_id(db):
     assert "second" in newest[6]
     assert "first" in (await cog.bot.stores.llm_log.context_row(7, newest[0] - 1))[6]
     assert await cog.bot.stores.llm_log.context_row(7, 99999) is None
+
+
+# --- mentions resolve to names before sanitize deletes them ------------------
+
+
+class _FakeNamed:
+    def __init__(self, name):
+        self.display_name = name
+        self.name = name
+
+
+class _FakeGuild:
+    def __init__(self, members=None, roles=None, channels=None):
+        self._members = members or {}
+        self._roles = roles or {}
+        self._channels = channels or {}
+
+    def get_member(self, mid):
+        return self._members.get(mid)
+
+    def get_role(self, rid):
+        return self._roles.get(rid)
+
+    def get_channel(self, cid):
+        return self._channels.get(cid)
+
+
+def test_a_user_mention_becomes_the_display_name():
+    guild = _FakeGuild(members={123: _FakeNamed("Maximo")})
+    assert resolve_mentions("roast <@123> for the diet", guild) == "roast @Maximo for the diet"
+
+
+def test_the_nickname_form_of_a_mention_resolves_too():
+    guild = _FakeGuild(members={123: _FakeNamed("Maximo")})
+    assert resolve_mentions("<@!123> again", guild) == "@Maximo again"
+
+
+def test_the_bug_a_mention_is_not_silently_deleted_from_the_question():
+    """The regression this exists for: the target of a roast was stripped out
+    and the model was blamed for asking who was meant."""
+    guild = _FakeGuild(members={9: _FakeNamed("Sarah")})
+    raw = "roast <@9> for being the fattest thing in the planet"
+    assert sanitize(resolve_mentions(raw, guild)) == (
+        "roast @Sarah for being the fattest thing in the planet"
+    )
+    # and what used to happen
+    assert "Sarah" not in sanitize(raw)
+
+
+def test_role_and_channel_mentions_resolve():
+    guild = _FakeGuild(roles={7: _FakeNamed("Mods")}, channels={8: _FakeNamed("no-mic")})
+    assert resolve_mentions("<@&7> in <#8>", guild) == "@Mods in #no-mic"
+
+
+def test_an_unresolvable_mention_becomes_a_placeholder_not_an_id():
+    guild = _FakeGuild()
+    out = resolve_mentions("hey <@999> and <@&998> in <#997>", guild)
+    assert "999" not in out and "998" not in out and "997" not in out
+    assert out == "hey @someone and @a role in #a channel"
+
+
+def test_no_raw_id_survives_to_the_model():
+    """The property sanitize() was protecting must still hold after resolving."""
+    guild = _FakeGuild(members={123: _FakeNamed("Maximo")})
+    assert "123" not in sanitize(resolve_mentions("<@123> hi", guild))
+
+
+def test_a_display_name_carrying_mention_syntax_is_still_stripped():
+    """Display names are attacker-controlled; sanitize stays the backstop."""
+    guild = _FakeGuild(members={1: _FakeNamed("<@everyone> lol")})
+    assert "<@" not in sanitize(resolve_mentions("<@1> hi", guild))
+
+
+def test_text_without_mentions_is_returned_untouched():
+    assert resolve_mentions("no mentions here", _FakeGuild()) == "no mentions here"
+
+
+def test_a_missing_guild_does_not_raise():
+    assert resolve_mentions("<@1> hi", None) == "@someone hi"

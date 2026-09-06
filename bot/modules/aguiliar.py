@@ -722,6 +722,72 @@ def sanitize(text: str, cap: int = MESSAGE_CHAR_CAP) -> str:
     return cleaned
 
 
+_USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
+_CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
+
+
+def resolve_mentions(text: str, guild: Any) -> str:
+    """Rewrites Discord mention syntax to the NAME it refers to, before
+    sanitize() deletes it.
+
+    sanitize() strips `<@123>` to nothing, which is right for an ID the model
+    must never parrot back and wrong for everything else: "roast <@123> for
+    being the fattest thing on the planet" reached the model as "roast for
+    being the fattest thing on the planet, ... her", a sentence with its
+    subject removed. The model asked who "her" was and looked like it was
+    dodging the request. It could not have answered - the person had been
+    edited out of the question.
+
+    Names, not IDs, so the property sanitize() protects is kept: nothing here
+    puts a raw ID in front of the model, and a name it repeats back renders as
+    plain text, not a ping. Unresolvable IDs (uncached member, deleted channel)
+    become a neutral placeholder rather than the ID - a gap the model can see
+    and mention beats a hole it cannot.
+
+    Runs BEFORE sanitize, never instead of it: a display name is attacker-
+    controlled text and can itself contain mention syntax, so sanitize() stays
+    the backstop that strips whatever this leaves behind.
+    """
+    if not text or "<" not in text:
+        return text
+
+    def user_name(match: "re.Match[str]") -> str:
+        member = None
+        if guild is not None:
+            try:
+                member = guild.get_member(int(match.group(1)))
+            except (AttributeError, ValueError, OverflowError):
+                member = None
+        name = getattr(member, "display_name", "") if member else ""
+        return f"@{name}" if name else "@someone"
+
+    def role_name(match: "re.Match[str]") -> str:
+        role = None
+        if guild is not None:
+            try:
+                role = guild.get_role(int(match.group(1)))
+            except (AttributeError, ValueError, OverflowError):
+                role = None
+        name = getattr(role, "name", "") if role else ""
+        return f"@{name}" if name else "@a role"
+
+    def channel_name(match: "re.Match[str]") -> str:
+        channel = None
+        if guild is not None:
+            try:
+                channel = guild.get_channel(int(match.group(1)))
+            except (AttributeError, ValueError, OverflowError):
+                channel = None
+        name = getattr(channel, "name", "") if channel else ""
+        return f"#{name}" if name else "#a channel"
+
+    text = _USER_MENTION_RE.sub(user_name, text)
+    text = _ROLE_MENTION_RE.sub(role_name, text)
+    text = _CHANNEL_MENTION_RE.sub(channel_name, text)
+    return text
+
+
 def clamp_limit(raw: Any, default: int = HISTORY_LIMIT_DEFAULT) -> int:
     """Coerces the model's `limit` to a sane int. Anything unparseable becomes
     the default rather than an error - the round is expensive, don't waste it."""
@@ -1399,7 +1465,8 @@ class Aguiliar(commands.Cog):
                 # The marker is what makes read_image reachable: without it the
                 # model has no way to know a picture is there to look at.
                 entries.append((hist.author.display_name,
-                                (hist.content or "") + note_images(message, hist)))
+                                resolve_mentions(hist.content or "", message.guild)
+                                + note_images(message, hist)))
         except (discord.Forbidden, discord.HTTPException) as exc:
             logger.warning("aguiliar: history read failed: %s", exc)
             return json.dumps({"error": "could not read channel history"})
@@ -1514,7 +1581,8 @@ class Aguiliar(commands.Cog):
             # fetch_message is bounded to this channel, so a cross-channel reply
             # simply ends the walk rather than reaching anywhere new.
             entries.append((resolved.author.display_name,
-                            (resolved.content or "") + note_images(message, resolved)))
+                            resolve_mentions(resolved.content or "", message.guild)
+                            + note_images(message, resolved)))
             current = resolved
         entries.reverse()
         return render_messages(entries)
@@ -1565,7 +1633,8 @@ class Aguiliar(commands.Cog):
             lines.append(f"Pinned ({len(pins)}), newest first:")
             for pin in list(pins)[:PIN_PREVIEW_MAX]:
                 who = sanitize(str(getattr(pin.author, "display_name", "?")), 40)
-                lines.append(f"  {who}: {sanitize(pin.content or '(no text)', 160)}")
+                lines.append(f"  {who}: "
+                             f"{sanitize(resolve_mentions(pin.content or '(no text)', message.guild), 160)}")
         else:
             lines.append("Pinned: none")
 
@@ -1912,7 +1981,8 @@ class Aguiliar(commands.Cog):
                     # the bot's own last turn, which is exactly what a "why?"
                     # refers back to.
                     anchor_id = hist.id
-                    text = (hist.content or "") + note_images(message, hist)
+                    text = (resolve_mentions(hist.content or "", message.guild)
+                            + note_images(message, hist))
                     if text.strip():
                         collected.append((self._bot_name(), text))
                         collected_ids.append(hist.id)
@@ -1921,7 +1991,8 @@ class Aguiliar(commands.Cog):
                 # lines, starboard reposts.
                 if hist.author.bot:
                     continue
-                text = (hist.content or "") + note_images(message, hist)
+                text = (resolve_mentions(hist.content or "", message.guild)
+                        + note_images(message, hist))
                 if text.strip():
                     collected.append((hist.author.display_name, text))
                     collected_ids.append(hist.id)
@@ -1978,11 +2049,13 @@ class Aguiliar(commands.Cog):
             return "", "bot_turn"    # going in as an assistant turn instead
         author = sanitize(str(getattr(reply_parent.author, "display_name", "")), 40)
         if reply_parent.id in gap_ids:
-            head = sanitize(reply_parent.content or "", REPLY_LOCATOR_CHAR_CAP)
+            head = sanitize(resolve_mentions(reply_parent.content or "", getattr(reply_parent, "guild", None)),
+                            REPLY_LOCATOR_CHAR_CAP)
             if not head:
                 return "", "none"
             return f"They are replying to {author}'s message above: \"{head}\"\n", "locator"
-        said = sanitize(reply_parent.content or "", REPLY_QUOTE_CHAR_CAP)
+        said = sanitize(resolve_mentions(reply_parent.content or "", getattr(reply_parent, "guild", None)),
+                        REPLY_QUOTE_CHAR_CAP)
         if not said:
             return "", "none"
         return (f"They are replying to this earlier message from {author}, "
@@ -2107,7 +2180,7 @@ class Aguiliar(commands.Cog):
             # Directly above their message, because that is what it belongs to.
             f"{quoted}"
             f"{attached}"
-            f"{who}: {sanitize(message.content, 1000)}"
+            f"{who}: {sanitize(resolve_mentions(message.content, message.guild), 1000)}"
         )
         if replying_to is not None:
             # A reply is a definite continuation, so the thing being replied to
@@ -2115,7 +2188,8 @@ class Aguiliar(commands.Cog):
             # test, no judgement call, and no tool round to go and find it. If
             # short-term memory already ended with that same text, it is not
             # repeated.
-            said = sanitize(replying_to.content or "", TOOL_RESULT_CHAR_CAP)
+            said = sanitize(resolve_mentions(replying_to.content or "", getattr(replying_to, "guild", None)),
+                            TOOL_RESULT_CHAR_CAP)
             # When the reply target IS the gap anchor it is already the first
             # line of the transcript, in context, with everything said after it.
             # Printing it again as an assistant turn would duplicate it.
