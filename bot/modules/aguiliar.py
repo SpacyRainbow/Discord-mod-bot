@@ -114,6 +114,7 @@ import asyncio
 import base64
 import contextvars
 import datetime
+import io
 import json
 import logging
 import os
@@ -222,6 +223,10 @@ REPLY_QUOTE_CHAR_CAP = 600
 # When the quoted message is already in the gap transcript, only a locator is
 # printed - enough to say WHICH line, not enough to duplicate it.
 REPLY_LOCATOR_CHAR_CAP = 80
+# How much of the user turn is kept in llm_log.context. Comfortably above a
+# full gap transcript plus a full quote, so in practice nothing is lost; the
+# cap only exists so one pathological row cannot bloat the database.
+CONTEXT_LOG_CHAR_CAP = 4000
 # Web search, sized by the clock rather than by taste. Every snippet is prompt
 # the model has to reprocess at ~5 tokens/sec, so 5 results at 300 characters is
 # roughly 400 tokens and about a minute and a half added to the reply. Raising
@@ -370,6 +375,14 @@ _gap_var: "contextvars.ContextVar[Optional[Tuple[int, int]]]" = contextvars.Cont
 )
 _images_var: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
     "aguiliar_images", default=None
+)
+# What the model was SHOWN for this reply: the verbatim user turn and the
+# counts describing how it was assembled. Set once, at the end of
+# _build_messages, and read by _log_exchange - so the log records the prompt
+# that actually went out rather than a reconstruction of what the code
+# probably did. Every "did it even see that" question ends here.
+_prompt_var: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
+    "aguiliar_prompt", default=None
 )
 
 
@@ -1918,7 +1931,7 @@ class Aguiliar(commands.Cog):
 
     def _reply_quote(self, reply_parent: Optional[discord.Message],
                      replying_to: Optional[discord.Message],
-                     gap_ids: FrozenSet[int]) -> str:
+                     gap_ids: FrozenSet[int]) -> Tuple[str, str]:
         """The message being replied to, shown when nobody else will show it.
 
         Replying to the BOT is handled elsewhere and better - that parent goes
@@ -1929,23 +1942,27 @@ class Aguiliar(commands.Cog):
 
         A parent already in the gap transcript gets a locator instead of a
         second copy - it is in front of the model either way, and the transcript
-        keeps it in sequence with everything said after it."""
+        keeps it in sequence with everything said after it.
+
+        Returns the text and the MODE that produced it - 'none', 'bot_turn',
+        'quote' or 'locator' - which goes straight into llm_log so which of
+        these four paths ran is a recorded fact, not an inference."""
         if reply_parent is None:
-            return ""
+            return "", "none"
         if replying_to is not None and reply_parent.id == replying_to.id:
-            return ""            # going in as an assistant turn instead
+            return "", "bot_turn"    # going in as an assistant turn instead
         author = sanitize(str(getattr(reply_parent.author, "display_name", "")), 40)
         if reply_parent.id in gap_ids:
             head = sanitize(reply_parent.content or "", REPLY_LOCATOR_CHAR_CAP)
             if not head:
-                return ""
-            return f"They are replying to {author}'s message above: \"{head}\"\n"
+                return "", "none"
+            return f"They are replying to {author}'s message above: \"{head}\"\n", "locator"
         said = sanitize(reply_parent.content or "", REPLY_QUOTE_CHAR_CAP)
         if not said:
-            return ""
+            return "", "none"
         return (f"They are replying to this earlier message from {author}, "
                 f"which is what their message below refers to:\n"
-                f"\"{said}\"\n")
+                f"\"{said}\"\n"), "quote"
 
     async def _image_parts(self, message: discord.Message) -> List[dict]:
         """Downscaled data URIs for images attached to the message being answered.
@@ -2029,7 +2046,7 @@ class Aguiliar(commands.Cog):
         _gap_var.set((gap_count, gap_chars))
         attached = ("They attached an image; it is shown to you below.\n"
                     if image_attachments(message) else "")
-        quoted = self._reply_quote(reply_parent, replying_to, gap_ids)
+        quoted, reply_mode = self._reply_quote(reply_parent, replying_to, gap_ids)
         # Volatile facts live here, in the user turn, never in the system prompt.
         # ORDERED MOST STABLE -> MOST VOLATILE, deliberately. The prompt cache
         # reuses up to the first differing token, so anything printed after a
@@ -2081,6 +2098,17 @@ class Aguiliar(commands.Cog):
             if said and not already_in_gap and not (
                     history and history[-1].get("content", "") == said):
                 history.append({"role": "assistant", "content": said})
+        # Counted BEFORE the turns below are added, so this is the replayed
+        # memory alone - including the reply target when it went in as an
+        # assistant turn, which is why it is counted after that append.
+        history_turns = len(history)
+        _prompt_var.set({
+            "context": context[:CONTEXT_LOG_CHAR_CAP],
+            "reply_mode": reply_mode,
+            "reply_chars": len(quoted),
+            "reply_parent_id": reply_parent.id if reply_parent is not None else None,
+            "history_turns": history_turns,
+        })
         messages.extend(history)
         # The image rides in the SAME user turn as the context block, so the
         # model never has to correlate a picture with a separate message.
@@ -2390,7 +2418,8 @@ class Aguiliar(commands.Cog):
             return
         embed = discord.Embed(title=f"Last {len(rows)} LLM exchanges", color=discord.Color.blurple())
         for (created, channel_name, user_name, prompt, reply, tool_calls, rounds,
-             duration_ms, status, error, prompt_tokens, cached_tokens, gap_messages) in rows:
+             duration_ms, status, error, prompt_tokens, cached_tokens, gap_messages,
+             reply_mode, history_turns) in rows:
             try:
                 names = ", ".join(call.get("name", "?") for call in json.loads(tool_calls or "[]"))
             except ValueError:
@@ -2406,6 +2435,13 @@ class Aguiliar(commands.Cog):
                     cost += f", gap {gap_messages}"
             else:
                 cost = ""
+            # Which of the four reply paths ran, and how many memory turns were
+            # replayed. Both were previously invisible, which is exactly how a
+            # reply the model never saw looked identical to one it ignored.
+            if reply_mode and reply_mode != "none":
+                cost += f", reply:{reply_mode}"
+            if history_turns:
+                cost += f", mem {history_turns}"
             head = f"{created[:19].replace('T', ' ')} - #{channel_name or '?'} - {user_name or '?'}"
             body = (
                 f"**{'' if status == 'ok' else status.upper() + ': '}**"
@@ -2417,6 +2453,55 @@ class Aguiliar(commands.Cog):
             )
             embed.add_field(name=head[:256], value=body[:1024], inline=False)
         await ctx.send(embed=embed)
+
+    @commands.hybrid_command(
+        name="llmcontext",
+        description="Show exactly what the model was shown for one exchange",
+    )
+    @commands.has_permissions(manage_guild=True)
+    async def llmcontext(self, ctx: commands.Context, exchange_id: Optional[int] = None):
+        """The verbatim user turn behind one logged reply, newest by default.
+
+        /llmlog says what came out. This says what went IN, character for
+        character, which is the only way to tell "the model ignored it" from
+        "the model was never shown it" without reading the code and guessing."""
+        if ctx.guild is None:
+            await ctx.send("That only works in a server.")
+            return
+        row = await self.bot.stores.llm_log.context_row(ctx.guild.id, exchange_id)
+        if row is None:
+            await ctx.send("No such exchange." if exchange_id else "Nothing logged yet.")
+            return
+        (row_id, created, channel_name, user_name, _prompt, _reply, context,
+         reply_mode, reply_chars, reply_parent_id, history_turns,
+         gap_messages, gap_chars, prompt_tokens, cached_tokens) = row
+        if not context:
+            # Rows written before this column existed, and rows whose reply died
+            # before the prompt was assembled. Say which rather than show blank.
+            await ctx.send(
+                f"Exchange {row_id} has no recorded context - it was logged "
+                f"before context logging existed, or it failed before the "
+                f"prompt was built."
+            )
+            return
+        facts = (
+            f"**Exchange {row_id}** - {created[:19].replace('T', ' ')} - "
+            f"#{channel_name or '?'} - {user_name or '?'}\n"
+            f"`reply:{reply_mode or 'none'}"
+            f"{f' (parent {reply_parent_id}, {reply_chars} chars)' if reply_chars else ''}"
+            f", mem {history_turns or 0} turn(s)"
+            f", gap {gap_messages or 0} msg/{gap_chars or 0} chars"
+            f", {prompt_tokens or 0} prompt tokens ({cached_tokens or 0} cached)`"
+        )
+        # As a file, not a code block: a full context runs past Discord's
+        # 2000-character limit routinely, and a truncated copy of the evidence
+        # is the thing this command exists to stop.
+        buffer = io.BytesIO(context.encode("utf-8"))
+        await ctx.send(
+            facts,
+            file=discord.File(buffer, filename=f"context-{row_id}.txt"),
+            ephemeral=True,
+        )
 
     @commands.hybrid_command(name="setpersona", description="Edit the bot's personality (opens a form)")
     @commands.has_permissions(manage_guild=True)
@@ -2543,6 +2628,7 @@ class Aguiliar(commands.Cog):
         # every request the reply goes on to make lands in the same one.
         _usage_var.set({"prompt_tokens": 0, "cached_tokens": 0, "requests": 0})
         _gap_var.set(None)
+        _prompt_var.set(None)
         _images_var.set({})
         try:
             placeholder = await message.reply("*thinking…*", mention_author=False)
@@ -2674,6 +2760,9 @@ class Aguiliar(commands.Cog):
         answer. Successes and failures both land here."""
         usage = _usage_var.get() or {}
         gap_count, gap_chars = _gap_var.get() or (0, 0)
+        # Empty when the reply died before the prompt was built - a timeout row
+        # with no context is itself the finding, so it is not faked up here.
+        assembled = _prompt_var.get() or {}
         try:
             await self.bot.stores.llm_log.add(
                 guild_id=message.guild.id,
@@ -2693,6 +2782,11 @@ class Aguiliar(commands.Cog):
                 cached_tokens=usage.get("cached_tokens") or None,
                 gap_messages=gap_count or None,
                 gap_chars=gap_chars or None,
+                context=assembled.get("context"),
+                reply_mode=assembled.get("reply_mode"),
+                reply_chars=assembled.get("reply_chars"),
+                reply_parent_id=assembled.get("reply_parent_id"),
+                history_turns=assembled.get("history_turns"),
             )
         except Exception:
             logger.warning("aguiliar: could not write the exchange log", exc_info=True)

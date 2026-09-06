@@ -2207,3 +2207,76 @@ def test_trim_gap_keeps_the_protected_entry_past_both_caps():
 def test_trim_gap_without_a_protected_entry_is_unchanged():
     entries = [("a", "x" * 400), ("b", "y" * 400), ("c", "z")]
     assert trim_gap(entries, 5, char_cap=100) == ([("c", "z")], True)
+
+
+# --- the log records what was SHOWN, not just what came back ----------------
+
+
+@pytest.mark.asyncio
+async def test_the_log_keeps_the_verbatim_context(db):
+    """The whole point: the row proves what went in. Reconstructing the prompt
+    from the code is how "it ignored the reply" and "it never saw the reply"
+    stayed indistinguishable for a day."""
+    cog = _gap_prompt_cog(db, [_gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42)])
+    cog._converse = AsyncMock(return_value="an answer")
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 1
+    parent.content = "the referent nobody could see"
+    parent.author = MagicMock(id=99, display_name="Raheem")
+
+    await cog._respond(_gap_live_message([]), 200, reply_parent=parent)
+
+    row = await cog.bot.stores.llm_log.context_row(7)
+    (_id, _created, _channel, _user, _prompt, _reply, context, reply_mode,
+     reply_chars, reply_parent_id, history_turns, *_rest) = row
+    assert "the referent nobody could see" in context
+    assert reply_mode == "quote"
+    assert reply_parent_id == 1
+    assert reply_chars > 0
+    assert history_turns == 0
+
+
+@pytest.mark.asyncio
+async def test_the_log_names_which_reply_path_ran(db):
+    """Four paths produce four different prompts. Which one ran is recorded,
+    not inferred from the shape of the context."""
+    items = [_gap_item(5, "Raheem", "in the transcript", minutes_ago=1),
+             _gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42, minutes_ago=2)]
+    cog = _gap_prompt_cog(db, items)
+    cog._converse = AsyncMock(return_value="an answer")
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 5
+    parent.content = "in the transcript"
+    parent.author = MagicMock(id=99, display_name="Raheem")
+
+    await cog._respond(_gap_live_message(items), 200, reply_parent=parent)
+    assert (await cog.bot.stores.llm_log.context_row(7))[7] == "locator"
+
+    await cog._respond(_gap_live_message(items), 200)
+    assert (await cog.bot.stores.llm_log.context_row(7))[7] == "none"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reply_logs_no_invented_context(db):
+    """A row with no context is itself the finding - it says the prompt was
+    never built. Filling it in with a guess would destroy that."""
+    cog = _logging_cog(db)
+    cog._build_messages = AsyncMock(side_effect=RuntimeError("died early"))
+
+    await cog._respond(_live_message(), 200)
+
+    row = await cog.bot.stores.llm_log.context_row(7)
+    assert row[6] is None
+
+
+@pytest.mark.asyncio
+async def test_context_row_finds_an_exchange_by_id(db):
+    cog = _gap_prompt_cog(db, [_gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42)])
+    cog._converse = AsyncMock(return_value="an answer")
+    await cog._respond(_gap_live_message([], content="first"), 200)
+    await cog._respond(_gap_live_message([], content="second"), 200)
+
+    newest = await cog.bot.stores.llm_log.context_row(7)
+    assert "second" in newest[6]
+    assert "first" in (await cog.bot.stores.llm_log.context_row(7, newest[0] - 1))[6]
+    assert await cog.bot.stores.llm_log.context_row(7, 99999) is None

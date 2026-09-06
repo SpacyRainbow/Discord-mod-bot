@@ -699,12 +699,18 @@ class LLMLogStore(_Store):
         cached_tokens: Optional[int] = None,
         gap_messages: Optional[int] = None,
         gap_chars: Optional[int] = None,
+        context: Optional[str] = None,
+        reply_mode: Optional[str] = None,
+        reply_chars: Optional[int] = None,
+        reply_parent_id: Optional[int] = None,
+        history_turns: Optional[int] = None,
     ) -> None:
         await self._write(
             "INSERT INTO llm_log (guild_id, channel_id, channel_name, user_id, user_name, "
             "prompt, reply, tool_calls, rounds, duration_ms, model, status, error, "
-            "prompt_tokens, cached_tokens, gap_messages, gap_chars, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "prompt_tokens, cached_tokens, gap_messages, gap_chars, context, "
+            "reply_mode, reply_chars, reply_parent_id, history_turns, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 guild_id,
                 channel_id,
@@ -723,6 +729,11 @@ class LLMLogStore(_Store):
                 cached_tokens,
                 gap_messages,
                 gap_chars,
+                context,
+                reply_mode,
+                reply_chars,
+                reply_parent_id,
+                history_turns,
                 datetime.datetime.now(datetime.timezone.utc).isoformat(),
             ),
             "Database unavailable, LLM exchange not logged",
@@ -745,9 +756,31 @@ class LLMLogStore(_Store):
         return await self._read_all(
             "SELECT created_at, channel_name, user_name, prompt, reply, tool_calls, "
             "rounds, duration_ms, status, error, prompt_tokens, cached_tokens, "
-            "gap_messages FROM llm_log "
+            "gap_messages, reply_mode, history_turns FROM llm_log "
             "WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             (guild_id, limit),
+        )
+
+    async def context_row(self, guild_id: int, row_id: Optional[int] = None):
+        """One exchange with the verbatim context that produced it.
+
+        Separate from recent_for_guild because the context is the biggest
+        column in the table and /llmlog lists twenty rows at a time - it is
+        fetched when somebody asks for exactly one."""
+        if row_id is None:
+            return await self._read_one(
+                "SELECT id, created_at, channel_name, user_name, prompt, reply, "
+                "context, reply_mode, reply_chars, reply_parent_id, history_turns, "
+                "gap_messages, gap_chars, prompt_tokens, cached_tokens "
+                "FROM llm_log WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (guild_id,),
+            )
+        return await self._read_one(
+            "SELECT id, created_at, channel_name, user_name, prompt, reply, "
+            "context, reply_mode, reply_chars, reply_parent_id, history_turns, "
+            "gap_messages, gap_chars, prompt_tokens, cached_tokens "
+            "FROM llm_log WHERE guild_id = ? AND id = ?",
+            (guild_id, row_id),
         )
 
     async def prune(self, older_than_iso: str) -> int:

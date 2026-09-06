@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS llm_log (
     cached_tokens INTEGER,
     gap_messages INTEGER,
     gap_chars INTEGER,
+    context TEXT,
+    reply_mode TEXT,
+    reply_chars INTEGER,
+    reply_parent_id INTEGER,
+    history_turns INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -212,6 +217,15 @@ ADDED_COLUMNS = [
     ("llm_log", "cached_tokens", "INTEGER"),
     ("llm_log", "gap_messages", "INTEGER"),
     ("llm_log", "gap_chars", "INTEGER"),
+    # What the model was actually SHOWN, so nobody has to reconstruct it from
+    # the code and guess. `context` is the verbatim user turn - the one piece
+    # of evidence that settles any "did it even see that" argument - and the
+    # rest are the parts of it that are cheap to filter and count on.
+    ("llm_log", "context", "TEXT"),
+    ("llm_log", "reply_mode", "TEXT"),
+    ("llm_log", "reply_chars", "INTEGER"),
+    ("llm_log", "reply_parent_id", "INTEGER"),
+    ("llm_log", "history_turns", "INTEGER"),
 ]
 
 

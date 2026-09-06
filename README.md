@@ -983,6 +983,18 @@ with a status and the error text, because a reply that never arrived is exactly
 the one worth looking at. `/llmlog [count]` shows the most recent ones and needs
 Manage Server. Rows older than `llm.logdays` are pruned once a day.
 
+Each row also records what the model was **shown**, not only what it said: the
+verbatim user turn, how many memory turns were replayed, how much of it was the
+gap transcript, and which of the four reply paths ran (`none`, `bot_turn`,
+`quote`, `locator`). `/llmlog` summarises that on the cost line;
+`/llmcontext [exchange_id]` attaches the whole context as a text file, newest
+exchange by default. That distinction matters more than it sounds: without it,
+"the model ignored what I replied to" and "the model was never shown what I
+replied to" produce identical-looking rows, and the second one is a bug.
+
+A row with an empty context is not a gap in the record — it means the reply
+failed before the prompt was assembled, which is itself the finding.
+
 Logging never gets in the way of a reply: it happens after the answer is on
 screen, and if the database is unavailable the bot loses the log row, not the
 answer.
