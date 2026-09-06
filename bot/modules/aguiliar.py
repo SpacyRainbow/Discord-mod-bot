@@ -406,6 +406,12 @@ NO_ACTION_TOKEN = "NO_ACTION"
 # than posted, and logged, because an unprompted wall of text is the exact
 # failure this feature has to avoid.
 AUTO_REPLY_CHAR_CAP = 320
+# /autocheck bounds. "all" on a large server is a lot of channels, and each one
+# is an API call, so the diagnostic is capped rather than allowed to become a
+# rate-limit incident somebody triggered by typing a slash command.
+AUTOCHECK_CHANNEL_MAX = 25
+AUTOCHECK_HISTORY_MAX = 60
+AUTOCHECK_REPORT_MAX = 8
 
 AUTO_PREAMBLE = """You were not mentioned. You are glancing at a conversation in
 #{channel} that has been going without you, the way somebody who has been away
@@ -3624,6 +3630,124 @@ class Aguiliar(commands.Cog):
             f"**This channel, as I have it** (written {when}):\n>>> {text}",
             ephemeral=True,
         )
+
+    @commands.hybrid_command(
+        name="autocheck",
+        description="Dry run of the autonomous wake-up: what it sees right now, and why it would not speak",
+    )
+    @commands.has_permissions(manage_guild=True)
+    async def autocheck(self, ctx: commands.Context):
+        """A pass over every eligible channel, on demand, changing nothing.
+
+        The background loop scores from an IN-MEMORY window that only fills as
+        people talk, so for the first `windowminutes` after a restart it is
+        empty and every channel scores zero. That makes "is this wired up
+        correctly" unanswerable exactly when somebody wants to ask it. This
+        backfills the same window from Discord history instead, so the numbers
+        are real immediately.
+
+        Read-only in every sense: a private tracker rather than the live one, no
+        cooldowns recorded, no evaluation cooldown spent, and THE MODEL IS NEVER
+        CALLED. It reports what the loop would decide, it does not decide it.
+        """
+        if ctx.guild is None:
+            await ctx.send("That only works in a server.")
+            return
+        config = await self._autonomy_config(ctx.guild.id)
+        if not config.enabled:
+            await ctx.send("`llm.auto.enabled` is off, so the loop would stop before looking.")
+            return
+        if not (config.channels or config.all_channels):
+            await ctx.send("`llm.auto.channels` is empty, which means NO channels. "
+                           "Set it to `all` or to a list of IDs.")
+            return
+        await ctx.defer(ephemeral=True)
+        rows, checked, skipped = await self._autonomous_dry_pass(ctx.guild, config)
+        state = await self._load_auto_state(ctx.guild.id)
+        idle = time.monotonic() - self._last_spoke.get(ctx.guild.id, 0.0)
+        embed = discord.Embed(
+            title="Autonomous wake-up - dry run",
+            description=(
+                f"Looked at **{checked}** channel(s), skipped **{skipped}** it cannot use.\n"
+                f"Idle **{idle / 60:.0f} min** (needs {config.idle_seconds / 60:.0f}), "
+                f"chance **{config.chance_percent}%**, "
+                f"used **{state.day_count}** of {config.max_per_day} today.\n"
+                f"Window {config.window_seconds / 60:.0f} min, "
+                f"needs {config.min_messages} msgs / {config.min_humans} humans / "
+                f"score {config.min_score:.0f}."
+            ),
+            color=discord.Color.blurple(),
+        )
+        if not rows:
+            embed.add_field(
+                name="No candidates",
+                value=("Nothing scored above zero. That is the normal answer in a quiet "
+                       "server - it needs several people talking inside the window."),
+                inline=False,
+            )
+        for name, stats, reasons in rows[:AUTOCHECK_REPORT_MAX]:
+            verdict = "**would speak** (only the dice left)" if not reasons else ", ".join(reasons)
+            embed.add_field(
+                name=f"#{name} - score {stats.score:.1f}",
+                value=(f"{stats.messages} msgs, {stats.humans} humans, "
+                       f"{stats.bot_messages} bot, newest {stats.newest_age:.0f}s ago, "
+                       f"busiest {stats.top_human_share:.0%}\n{verdict}"),
+                inline=False,
+            )
+        embed.set_footer(text="Nothing was sent, reacted to, or asked of the model.")
+        await ctx.send(embed=embed, ephemeral=True)
+
+    async def _autonomous_dry_pass(self, guild: discord.Guild, config: AutonomyConfig):
+        """Score every eligible channel from freshly fetched history.
+
+        Uses a throwaway ActivityTracker: the live one is the loop's state and
+        must not be seeded by a diagnostic, or running /autocheck would change
+        what the loop does next - which would make this tool a participant in
+        the thing it claims to observe.
+        """
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        now_utc = discord.utils.utcnow()
+        state = await self._load_auto_state(guild.id)
+        tz, _resolved = resolve_timezone(
+            await self.bot.stores.config.get(guild.id, "llm.timezone", None))
+        local = datetime.datetime.now(tz)
+        idle = now_mono - self._last_spoke.get(guild.id, 0.0)
+        probe = ActivityTracker()
+        rows, checked, skipped = [], 0, 0
+        after = now_utc - datetime.timedelta(seconds=config.window_seconds)
+        for channel_id in (await self._auto_candidate_ids(guild, config))[:AUTOCHECK_CHANNEL_MAX]:
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                skipped += 1
+                continue
+            if not self._can(channel, "read_message_history") or not self._can(channel, "send_messages"):
+                skipped += 1
+                continue
+            checked += 1
+            try:
+                async for hist in channel.history(limit=AUTOCHECK_HISTORY_MAX, after=after):
+                    # Real timestamps mapped onto the monotonic clock the
+                    # tracker speaks, so recency and the window behave exactly
+                    # as they do for the live loop.
+                    at = now_mono - (now_utc - hist.created_at).total_seconds()
+                    if self.bot.user is not None and hist.author.id == self.bot.user.id:
+                        probe.record_self(channel_id, at)
+                        continue
+                    probe.record(channel_id, hist.author.id, bool(hist.author.bot),
+                                 len((hist.content or "").strip()), at)
+            except (discord.Forbidden, discord.HTTPException):
+                skipped += 1
+                continue
+            stats = probe.stats(channel_id, config.window_seconds, now=now_mono)
+            if stats.messages == 0 and stats.bot_messages == 0:
+                continue
+            reasons = gate_reasons(config, state, idle_seconds=idle, channel_id=channel_id,
+                                   stats=stats, now=now_wall, local_hour=local.hour,
+                                   day=local.date().isoformat())
+            rows.append((getattr(channel, "name", str(channel_id)), stats, reasons))
+        rows.sort(key=lambda row: row[1].score, reverse=True)
+        return rows, checked, skipped
 
     @commands.hybrid_command(name="llmlog", description="Show the most recent LLM exchanges")
     @commands.has_permissions(manage_guild=True)

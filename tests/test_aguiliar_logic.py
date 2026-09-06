@@ -3627,3 +3627,131 @@ async def test_a_restart_does_not_count_as_having_been_quiet():
     assert 5 in cog._last_spoke
     idle = __import__("time").monotonic() - cog._last_spoke[5]
     assert idle < 60, "a fresh process must read as having just spoken"
+
+
+# --- /autocheck: the on-demand dry pass --------------------------------------
+
+def _history_message(author_id, *, bot=False, content="something worth saying", ago=30):
+    import datetime as _dt
+    msg = MagicMock()
+    msg.author = MagicMock()
+    msg.author.id = author_id
+    msg.author.bot = bot
+    msg.content = content
+    msg.created_at = discord.utils.utcnow() - _dt.timedelta(seconds=ago)
+    return msg
+
+
+def _history_channel(channel_id, messages, name="general"):
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = channel_id
+    channel.name = name
+
+    def history(limit=None, after=None):
+        async def gen():
+            for m in messages:
+                yield m
+        return gen()
+
+    channel.history = history
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_the_dry_pass_scores_from_fetched_history_not_the_live_window():
+    """The loop's window is in-memory and empty after a restart, which is
+    exactly when somebody wants to ask whether this works. The dry pass fetches
+    its own history so the numbers are real immediately."""
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    messages = [_history_message(100 + (i % 3), ago=20 + i) for i in range(9)]
+    channel = _history_channel(1, messages)
+    guild.get_channel = MagicMock(return_value=channel)
+    cog._auto_candidate_ids = AsyncMock(return_value=[1])
+    cog._can = MagicMock(return_value=True)
+    cog._load_auto_state = AsyncMock(return_value=AutonomyState())
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog._last_spoke[5] = 0.0  # idle, so only the channel numbers are in play
+    rows, checked, skipped = await cog._autonomous_dry_pass(
+        guild, AutonomyConfig(enabled=True, all_channels=True, chance_percent=0))
+    assert checked == 1 and skipped == 0
+    name, stats, reasons = rows[0]
+    assert stats.messages == 9 and stats.humans == 3
+    assert reasons == [], "nine messages from three people should clear every gate"
+
+
+@pytest.mark.asyncio
+async def test_the_dry_pass_does_not_touch_the_live_tracker_or_any_cooldown():
+    """A diagnostic that seeds the loop's own state would change what the loop
+    does next, which makes it a participant in the thing it observes."""
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    channel = _history_channel(1, [_history_message(100 + i) for i in range(9)])
+    guild.get_channel = MagicMock(return_value=channel)
+    cog._auto_candidate_ids = AsyncMock(return_value=[1])
+    cog._can = MagicMock(return_value=True)
+    state = AutonomyState()
+    cog._load_auto_state = AsyncMock(return_value=state)
+    cog._save_auto_state = AsyncMock()
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    await cog._autonomous_dry_pass(guild, AutonomyConfig(enabled=True, all_channels=True))
+    assert list(cog._activity.channels()) == [], "the live window must stay untouched"
+    assert state.last_eval == {} and state.last_action_at == 0.0
+    cog._save_auto_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_dry_pass_never_calls_the_model():
+    """The whole point is that it is free. If this ever starts costing an
+    inference, it stops being something you can run to check a config."""
+    cog = _make_cog()
+    cog._converse = AsyncMock(side_effect=AssertionError("the dry pass must not infer"))
+    guild = MagicMock()
+    guild.id = 5
+    channel = _history_channel(1, [_history_message(100 + i) for i in range(9)])
+    guild.get_channel = MagicMock(return_value=channel)
+    cog._auto_candidate_ids = AsyncMock(return_value=[1])
+    cog._can = MagicMock(return_value=True)
+    cog._load_auto_state = AsyncMock(return_value=AutonomyState())
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    await cog._autonomous_dry_pass(guild, AutonomyConfig(enabled=True, all_channels=True))
+    cog._converse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_dry_pass_reports_why_a_channel_would_be_skipped():
+    """A bot-only channel has to come back with a reason, not just a low number
+    - the reason is the whole reason to run this."""
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    bots_only = [_history_message(500, bot=True) for _ in range(12)]
+    channel = _history_channel(1, bots_only, name="bots")
+    guild.get_channel = MagicMock(return_value=channel)
+    cog._auto_candidate_ids = AsyncMock(return_value=[1])
+    cog._can = MagicMock(return_value=True)
+    cog._load_auto_state = AsyncMock(return_value=AutonomyState())
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog._last_spoke[5] = 0.0
+    rows, _, _ = await cog._autonomous_dry_pass(
+        guild, AutonomyConfig(enabled=True, all_channels=True))
+    name, stats, reasons = rows[0]
+    assert stats.messages == 0 and stats.bot_messages == 12
+    assert any("too-few-messages" in r for r in reasons)
+
+
+@pytest.mark.asyncio
+async def test_the_dry_pass_skips_channels_it_cannot_read():
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    guild.get_channel = MagicMock(return_value=_history_channel(1, []))
+    cog._auto_candidate_ids = AsyncMock(return_value=[1])
+    cog._can = MagicMock(return_value=False)
+    cog._load_auto_state = AsyncMock(return_value=AutonomyState())
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    rows, checked, skipped = await cog._autonomous_dry_pass(
+        guild, AutonomyConfig(enabled=True, all_channels=True))
+    assert checked == 0 and skipped == 1 and rows == []

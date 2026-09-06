@@ -1004,7 +1004,12 @@ opened one per person by this same bot), and the logging and starboard channels,
 which are machine output rather than talk. `llm.auto.exclude` is a denylist that
 wins over everything, including `all`.
 
-Configure it with the `llm.auto.*` keys in `/setconfig`.
+Configure it with the `llm.auto.*` keys in `/setconfig`, and check it with
+**`/autocheck`** — a dry run that reports every eligible channel, its score, and
+which gate would stop it. It fetches its own history rather than reading the
+loop's in-memory window, so it gives real numbers immediately after a restart,
+and it changes nothing: no cooldowns are spent, the live window is untouched,
+and the model is never called.
 
 ### What it cannot do
 
