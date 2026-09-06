@@ -1011,6 +1011,15 @@ loop's in-memory window, so it gives real numbers immediately after a restart,
 and it changes nothing: no cooldowns are spent, the live window is untouched,
 and the model is never called.
 
+**`/autopoke [channel]`** is the other half: it runs the decision once, right
+now, for real. It skips the gates — idle time, cooldowns, quiet hours, the
+activity thresholds and the dice all exist to decide *whether to look*, and
+somebody typing the command has already decided. It does not skip the parts that
+matter: permissions, the reactions-only allowlist, and the model's freedom to
+answer `NO_ACTION`, which on a quiet channel is the correct answer. If it does
+act, the cooldowns are spent exactly as if the loop had done it, so a poke is
+not a way around the daily cap.
+
 ### What it cannot do
 
 The limits are enforced in Python, not asked for in the prompt:

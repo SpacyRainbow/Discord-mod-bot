@@ -3749,6 +3749,78 @@ class Aguiliar(commands.Cog):
         rows.sort(key=lambda row: row[1].score, reverse=True)
         return rows, checked, skipped
 
+    @commands.hybrid_command(
+        name="autopoke",
+        description="Make it evaluate this channel RIGHT NOW and act if it wants to (skips every gate)",
+    )
+    @commands.has_permissions(manage_guild=True)
+    async def autopoke(self, ctx: commands.Context,
+                       channel: Optional[discord.TextChannel] = None):
+        """Run the autonomous decision once, on demand, for real.
+
+        /autocheck answers "would it?" and never calls the model. This answers
+        "do it", and is the only way to see the whole chain - prompt, model,
+        tool call, reaction - without waiting for the right conversation to
+        happen by itself. It is the manual counterpart to a feature whose entire
+        design is about NOT running on demand.
+
+        Skips the gates on purpose: idle time, cooldowns, quiet hours, the
+        activity thresholds and the probability roll are all about deciding
+        WHETHER to look, and somebody typing this has already decided. What it
+        does NOT skip is the part that matters: permissions, the act_* allowlist
+        (reactions only, same as the real loop), and the model's own freedom to
+        answer NO_ACTION - which on a quiet channel is the RIGHT answer and
+        should be expected rather than read as a failure.
+
+        If it does act, the cooldowns are spent exactly as if the loop had done
+        it, so a poke cannot be used to sneak past the daily cap.
+        """
+        if ctx.guild is None:
+            await ctx.send("That only works in a server.")
+            return
+        target = channel or ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            await ctx.send("Pick a normal text channel.")
+            return
+        if not self._can(target, "read_message_history") or not self._can(target, "send_messages"):
+            await ctx.send(f"I cannot read and post in {target.mention}.")
+            return
+        if not self.configured or self.session is None:
+            await ctx.send("The LLM is not configured, so there is nothing to ask.")
+            return
+        config = await self._autonomy_config(ctx.guild.id)
+        state = await self._load_auto_state(ctx.guild.id)
+        await ctx.defer(ephemeral=True)
+        now_wall = time.time()
+        tz, _resolved = resolve_timezone(
+            await self.bot.stores.config.get(ctx.guild.id, "llm.timezone", None))
+        day = datetime.datetime.now(tz).date().isoformat()
+        stats = self._activity.stats(target.id, config.window_seconds)
+        started = time.monotonic()
+        logger.info("aguiliar: auto POKE (manual) guild=%s channel=%s by=%s",
+                    ctx.guild.id, target.id, ctx.author.id)
+        try:
+            action, detail = await self._autonomous_participate(
+                target, config, state, stats, now_wall, day, forced=True)
+        except Exception as exc:
+            logger.exception("aguiliar: autopoke failed")
+            await ctx.send(f"That fell over: `{type(exc).__name__}: {exc}`"[:400], ephemeral=True)
+            return
+        seconds = time.monotonic() - started
+        explain = {
+            "NO_ACTION": ("It read the channel and chose to say nothing. That is a real "
+                          "answer, and on a quiet channel it is the right one - try it "
+                          "again where people are actually talking."),
+            "REACT": "It reacted to a message. No second generation ran - that is the point.",
+            "REPLY": "It wrote a line.",
+            "SEND_FAILED": "It tried to speak and Discord refused.",
+        }.get(action, "")
+        await ctx.send(
+            f"**{action}** in {target.mention} after {seconds:.0f}s"
+            f"{' (' + detail + ')' if detail else ''}\n{explain}",
+            ephemeral=True,
+        )
+
     @commands.hybrid_command(name="llmlog", description="Show the most recent LLM exchanges")
     @commands.has_permissions(manage_guild=True)
     async def llmlog(self, ctx: commands.Context, count: int = 5):
@@ -4408,8 +4480,19 @@ class Aguiliar(commands.Cog):
 
     async def _autonomous_participate(self, channel: discord.TextChannel,
                                       config: AutonomyConfig, state: AutonomyState,
-                                      stats: ChannelStats, now_wall: float, day: str) -> None:
-        """The one inference. Chooses NO_ACTION, a reaction, or a short line."""
+                                      stats: ChannelStats, now_wall: float, day: str,
+                                      forced: bool = False) -> Tuple[str, str]:
+        """The one inference. Chooses NO_ACTION, a reaction, or a short line.
+
+        Returns the outcome so /autopoke can report it. The loop ignores the
+        return value and reads the log line, which is unchanged.
+
+        `forced` only widens what it may look at: a poke on a channel that has
+        been quiet for hours should still have something to read, so the age
+        window is not applied to the context. Every safety property - the
+        reactions-only allowlist, the permission checks, the already-reacted
+        guard, NO_ACTION - is identical either way.
+        """
         _usage_var.set({"prompt_tokens": 0, "cached_tokens": 0, "requests": 0})
         _gap_var.set(None)
         _gap_stats_var.set(None)
@@ -4422,11 +4505,11 @@ class Aguiliar(commands.Cog):
             async for hist in channel.history(limit=AUTO_CONTEXT_MESSAGES):
                 recent.append(hist)
         except (discord.Forbidden, discord.HTTPException):
-            return
+            return "ERROR", "history unreadable"
         recent.reverse()
         anchor = next((m for m in reversed(recent) if not m.author.bot), None)
         if anchor is None:
-            return
+            return "NO_ACTION", "nothing here but bots"
         # Bots, webhooks and the bot's own messages are rendered but never made
         # reactable: note_message is what creates a marker, so a message with no
         # marker is one act_react_to_message physically cannot resolve. Same
@@ -4466,6 +4549,8 @@ class Aguiliar(commands.Cog):
         action, detail = await self._autonomous_deliver(
             channel, anchor, answer, config, state, now_wall, day)
         usage = _usage_var.get() or {}
+        if forced:
+            detail = (detail + " " if detail else "") + "forced"
         logger.info(
             "aguiliar: auto RESULT guild=%s channel=%s action=%s %s rounds=%s tools=%s "
             "duration=%sms prompt_tokens=%s cached=%s %s",
@@ -4473,6 +4558,7 @@ class Aguiliar(commands.Cog):
             [c["name"] for c in trace["tool_calls"]], duration_ms,
             usage.get("prompt_tokens"), usage.get("cached_tokens"), detail,
         )
+        return action, detail
 
     async def _autonomous_deliver(self, channel: discord.TextChannel, anchor: discord.Message,
                                   answer: str, config: AutonomyConfig, state: AutonomyState,

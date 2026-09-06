@@ -3637,6 +3637,8 @@ def _history_message(author_id, *, bot=False, content="something worth saying", 
     msg.author = MagicMock()
     msg.author.id = author_id
     msg.author.bot = bot
+    msg.author.display_name = f"member{author_id}"
+    msg.id = 900000 + author_id + ago
     msg.content = content
     msg.created_at = discord.utils.utcnow() - _dt.timedelta(seconds=ago)
     return msg
@@ -3755,3 +3757,84 @@ async def test_the_dry_pass_skips_channels_it_cannot_read():
     rows, checked, skipped = await cog._autonomous_dry_pass(
         guild, AutonomyConfig(enabled=True, all_channels=True))
     assert checked == 0 and skipped == 1 and rows == []
+
+
+# --- /autopoke: forcing one real evaluation ----------------------------------
+
+@pytest.mark.asyncio
+async def test_a_forced_pass_still_only_gets_the_reaction_allowlist():
+    """Skipping the gates must not skip the permission boundary. A poke decides
+    WHETHER to look; it does not widen what the model may do once it has."""
+    cog = _make_cog()
+    captured = {}
+
+    async def fake_converse(anchor, messages, max_tokens, on_text, trace,
+                            allowed_acts=None, **kwargs):
+        captured["allowed"] = allowed_acts
+        return NO_ACTION_TOKEN
+
+    cog._converse = fake_converse
+    cog._save_auto_state = AsyncMock()
+    channel = _history_channel(1, [_history_message(100)])
+    channel.guild = MagicMock()
+    channel.guild.id = 5
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog._identity_block = MagicMock(return_value="")
+    action, detail = await cog._autonomous_participate(
+        channel, AutonomyConfig(enabled=True), AutonomyState(), ChannelStats(),
+        1_000_000.0, "2026-09-06", forced=True)
+    assert captured["allowed"] == AUTONOMOUS_ACT_TOOLS
+    assert action == "NO_ACTION"
+    assert "forced" in detail
+
+
+@pytest.mark.asyncio
+async def test_a_forced_no_action_is_reported_as_a_real_answer():
+    """On a quiet channel NO_ACTION is correct, and the command has to say so
+    rather than look like a failure."""
+    cog = _make_cog()
+    cog._converse = AsyncMock(return_value="NO_ACTION")
+    cog._save_auto_state = AsyncMock()
+    channel = _history_channel(1, [_history_message(100)])
+    channel.guild = MagicMock()
+    channel.guild.id = 5
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog._identity_block = MagicMock(return_value="")
+    action, _ = await cog._autonomous_participate(
+        channel, AutonomyConfig(enabled=True), AutonomyState(), ChannelStats(),
+        1_000_000.0, "2026-09-06", forced=True)
+    assert action == "NO_ACTION"
+
+
+@pytest.mark.asyncio
+async def test_a_forced_action_still_spends_the_cooldowns():
+    """Otherwise a poke would be a way around the daily cap."""
+    cog = _make_cog()
+    cog._converse = AsyncMock(return_value="that is genuinely cursed")
+    cog._save_auto_state = AsyncMock()
+    state = AutonomyState()
+    channel = _history_channel(1, [_history_message(100)])
+    channel.guild = MagicMock()
+    channel.guild.id = 5
+    channel.send = AsyncMock()
+    cog.bot.stores.config.get = AsyncMock(return_value=None)
+    cog._identity_block = MagicMock(return_value="")
+    action, _ = await cog._autonomous_participate(
+        channel, AutonomyConfig(enabled=True), state, ChannelStats(),
+        1_000_000.0, "2026-09-06", forced=True)
+    assert action == "REPLY"
+    assert state.day_count == 1
+    assert state.last_action_at == 1_000_000.0
+
+
+@pytest.mark.asyncio
+async def test_a_channel_with_only_bots_in_it_returns_a_reason_not_a_crash():
+    cog = _make_cog()
+    channel = _history_channel(1, [_history_message(500, bot=True)])
+    channel.guild = MagicMock()
+    channel.guild.id = 5
+    action, detail = await cog._autonomous_participate(
+        channel, AutonomyConfig(enabled=True), AutonomyState(), ChannelStats(),
+        1_000_000.0, "2026-09-06", forced=True)
+    assert action == "NO_ACTION"
+    assert "bots" in detail
