@@ -119,7 +119,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
@@ -215,6 +215,13 @@ GAP_MESSAGES_DEFAULT = 15
 GAP_CHAR_CAP = 800           # roughly 200 tokens; the tight end, on purpose
 GAP_MINUTES_DEFAULT = 60
 GAP_MINUTES_MAX = 1440
+# A message somebody explicitly replied to is quoted back at them at this
+# length. Bigger than a gap line on purpose: they pointed at it, so it is the
+# one piece of context that is certainly relevant. Only paid on replies.
+REPLY_QUOTE_CHAR_CAP = 600
+# When the quoted message is already in the gap transcript, only a locator is
+# printed - enough to say WHICH line, not enough to duplicate it.
+REPLY_LOCATOR_CHAR_CAP = 80
 # Web search, sized by the clock rather than by taste. Every snippet is prompt
 # the model has to reprocess at ~5 tokens/sec, so 5 results at 300 characters is
 # roughly 400 tokens and about a minute and a half added to the reply. Raising
@@ -1154,21 +1161,41 @@ def render_status_line(calls: List[dict]) -> str:
 
 
 def trim_gap(entries: List[Tuple[str, str]], max_messages: int,
-             char_cap: int = GAP_CHAR_CAP) -> Tuple[List[Tuple[str, str]], bool]:
+             char_cap: int = GAP_CHAR_CAP,
+             keep_index: Optional[int] = None) -> Tuple[List[Tuple[str, str]], bool]:
     """Cuts the gap down to size from the OLDEST end, so the messages nearest
     the question always survive. Returns the kept entries and whether anything
-    was dropped."""
-    kept = list(entries)
+    was dropped.
+
+    `keep_index` marks one entry - the message being replied to - as exempt
+    from both caps. It is the referent of the question being asked, so trimming
+    it produces exactly the failure the transcript exists to prevent: on
+    2026-09-05 a 1.3 kB maths problem was evicted by the character cap and the
+    bot answered "i don't have a 'this' on file", correctly. The entry survives
+    even alone over the cap; sanitize() bounds it either way."""
+    kept = list(range(len(entries)))
+
+    def size(i: int) -> int:
+        author, content = entries[i]
+        return len(author) + len(content) + 2
+
+    def drop_oldest_unprotected() -> bool:
+        for position, index in enumerate(kept):
+            if index != keep_index:
+                kept.pop(position)
+                return True
+        return False
+
     truncated = False
-    if max_messages >= 0 and len(kept) > max_messages:
-        kept = kept[len(kept) - max_messages:]
+    while max_messages >= 0 and len(kept) > max_messages:
+        if not drop_oldest_unprotected():
+            break
         truncated = True
-    total = sum(len(author) + len(content) + 2 for author, content in kept)
-    while kept and total > char_cap:
-        author, content = kept.pop(0)
-        total -= len(author) + len(content) + 2
+    while kept and sum(size(i) for i in kept) > char_cap:
+        if not drop_oldest_unprotected():
+            break
         truncated = True
-    return kept, truncated
+    return [entries[i] for i in kept], truncated
 
 
 def render_gap(entries: List[Tuple[str, str]], truncated: bool = False) -> str:
@@ -1797,15 +1824,19 @@ class Aguiliar(commands.Cog):
         return memory_turns(rows, turns), last_memory_speaker(rows, turns)
 
     async def _gap_messages(
-        self, message: discord.Message
-    ) -> Tuple[str, int, int, Optional[int]]:
+        self, message: discord.Message, keep_id: Optional[int] = None
+    ) -> Tuple[str, int, int, Optional[int], FrozenSet[int]]:
         """Everything said in this channel since the bot itself last spoke,
         including that message of its own.
 
-        Returns (rendered block, message count, character count, anchor id) -
-        the counts go into llm_log so the cost of this feature is a number
-        rather than a feeling, and the anchor id lets _build_messages avoid
-        printing the same bot message twice.
+        Returns (rendered block, message count, character count, anchor id,
+        kept ids) - the counts go into llm_log so the cost of this feature is a
+        number rather than a feeling, and the kept ids let _build_messages avoid
+        printing any message twice that is already in the transcript.
+
+        `keep_id` is the message being replied to. It is exempt from the caps:
+        a message somebody pointed at is the referent of their question, and
+        the oldest-first trim is otherwise most likely to drop exactly it.
 
         No anchor found inside GAP_SCAN_MAX means the bot has not spoken here
         recently: return nothing. Falling back to "the last N messages" would
@@ -1817,7 +1848,7 @@ class Aguiliar(commands.Cog):
             minimum=0, maximum=GAP_MESSAGES_MAX,
         )
         if limit <= 0:
-            return "", 0, 0, None
+            return "", 0, 0, None, frozenset()
         minutes = await self.bot.stores.config.get_int(
             guild_id, "llm.gapminutes", GAP_MINUTES_DEFAULT,
             minimum=1, maximum=GAP_MINUTES_MAX,
@@ -1825,9 +1856,12 @@ class Aguiliar(commands.Cog):
         cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes)
         bot_user = self.bot.user
         if bot_user is None:
-            return "", 0, 0, None
+            return "", 0, 0, None, frozenset()
 
         collected: List[Tuple[str, str]] = []
+        # Parallel to `collected`, so an entry can be matched back to the
+        # Discord message it came from after trimming.
+        collected_ids: List[int] = []
         anchor_id: Optional[int] = None
         try:
             async for hist in message.channel.history(limit=GAP_SCAN_MAX, before=message):
@@ -1843,6 +1877,7 @@ class Aguiliar(commands.Cog):
                     text = (hist.content or "") + note_images(message, hist)
                     if text.strip():
                         collected.append((self._bot_name(), text))
+                        collected_ids.append(hist.id)
                     break
                 # Other bots are noise, not conversation - music embeds, log
                 # lines, starboard reposts.
@@ -1851,21 +1886,66 @@ class Aguiliar(commands.Cog):
                 text = (hist.content or "") + note_images(message, hist)
                 if text.strip():
                     collected.append((hist.author.display_name, text))
+                    collected_ids.append(hist.id)
         except (discord.Forbidden, discord.HTTPException) as exc:
             logger.warning("aguiliar: gap read failed: %s", exc)
-            return "", 0, 0, None
+            return "", 0, 0, None, frozenset()
 
         if anchor_id is None:
-            return "", 0, 0, None
+            return "", 0, 0, None, frozenset()
         collected.reverse()          # oldest first, anchor at the top
+        collected_ids.reverse()
         # The anchor is kept whatever the caps say - it is the referent, and a
         # transcript that trimmed it would be worse than none.
         head, tail = collected[:1], collected[1:]
-        kept, truncated = trim_gap(tail, max(0, limit - 1))
+        tail_ids = collected_ids[1:]
+        keep_index = tail_ids.index(keep_id) if keep_id in tail_ids else None
+        kept, truncated = trim_gap(tail, max(0, limit - 1), keep_index=keep_index)
         entries = head + kept
+        # Matched back by IDENTITY, walking the kept list as a subsequence of
+        # the tail. Two people can post the same text in one gap, so equality
+        # would hand one of them the other's id.
+        surviving = list(collected_ids[:1])
+        position = 0
+        for index, entry in enumerate(tail):
+            if position < len(kept) and entry is kept[position]:
+                surviving.append(tail_ids[index])
+                position += 1
+        kept_ids = frozenset(surviving)
         block = render_gap(entries, truncated)
         chars = sum(len(author) + len(content) + 2 for author, content in entries)
-        return block, len(entries), chars, anchor_id
+        return block, len(entries), chars, anchor_id, kept_ids
+
+    def _reply_quote(self, reply_parent: Optional[discord.Message],
+                     replying_to: Optional[discord.Message],
+                     gap_ids: FrozenSet[int]) -> str:
+        """The message being replied to, shown when nobody else will show it.
+
+        Replying to the BOT is handled elsewhere and better - that parent goes
+        in as an assistant turn, which is the shape the model already reads as
+        "what I said last". This covers the other case: replying to a PERSON
+        while pinging the bot. Before 2026-09-05 that parent was dropped on the
+        floor, and the model answered a pronoun with no referent.
+
+        A parent already in the gap transcript gets a locator instead of a
+        second copy - it is in front of the model either way, and the transcript
+        keeps it in sequence with everything said after it."""
+        if reply_parent is None:
+            return ""
+        if replying_to is not None and reply_parent.id == replying_to.id:
+            return ""            # going in as an assistant turn instead
+        author = sanitize(str(getattr(reply_parent.author, "display_name", "")), 40)
+        if reply_parent.id in gap_ids:
+            head = sanitize(reply_parent.content or "", REPLY_LOCATOR_CHAR_CAP)
+            if not head:
+                return ""
+            return f"They are replying to {author}'s message above: \"{head}\"\n"
+        said = sanitize(reply_parent.content or "", REPLY_QUOTE_CHAR_CAP)
+        if not said:
+            return ""
+        return (f"They are replying to this earlier message from {author}, "
+                f"which is what their message below refers to:\n"
+                f"\"{said}\"\n")
 
     async def _image_parts(self, message: discord.Message) -> List[dict]:
         """Downscaled data URIs for images attached to the message being answered.
@@ -1889,7 +1969,9 @@ class Aguiliar(commands.Cog):
         return parts
 
     async def _build_messages(self, message: discord.Message,
-                              replying_to: Optional[discord.Message] = None) -> List[dict]:
+                              replying_to: Optional[discord.Message] = None,
+                              *,
+                              reply_parent: Optional[discord.Message] = None) -> List[dict]:
         guild_id = message.guild.id
         persona = await self.bot.stores.config.get(guild_id, "llm.persona", None)
         previous_ts: Optional[float] = None
@@ -1938,13 +2020,16 @@ class Aguiliar(commands.Cog):
         )
         digest = await self._channel_digest(message)
         recently = f"Recently in this channel: {digest}\n" if digest else ""
-        gap, gap_count, gap_chars, gap_anchor_id = await self._gap_messages(message)
+        # The reply target is handed to the gap so the caps cannot evict it.
+        gap, gap_count, gap_chars, gap_anchor_id, gap_ids = await self._gap_messages(
+            message, keep_id=reply_parent.id if reply_parent is not None else None)
         gap_block = f"{gap}\n" if gap else ""
         # Recorded task-locally so _log_exchange can report what this cost
         # without threading a return value through the whole call chain.
         _gap_var.set((gap_count, gap_chars))
         attached = ("They attached an image; it is shown to you below.\n"
                     if image_attachments(message) else "")
+        quoted = self._reply_quote(reply_parent, replying_to, gap_ids)
         # Volatile facts live here, in the user turn, never in the system prompt.
         # ORDERED MOST STABLE -> MOST VOLATILE, deliberately. The prompt cache
         # reuses up to the first differing token, so anything printed after a
@@ -1977,6 +2062,8 @@ class Aguiliar(commands.Cog):
             # them). Costs nothing to drop; it is a dozen tokens.
             f"{hint + chr(10) if not gap else ''}"
             f"Current time: {format_local_time(message.created_at, tz)}\n"
+            # Directly above their message, because that is what it belongs to.
+            f"{quoted}"
             f"{attached}"
             f"{who}: {sanitize(message.content, 1000)}"
         )
@@ -1990,7 +2077,7 @@ class Aguiliar(commands.Cog):
             # When the reply target IS the gap anchor it is already the first
             # line of the transcript, in context, with everything said after it.
             # Printing it again as an assistant turn would duplicate it.
-            already_in_gap = gap_anchor_id is not None and gap_anchor_id == replying_to.id
+            already_in_gap = replying_to.id in gap_ids
             if said and not already_in_gap and not (
                     history and history[-1].get("content", "") == said):
                 history.append({"role": "assistant", "content": said})
@@ -2365,7 +2452,15 @@ class Aguiliar(commands.Cog):
         # Cheap checks before the expensive one: get_context parses the message
         # against the whole command tree, and this listener sees every message
         # in the server. Only pay for that once we know it is a ping for us.
-        replying_to_me = await self._is_reply_to_me(message)
+        # Resolved once here and carried down: the fetch behind it is an API
+        # call, and the trigger check and the prompt both want the answer.
+        reply_parent = await self._reply_parent(message)
+        replying_to_me = (
+            reply_parent
+            if reply_parent is not None and self.bot.user is not None
+            and reply_parent.author.id == self.bot.user.id
+            else None
+        )
         if not should_respond(
             message, self.bot.user, is_command=False, is_reply_to_bot=replying_to_me
         ):
@@ -2402,12 +2497,13 @@ class Aguiliar(commands.Cog):
         self._cancel_warmup()
         self._queued += 1
         try:
-            await self._respond(message, max_tokens, replying_to_me=replying_to_me)
+            await self._respond(message, max_tokens, replying_to_me=replying_to_me,
+                                reply_parent=reply_parent)
         finally:
             self._queued -= 1
 
-    async def _is_reply_to_me(self, message: discord.Message) -> Optional[discord.Message]:
-        """The message this one is replying to, but only when the bot wrote it.
+    async def _reply_parent(self, message: discord.Message) -> Optional[discord.Message]:
+        """The message this one is replying to, whoever wrote it.
 
         Returns the parent message rather than a bool because the caller wants
         its text: a reply is a continuation, and the thing being continued is
@@ -2424,11 +2520,25 @@ class Aguiliar(commands.Cog):
                 parent = await message.channel.fetch_message(reference.message_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 return None
+        return parent
+
+    async def _is_reply_to_me(self, message: discord.Message) -> Optional[discord.Message]:
+        """The parent, but only when the bot wrote it.
+
+        Kept separate from _reply_parent because this one also decides whether
+        to answer at all: replying to somebody ELSE is not a ping, and widening
+        the trigger would have the bot answer every reply in the channel. The
+        parent's TEXT is still used in that case - see _build_messages - it just
+        does not summon anyone."""
+        parent = await self._reply_parent(message)
+        if parent is None or self.bot.user is None:
+            return None
         return parent if parent.author.id == self.bot.user.id else None
 
     async def _respond(self, message: discord.Message, max_tokens: int,
                        replying_to: Optional[discord.Message] = None,
-                       *, replying_to_me: Optional[discord.Message] = None) -> None:
+                       *, replying_to_me: Optional[discord.Message] = None,
+                       reply_parent: Optional[discord.Message] = None) -> None:
         # Opens this reply's token tally. Set here, at the top of the task, so
         # every request the reply goes on to make lands in the same one.
         _usage_var.set({"prompt_tokens": 0, "cached_tokens": 0, "requests": 0})
@@ -2507,7 +2617,8 @@ class Aguiliar(commands.Cog):
         # of an UnboundLocalError instead of saying anything.
         answer = ""
         try:
-            messages = await self._build_messages(message, replying_to or replying_to_me)
+            messages = await self._build_messages(
+                message, replying_to or replying_to_me, reply_parent=reply_parent)
             async with message.channel.typing():
                 async with self._slot:
                     answer = await self._converse(

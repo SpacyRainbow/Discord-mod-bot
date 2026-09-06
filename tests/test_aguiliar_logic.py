@@ -1737,7 +1737,7 @@ async def test_the_gap_stops_at_the_bots_own_message_and_includes_it():
         _gap_item(3, "Aguilar", "because it rained", is_bot=True, author_id=42, minutes_ago=3),
         _gap_item(2, "alice", "ancient", minutes_ago=4),
     ])
-    block, count, chars, anchor = await cog._gap_messages(message)
+    block, count, chars, anchor, _ids = await cog._gap_messages(message)
     assert anchor == 3 and count == 3 and chars > 0
     assert block.index("Aguilar: because it rained") < block.index("alice: huh")
     assert "ancient" not in block
@@ -1749,7 +1749,7 @@ async def test_the_gap_is_empty_when_the_bot_has_not_spoken_recently():
     sliding window this whole feature exists to avoid."""
     cog = _gap_cog()
     message = _gap_message([_gap_item(n, "bob", f"m{n}") for n in range(30, 0, -1)])
-    block, count, _chars, anchor = await cog._gap_messages(message)
+    block, count, _chars, anchor, _ids = await cog._gap_messages(message)
     assert block == "" and count == 0 and anchor is None
 
 
@@ -1761,7 +1761,7 @@ async def test_the_gap_skips_other_bots_but_not_the_anchor():
         _gap_item(5, "MusicBot", "now playing", is_bot=True, author_id=77),
         _gap_item(4, "Aguilar", "my last word", is_bot=True, author_id=42),
     ])
-    block, count, _chars, _anchor = await cog._gap_messages(message)
+    block, count, _chars, _anchor, _ids = await cog._gap_messages(message)
     assert "now playing" not in block
     assert "my last word" in block and "real message" in block and count == 2
 
@@ -1775,7 +1775,7 @@ async def test_the_gap_drops_the_oldest_first_and_always_keeps_the_anchor():
         _gap_item(7, "bob", "oldest-human"),
         _gap_item(6, "Aguilar", "anchor line", is_bot=True, author_id=42),
     ])
-    block, count, _chars, _anchor = await cog._gap_messages(message)
+    block, count, _chars, _anchor, _ids = await cog._gap_messages(message)
     assert count == 3
     assert "anchor line" in block and "newest" in block
     assert "oldest-human" not in block
@@ -1786,7 +1786,7 @@ async def test_the_gap_drops_the_oldest_first_and_always_keeps_the_anchor():
 async def test_the_gap_is_off_when_gapmax_is_zero():
     cog = _gap_cog(gapmax=0)
     message = _gap_message([_gap_item(2, "Aguilar", "hi", is_bot=True, author_id=42)])
-    assert await cog._gap_messages(message) == ("", 0, 0, None)
+    assert await cog._gap_messages(message) == ("", 0, 0, None, frozenset())
 
 
 @pytest.mark.asyncio
@@ -1796,7 +1796,7 @@ async def test_the_gap_stops_at_the_age_cutoff_before_it_finds_an_anchor():
         _gap_item(3, "bob", "recent", minutes_ago=1),
         _gap_item(2, "Aguilar", "hours ago", is_bot=True, author_id=42, minutes_ago=600),
     ])
-    block, count, _chars, anchor = await cog._gap_messages(message)
+    block, count, _chars, anchor, _ids = await cog._gap_messages(message)
     assert block == "" and count == 0 and anchor is None
 
 
@@ -2084,3 +2084,126 @@ def test_live_preview_is_exact_at_the_boundary():
     edge = "C" * LIVE_PREVIEW_CHARS
     assert live_preview(edge) == edge
     assert live_preview(edge + "D").endswith("D")
+
+
+# --- replying to somebody who is not the bot --------------------------------
+# All three of these are one incident, 2026-09-05: a member replied to their own
+# earlier maths problem while pinging the bot, and got "start what. i don't have
+# a 'this' on file". Nothing was broken - the parent was simply never shown.
+
+
+@pytest.mark.asyncio
+async def test_reply_parent_resolves_a_message_the_bot_did_not_write():
+    """_is_reply_to_me is the TRIGGER and stays bot-only; the text of a reply to
+    anyone else is still wanted."""
+    cog = _make_cog()
+    cog.bot.user = _bot_user(42)
+    parent = MagicMock(spec=discord.Message)
+    parent.author = MagicMock()
+    parent.author.id = 99
+    message = MagicMock(spec=discord.Message)
+    message.reference = MagicMock(message_id=5, resolved=parent)
+
+    assert await cog._reply_parent(message) is parent
+    assert await cog._is_reply_to_me(message) is None
+
+
+@pytest.mark.asyncio
+async def test_a_reply_to_another_member_is_quoted_into_the_prompt(db):
+    """The original failure. The parent is out of the gap's reach, so without
+    the quote the model is answering a pronoun with no referent."""
+    cog = _gap_prompt_cog(db, [_gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42)])
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 1
+    parent.content = "A point P lies strictly inside a rectangle ABCD"
+    parent.author = MagicMock(id=99, display_name="Raheem")
+
+    message = _gap_live_message([], content="Try this again. You didn't even start it")
+    user_turn = (await cog._build_messages(message, reply_parent=parent))[-1]["content"]
+    assert "A point P lies strictly inside a rectangle ABCD" in user_turn
+    assert "Raheem" in user_turn
+
+
+@pytest.mark.asyncio
+async def test_a_quoted_parent_never_becomes_an_assistant_turn(db):
+    """Somebody else's words in an assistant turn read to the model as its own."""
+    cog = _gap_prompt_cog(db, [_gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42)])
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 1
+    parent.content = "words written by a person"
+    parent.author = MagicMock(id=99, display_name="Raheem")
+
+    messages = await cog._build_messages(_gap_live_message([]), reply_parent=parent)
+    assert not any(m["role"] == "assistant" for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_the_bots_own_parent_is_not_quoted_as_well_as_carried(db):
+    """Replying to the bot keeps the tuned assistant-turn path, once."""
+    cog = _gap_prompt_cog(db, [_gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42)])
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 7
+    parent.content = "because it rained"
+    parent.author = MagicMock(id=42, display_name="Aguilar")
+
+    messages = await cog._build_messages(
+        _gap_live_message([]), parent, reply_parent=parent)
+    joined = "\n".join(str(m["content"]) for m in messages)
+    assert joined.count("because it rained") == 1
+    assert any(m["role"] == "assistant" for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_a_parent_already_in_the_gap_gets_a_locator_not_a_second_copy(db):
+    items = [_gap_item(5, "Raheem", "the thing I said", minutes_ago=1),
+             _gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42, minutes_ago=2)]
+    cog = _gap_prompt_cog(db, items)
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 5
+    parent.content = "the thing I said"
+    parent.author = MagicMock(id=99, display_name="Raheem")
+
+    user_turn = (await cog._build_messages(
+        _gap_live_message(items), reply_parent=parent))[-1]["content"]
+    # The locator names the line and echoes its first few words; the full quote
+    # block - which would be the second copy - is not printed.
+    assert "Raheem: the thing I said" in user_turn
+    assert "message above" in user_turn
+    assert "refers to" not in user_turn
+
+
+@pytest.mark.asyncio
+async def test_the_reply_target_survives_the_gap_character_cap(db):
+    """The second half of the incident: even inside the gap's reach, the maths
+    problem was 1.3 kB and the oldest-first trim ate it first."""
+    long_one = "A point P lies strictly inside a rectangle ABCD. " * 30
+    items = [
+        _gap_item(7, "Raheem", "we got more improvements", minutes_ago=1),
+        _gap_item(6, "Raheem", "WOOO", minutes_ago=2),
+        _gap_item(5, "Raheem", long_one, minutes_ago=3),
+        _gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42, minutes_ago=4),
+    ]
+    cog = _gap_prompt_cog(db, items)
+    message = _gap_live_message(items, content="Try this again")
+
+    without = (await cog._build_messages(message))[-1]["content"]
+    assert "rectangle ABCD" not in without      # the bug, still true unprompted
+
+    parent = MagicMock(spec=discord.Message)
+    parent.id = 5
+    parent.content = long_one
+    parent.author = MagicMock(id=99, display_name="Raheem")
+    with_reply = (await cog._build_messages(message, reply_parent=parent))[-1]["content"]
+    assert "rectangle ABCD" in with_reply
+
+
+def test_trim_gap_keeps_the_protected_entry_past_both_caps():
+    entries = [("a", "x" * 400), ("b", "the one replied to"), ("c", "y" * 400)]
+    kept, truncated = trim_gap(entries, 5, char_cap=100, keep_index=1)
+    assert kept == [("b", "the one replied to")]
+    assert truncated is True
+
+
+def test_trim_gap_without_a_protected_entry_is_unchanged():
+    entries = [("a", "x" * 400), ("b", "y" * 400), ("c", "z")]
+    assert trim_gap(entries, 5, char_cap=100) == ([("c", "z")], True)
