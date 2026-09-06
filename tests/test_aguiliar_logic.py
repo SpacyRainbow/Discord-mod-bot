@@ -14,6 +14,10 @@ from bot.modules.aguiliar import (
     MAX_CONTINUATIONS,
     MAX_TOOL_ROUNDS,
     MODAL_TEXT_MAX,
+    BUSY_PHRASES,
+    RECENT_WINDOW,
+    THINKING_PHRASES,
+    PhraseCycler,
     PERSONA_TEMPLATE,
     SAFETY_PREAMBLE,
     Aguiliar,
@@ -2472,3 +2476,61 @@ def test_a_normal_reply_is_untouched():
 def test_empty_input_is_safe():
     assert strip_transcript_decoration("", "Aguilar") == ""
     assert strip_transcript_decoration(None, "Aguilar") == ""
+
+
+# --- the thinking-phrase pool ---------------------------------------------
+
+
+def test_no_phrase_repeats_inside_a_window_of_five():
+    """The whole point: a phrase has to sit out five picks before it returns."""
+    cycler = PhraseCycler(THINKING_PHRASES)
+    picks = [cycler.pick() for _ in range(200)]
+    for i in range(len(picks)):
+        window = picks[max(0, i - RECENT_WINDOW):i]
+        assert picks[i] not in window
+
+
+def test_every_phrase_eventually_comes_round():
+    """Nothing is stranded - the window releases, it does not retire."""
+    cycler = PhraseCycler(THINKING_PHRASES)
+    seen = {cycler.pick() for _ in range(2000)}
+    assert seen == set(THINKING_PHRASES)
+
+
+def test_a_phrase_can_return_once_five_others_have_gone_by():
+    pool = ["a", "b", "c", "d", "e", "f"]
+    cycler = PhraseCycler(pool, window=5)
+    first = cycler.pick()
+    # The next five must all be different, and the sixth has only `first` left.
+    following = [cycler.pick() for _ in range(5)]
+    assert first not in following
+    assert cycler.pick() == first
+
+
+def test_a_pool_smaller_than_the_window_still_works():
+    """Degenerate case: three phrases, window of five. Never blows up, and
+    never repeats back to back."""
+    cycler = PhraseCycler(["a", "b", "c"], window=5)
+    picks = [cycler.pick() for _ in range(50)]
+    assert set(picks) == {"a", "b", "c"}
+    assert all(picks[i] != picks[i - 1] for i in range(1, len(picks)))
+
+
+def test_a_single_phrase_pool_just_repeats():
+    cycler = PhraseCycler(["only"])
+    assert [cycler.pick() for _ in range(3)] == ["only"] * 3
+
+
+def test_an_empty_pool_is_rejected_at_construction():
+    with pytest.raises(ValueError):
+        PhraseCycler([])
+
+
+def test_the_shipped_pools_are_sane():
+    for pool in (THINKING_PHRASES, BUSY_PHRASES):
+        assert pool
+        assert len(set(pool)) == len(pool)
+        assert all(p == p.strip() and p for p in pool)
+    # Comfortably wider than the window, or the variety is theatre.
+    assert len(THINKING_PHRASES) > RECENT_WINDOW * 4
+    assert len(BUSY_PHRASES) > RECENT_WINDOW

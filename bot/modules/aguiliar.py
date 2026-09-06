@@ -118,8 +118,10 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import time
+from collections import deque
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -343,6 +345,91 @@ EDIT_INTERVAL_SECONDS = 2.0
 # follows the TAIL. Final delivery is untouched - chunk_text still sends the
 # whole answer across as many messages as it needs.
 LIVE_PREVIEW_CHARS = 1990
+
+
+# How many recent picks a phrase has to sit out before it can come round again.
+# Five is the user's call: long enough that nothing repeats inside one stretch of
+# conversation, short enough that the pool never feels like a fixed rotation.
+RECENT_WINDOW = 5
+
+# The opening frame of every reply. One or two words, in Aguilar's own register -
+# dry, unbothered, no fake enthusiasm and no exclamation marks. They are only on
+# screen until the first tokens land, so they say "busy", not anything clever.
+THINKING_PHRASES = [
+    "thinking",
+    "working",
+    "hang on",
+    "one sec",
+    "hold on",
+    "processing",
+    "pondering",
+    "mulling",
+    "deliberating",
+    "computing",
+    "parsing",
+    "cooking",
+    "chewing on it",
+    "weighing options",
+    "figuring it out",
+    "looking into it",
+    "checking",
+    "reading",
+    "counting",
+    "considering",
+    "sorting it out",
+    "digging",
+    "grinding",
+    "crunching",
+    "still here",
+    "give it a sec",
+    "getting there",
+    "loading",
+    "assembling",
+    "drafting",
+    "reasoning",
+    "consulting notes",
+    "doing the work",
+    "warming up",
+    "stalling",
+]
+
+# Queue is full. Each of these is a whole reply on its own, not a fragment, and
+# each has to say the same two things: busy now, try again shortly.
+BUSY_PHRASES = [
+    "I'm still thinking about something else - try me in a bit.",
+    "Busy with another one. Give it a minute.",
+    "Already mid-answer somewhere. Come back shortly.",
+    "One at a time. Ping me again in a bit.",
+    "Queue's full. Try again in a minute.",
+    "Still working on someone else's. Shortly.",
+    "Occupied. Give it a moment and ask again.",
+    "Hands full right now - try me again soon.",
+]
+
+
+class PhraseCycler:
+    """Random pick that avoids the last `window` picks.
+
+    A phrase drops out of the window after `window` other picks and is eligible
+    again, so the pool never drains and nothing repeats close together. State is
+    per-process and shared across guilds: there is one bot, and "the one it just
+    used" means the one it just posted anywhere."""
+
+    def __init__(self, phrases, window: int = RECENT_WINDOW):
+        self.phrases = list(phrases)
+        if not self.phrases:
+            raise ValueError("PhraseCycler needs at least one phrase")
+        self._recent = deque(maxlen=max(0, window))
+
+    def pick(self) -> str:
+        candidates = [p for p in self.phrases if p not in self._recent]
+        if not candidates:
+            # Pool no bigger than the window. Still never repeat back to back.
+            last = self._recent[-1] if self._recent else None
+            candidates = [p for p in self.phrases if p != last] or list(self.phrases)
+        choice = random.choice(candidates)
+        self._recent.append(choice)
+        return choice
 
 
 def live_preview(text: str) -> str:
@@ -1493,6 +1580,9 @@ class Aguiliar(commands.Cog):
         # Reset at the top of every _converse. One exchange at a time (see
         # SEARCH_CALLS_PER_MESSAGE), so this does not need to be per-message.
         self._search_calls = 0
+        # Built once, so the "recently used" window survives across requests.
+        self._thinking = PhraseCycler(THINKING_PHRASES)
+        self._busy = PhraseCycler(BUSY_PHRASES)
         self.model = os.getenv("LLM_MODEL") or ""
         try:
             self.timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", ""))
@@ -2778,8 +2868,7 @@ class Aguiliar(commands.Cog):
         # the bot is busy shouldn't also burn the asker's cooldown token and
         # lock them out for another minute through no fault of their own.
         if self._queued >= MAX_QUEUED:
-            await message.reply("I'm still thinking about something else - try me in a bit.",
-                                mention_author=False)
+            await message.reply(self._busy.pick(), mention_author=False)
             return
         cooldown = await self.bot.stores.config.get_int(
             guild_id, "llm.cooldown", DEFAULT_COOLDOWN_SECONDS, minimum=0, maximum=MAX_COOLDOWN_SECONDS
@@ -2844,7 +2933,8 @@ class Aguiliar(commands.Cog):
         _prompt_var.set(None)
         _images_var.set({})
         try:
-            placeholder = await message.reply("*thinking…*", mention_author=False)
+            placeholder = await message.reply(f"*{self._thinking.pick()}…*",
+                                              mention_author=False)
         except (discord.Forbidden, discord.HTTPException):
             return
         started = time.monotonic()
