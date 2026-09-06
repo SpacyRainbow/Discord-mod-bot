@@ -19,6 +19,9 @@ from bot.modules.aguiliar import (
     Aguiliar,
     build_identity_block,
     resolve_mentions,
+    describe_mentioned,
+    describe_member,
+    is_moderator,
     build_system_prompt,
     live_preview,
     channel_allowed,
@@ -2360,3 +2363,54 @@ def test_text_without_mentions_is_returned_untouched():
 
 def test_a_missing_guild_does_not_raise():
     assert resolve_mentions("<@1> hi", None) == "@someone hi"
+
+
+# --- mentioned members are described inline, without a tool round -----------
+
+
+class _FakePerms:
+    def __init__(self, mod=False):
+        self.manage_messages = mod
+        self.kick_members = mod
+        self.administrator = False
+
+
+class _FakeMember:
+    def __init__(self, name, mod=False, roles=("Server Booster",)):
+        self.display_name = name
+        self.name = name.lower()
+        self.roles = [_FakeNamed(r) for r in roles]
+        self.guild_permissions = _FakePerms(mod)
+        self.joined_at = None
+        self.created_at = None
+
+
+def test_a_mentioned_member_is_described_inline():
+    block = describe_mentioned([_FakeMember("Maximo")], [False])
+    assert "Maximo" in block and "Server Booster" in block
+    assert block.startswith("They mentioned:")
+
+
+def test_the_inline_block_and_the_tool_agree():
+    """One renderer, two routes - they must not drift."""
+    member = _FakeMember("Maximo")
+    assert describe_member(member, is_moderator=False) in describe_mentioned([member], [False])
+
+
+def test_no_mentions_costs_nothing():
+    assert describe_mentioned([], []) == ""
+
+
+def test_mentions_are_capped_and_the_overflow_is_named():
+    members = [_FakeMember(f"M{i}") for i in range(6)]
+    block = describe_mentioned(members, [False] * 6)
+    assert "M0" in block and "M2" in block
+    assert "M5" not in block
+    assert "3 more mentioned" in block
+    assert "read_member_profile" in block
+
+
+def test_the_moderator_flag_has_one_definition():
+    assert is_moderator(_FakeMember("Mod", mod=True)) is True
+    assert is_moderator(_FakeMember("Not", mod=False)) is False
+    assert is_moderator(object()) is False
