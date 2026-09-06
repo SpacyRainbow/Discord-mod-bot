@@ -302,26 +302,72 @@ def test_no_tool_schema_exposes_a_channel_or_guild_id():
             assert not name.lower().endswith("id")
 
 
-def test_only_read_tools_are_offered():
-    from bot.modules.aguiliar import SEARCH_TOOL_SCHEMA, TOOL_SCHEMAS
-    names = {s["function"]["name"] for s in TOOL_SCHEMAS + [SEARCH_TOOL_SCHEMA]}
-    assert names == {"read_recent_messages", "read_reply_chain", "read_member_profile",
-                     "read_image", "read_channel", "read_web_search"}
-    assert names == set(Aguiliar.TOOL_HANDLERS)
-    # Every offered tool is a read. Nothing here may write or send.
-    assert all(name.startswith("read_") for name in names)
+def test_tool_names_declare_whether_they_have_side_effects():
+    """The naming convention IS the safety boundary, so it is asserted.
+
+    This used to require every tool to start with read_, back when every tool
+    was a read. Side-effecting tools now exist, and the rule that replaced it is
+    stricter rather than looser: a tool is either a read_ (observes, changes
+    nothing) or an act_ (changes something and is separately authorized), there
+    is no third prefix, and the act_ set is derived from the schemas so the
+    permission checks in _dispatch_tool cannot silently disagree with what is
+    offered."""
+    from bot.modules.aguiliar import (
+        ACT_TOOL_NAMES, ACT_TOOL_SCHEMAS, EXTRA_READ_TOOL_SCHEMAS,
+        SEARCH_TOOL_SCHEMA, TOOL_SCHEMAS,
+    )
+    read_names = {s["function"]["name"]
+                  for s in TOOL_SCHEMAS + EXTRA_READ_TOOL_SCHEMAS + [SEARCH_TOOL_SCHEMA]}
+    act_names = {s["function"]["name"] for s in ACT_TOOL_SCHEMAS}
+    assert read_names == {"read_recent_messages", "read_reply_chain", "read_member_profile",
+                          "read_image", "read_channel", "read_web_search",
+                          "read_message_reactions", "read_own_past_replies"}
+    assert act_names == {"act_react_to_message", "act_roll_dice",
+                         "act_set_reminder", "act_start_poll"}
+    assert all(name.startswith("read_") for name in read_names)
+    assert all(name.startswith("act_") for name in act_names)
+    assert not read_names & act_names
+    assert act_names == set(ACT_TOOL_NAMES)
+    assert read_names | act_names == set(Aguiliar.TOOL_HANDLERS)
+
+
+def test_every_read_tool_handler_is_free_of_discord_writes():
+    """A read_ tool that sends, reacts, edits or deletes would be mislabelled,
+    and the label is what autonomous mode's permission set is built on. Checked
+    against the source of each handler rather than by calling it, so a write
+    added down some rarely-taken branch is still caught."""
+    import inspect
+    from bot.modules.aguiliar import Aguiliar as Cog
+    forbidden = (".send(", ".add_reaction(", ".remove_reaction(", ".edit(",
+                 ".delete(", ".ban(", ".kick(", ".create_", "scheduled.add(")
+    for name, handler_name in Cog.TOOL_HANDLERS.items():
+        if not name.startswith("read_"):
+            continue
+        source = inspect.getsource(getattr(Cog, handler_name))
+        for pattern in forbidden:
+            assert pattern not in source, f"{name} looks like it writes: {pattern}"
+
+
+def test_autonomous_act_tools_are_a_strict_subset():
+    from bot.modules.aguiliar import ACT_TOOL_NAMES, AUTONOMOUS_ACT_TOOLS
+    assert AUTONOMOUS_ACT_TOOLS < ACT_TOOL_NAMES
+    assert AUTONOMOUS_ACT_TOOLS == {"act_react_to_message"}
 
 
 def test_search_is_only_offered_when_a_search_host_is_configured():
-    """An instance with no LLM_SEARCH_URL must declare exactly the old three -
+    """An instance with no LLM_SEARCH_URL must not declare the search tool -
     both so it never calls a tool that always errors, and so its prompt prefix
-    is byte-identical to what it was before search existed."""
-    from bot.modules.aguiliar import SEARCH_TOOL_SCHEMA, TOOL_SCHEMAS
+    does not carry a schema it can never use."""
+    from bot.modules.aguiliar import (
+        ACT_TOOL_SCHEMAS, EXTRA_READ_TOOL_SCHEMAS, SEARCH_TOOL_SCHEMA, TOOL_SCHEMAS,
+    )
     cog = _make_cog()
     cog.search_url = ""
-    assert cog._tool_schemas() == TOOL_SCHEMAS
+    assert cog._tool_schemas() == TOOL_SCHEMAS + EXTRA_READ_TOOL_SCHEMAS + ACT_TOOL_SCHEMAS
     cog.search_url = "http://searxng.example:8082/search"
-    assert cog._tool_schemas() == TOOL_SCHEMAS + [SEARCH_TOOL_SCHEMA]
+    assert cog._tool_schemas() == (
+        TOOL_SCHEMAS + EXTRA_READ_TOOL_SCHEMAS + [SEARCH_TOOL_SCHEMA] + ACT_TOOL_SCHEMAS
+    )
 
 
 def test_the_search_tool_takes_a_query_and_nothing_else():
@@ -1414,7 +1460,7 @@ async def test_the_status_is_shown_before_the_tool_runs_not_after():
                          "arguments": '{"query": "astra"}'}], "tool_calls"
         return "done", [], "stop"
 
-    async def fake_dispatch(name, raw_args, message):
+    async def fake_dispatch(name, raw_args, message, allowed_acts=None):
         events.append(("tool", name))
         return "results"
 
@@ -2675,3 +2721,774 @@ async def test_the_gap_diagnostics_round_trip_through_the_log(db):
     assert row is not None
     rows = await store.recent_for_guild(1, 5)
     assert rows and rows[0][-1] == "fallback"
+
+
+# --- act_* tools, terminal actions, and the authorization boundary ----------
+# The tests above this line cover a bot whose every tool was a read. Everything
+# below covers the two things that changed: tools that CHANGE something, and a
+# bot that occasionally speaks without being spoken to.
+
+from bot.modules.aguiliar import (  # noqa: E402
+    AUTO_REPLY_CHAR_CAP,
+    AUTONOMOUS_ACT_TOOLS,
+    NO_ACTION_TOKEN,
+    TerminalReply,
+    _msgs_var,
+    _reacted_var,
+    message_registry,
+    note_message,
+    parse_dice,
+    render_past_replies,
+    render_reactions,
+    resolve_emoji,
+    roll_dice,
+)
+from bot.modules.aguiliar_activity import (  # noqa: E402
+    ActivityTracker,
+    AutonomyConfig,
+    AutonomyState,
+    ChannelStats,
+    gate_reasons,
+    in_quiet_hours,
+    pick_channel,
+    roll_passes,
+)
+
+
+def _make_guild_emoji(name):
+    emoji = MagicMock()
+    emoji.name = name
+    return emoji
+
+
+def _make_target_message(message_id=999, channel_perm=True):
+    """A message the model could point at, wired enough for a reaction."""
+    target = MagicMock(spec=discord.Message)
+    target.id = message_id
+    target.add_reaction = AsyncMock()
+    target.channel = MagicMock()
+    target.channel.id = 7
+    permissions = MagicMock()
+    permissions.add_reactions = channel_perm
+    permissions.send_messages = channel_perm
+    permissions.read_message_history = channel_perm
+    target.channel.permissions_for = MagicMock(return_value=permissions)
+    target.channel.guild = MagicMock()
+    target.channel.guild.me = MagicMock()
+    return target
+
+
+# --- the message registry: refs instead of IDs ------------------------------
+
+def test_a_message_ref_is_opaque_and_never_an_id():
+    """The registry is what keeps the no-IDs invariant true while still letting
+    the model point at one message. A ref carries no information about which
+    message it is - it is a position in this request's registry and nothing
+    else - so it cannot be constructed for a message the model was not shown."""
+    _msgs_var.set({})
+    trigger = _make_message()
+    first, second = _make_target_message(111), _make_target_message(222)
+    assert note_message(trigger, first) == " [msg1]"
+    assert note_message(trigger, second) == " [msg2]"
+    assert message_registry(trigger)["msg1"] is first
+    assert "111" not in "msg1"
+
+
+def test_the_same_message_gets_the_same_ref_twice():
+    """A history read and a reply-chain walk can both reach one message. Two
+    refs for one message would invite two reactions on it."""
+    _msgs_var.set({})
+    trigger = _make_message()
+    target = _make_target_message(111)
+    assert note_message(trigger, target) == " [msg1]"
+    assert note_message(trigger, target) == " [msg1]"
+    assert len(message_registry(trigger)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_ref_that_was_never_shown_cannot_be_resolved():
+    """The confinement boundary, stated as a test: a model that invents msg7
+    gets an error and a list of what it may actually point at, not a message."""
+    _msgs_var.set({})
+    cog = _make_cog()
+    message = _make_message()
+    result = cog._resolve_ref(message, "msg7")
+    assert isinstance(result, str)
+    payload = json.loads(result)
+    assert "no message called msg7" in payload["error"]
+
+
+# --- act_react_to_message ---------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reacting_ends_the_turn_without_another_model_pass():
+    """The point of the whole terminal-action mechanism. At ~4 tok/s a second
+    inference to say "I reacted with a skull" costs more than a minute to tell
+    somebody what is already on their screen."""
+    _msgs_var.set({})
+    cog = _make_cog()
+    message = _make_message()
+    target = _make_target_message()
+    message_registry(message)["msg1"] = target
+    result = await cog._tool_act_react_to_message(
+        message, {"ref": "msg1", "emoji": "\U0001f480"})
+    assert isinstance(result, TerminalReply)
+    assert str(result) == ""
+    target.add_reaction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_tool_loop_stops_on_a_terminal_action():
+    """_converse must return the TerminalReply itself rather than looping for
+    another completion - that saved round IS the feature."""
+    cog = _make_cog()
+    calls = {"n": 0}
+
+    async def fake_stream(payload, on_text):
+        calls["n"] += 1
+        return "", [{"id": "c1", "name": "act_react_to_message",
+                     "arguments": '{"ref": "msg1", "emoji": "x"}'}], "tool_calls"
+
+    async def fake_dispatch(name, raw_args, message, allowed_acts=None):
+        return TerminalReply("")
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = fake_dispatch
+    trace = {"rounds": 0, "tool_calls": []}
+    answer = await cog._converse(_make_message(), [], 200, AsyncMock(), trace)
+    assert isinstance(answer, TerminalReply)
+    assert calls["n"] == 1, "a terminal action must not trigger a second inference"
+    assert trace["terminal"] == "act_react_to_message"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reaction_is_reported_honestly_not_as_success():
+    """A reaction Discord refused must come back as an error the model can read
+    and answer for. Returning a TerminalReply here would end the turn silently
+    and leave the bot having said nothing at all."""
+    _msgs_var.set({})
+    cog = _make_cog()
+    message = _make_message()
+    target = _make_target_message()
+    target.add_reaction = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "nope"))
+    message_registry(message)["msg1"] = target
+    result = await cog._tool_act_react_to_message(
+        message, {"ref": "msg1", "emoji": "\U0001f480"})
+    assert not isinstance(result, TerminalReply)
+    assert "refused" in json.loads(result)["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_reaction_is_refused_without_the_discord_permission():
+    """Checked in Python before the API call. The model asks; code decides."""
+    _msgs_var.set({})
+    cog = _make_cog()
+    message = _make_message()
+    target = _make_target_message(channel_perm=False)
+    message_registry(message)["msg1"] = target
+    result = await cog._tool_act_react_to_message(
+        message, {"ref": "msg1", "emoji": "\U0001f480"})
+    assert "not allowed" in json.loads(result)["error"]
+    target.add_reaction.assert_not_awaited()
+
+
+def test_a_custom_emoji_resolves_only_from_this_guild():
+    guild = MagicMock()
+    guild.emojis = [_make_guild_emoji("copium")]
+    assert resolve_emoji(":copium:", guild).name == "copium"
+    assert resolve_emoji("<:copium:12345>", guild).name == "copium"
+    with pytest.raises(ValueError):
+        resolve_emoji(":nothere:", guild)
+
+
+def test_an_emoji_that_is_actually_a_sentence_is_rejected():
+    """The model occasionally answers a string parameter with prose. Discord
+    would 400 on it half a second later; this fails faster and more clearly."""
+    guild = MagicMock()
+    guild.emojis = []
+    with pytest.raises(ValueError):
+        resolve_emoji("a skull emoji please", guild)
+    with pytest.raises(ValueError):
+        resolve_emoji("", guild)
+
+
+# --- authorization ----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_autonomous_mode_cannot_reach_a_forbidden_act_tool():
+    """Autonomous mode is offered reactions only. This asserts the SECOND gate:
+    even if the model names act_start_poll - which it was never shown - the
+    dispatcher refuses it. Not describing a tool is not the same as refusing
+    it, and only one of those is a permission check."""
+    cog = _make_cog()
+    cog._tool_act_start_poll = AsyncMock()
+    result = await cog._dispatch_tool(
+        "act_start_poll", "{}", _make_message(), AUTONOMOUS_ACT_TOOLS)
+    assert "not available" in json.loads(result)["error"]
+    cog._tool_act_start_poll.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_pinged_reply_may_use_every_act_tool():
+    """The other side of the same boundary: being asked directly is a
+    higher-trust context than acting uninvited."""
+    cog = _make_cog()
+    cog._tool_act_roll_dice = AsyncMock(return_value=TerminalReply("1d20: **7**"))
+    result = await cog._dispatch_tool("act_roll_dice", '{"spec": "1d20"}', _make_message())
+    assert isinstance(result, TerminalReply)
+
+
+@pytest.mark.asyncio
+async def test_autonomous_mode_still_gets_the_read_tools():
+    """Narrowing act_* must not accidentally narrow the reads: looking before
+    speaking is the behaviour we want more of, not less."""
+    cog = _make_cog()
+    names = {s["function"]["name"] for s in cog._tool_schemas(AUTONOMOUS_ACT_TOOLS)}
+    assert "read_recent_messages" in names
+    assert "act_react_to_message" in names
+    assert "act_start_poll" not in names
+
+
+# --- dice -------------------------------------------------------------------
+
+def test_dice_are_rolled_in_python_not_imagined_by_the_model():
+    import random as _random
+    rendered = roll_dice("2d6+3", _random.Random(1))
+    assert rendered.startswith("2d6+3:")
+    assert "**" in rendered
+    assert parse_dice("4d10-1") == (4, 10, -1)
+    assert parse_dice("d20") == (1, 20, 0)
+
+
+def test_dice_bounds_are_not_the_models_to_widen():
+    for bad in ("99999d6", "1d99999", "0d6", "hello", "", "1d1"):
+        with pytest.raises(ValueError):
+            parse_dice(bad)
+
+
+# --- read_own_past_replies --------------------------------------------------
+
+def test_past_replies_render_as_the_bots_own_words():
+    rows = [("2026-09-01T10:11:12", "general", "your server is fine, you are not", "Raheem")]
+    rendered = render_past_replies(rows)
+    assert "your server is fine" in rendered
+    assert "2026-09-01 10:11" in rendered
+    assert "#general" in rendered
+
+
+def test_no_past_replies_says_so_rather_than_returning_nothing():
+    assert "not said anything" in render_past_replies([])
+
+
+@pytest.mark.asyncio
+async def test_past_reply_search_is_scoped_to_this_guild_and_bounded():
+    cog = _make_cog()
+    message = _make_message()
+    message.guild.id = 5
+    cog.bot.stores.llm_log.search_replies = AsyncMock(return_value=[])
+    await cog._tool_read_own_past_replies(message, {"query": "minecraft", "limit": 999})
+    guild_id, query, limit = cog.bot.stores.llm_log.search_replies.await_args.args
+    assert guild_id == 5
+    assert limit <= 5
+
+
+# --- reactions read ---------------------------------------------------------
+
+def test_reaction_summary_says_whether_the_bot_itself_reacted():
+    reaction = MagicMock()
+    reaction.emoji = "\U0001f480"
+    reaction.count = 4
+    reaction.me = True
+    reaction._cached_users = []
+    message = MagicMock()
+    message.reactions = [reaction]
+    rendered = render_reactions(message, _bot_user())
+    assert "x4" in rendered
+    assert "including you" in rendered
+
+
+def test_a_message_with_no_reactions_is_stated_plainly():
+    message = MagicMock()
+    message.reactions = []
+    assert "no reactions" in render_reactions(message, _bot_user())
+
+
+# --- the activity tracker ---------------------------------------------------
+
+def _busy_channel(tracker, channel_id=1, humans=3, each=4, now=1000.0):
+    for user in range(humans):
+        for _ in range(each):
+            tracker.record(channel_id, 100 + user, False, 30, now)
+    return tracker
+
+
+def test_a_real_multi_human_conversation_scores_as_a_candidate():
+    tracker = _busy_channel(ActivityTracker())
+    stats = tracker.stats(1, 600, now=1000.0)
+    assert stats.humans == 3
+    assert stats.messages == 12
+    assert stats.score > 10
+
+
+def test_one_person_posting_thirty_times_is_not_a_conversation():
+    """Volume is not activity. A monologue must never read as a room worth
+    joining, which is the difference between a bot with judgement and a bot
+    that barges in."""
+    tracker = ActivityTracker()
+    for _ in range(30):
+        tracker.record(1, 100, False, 40, 1000.0)
+    monologue = tracker.stats(1, 600, now=1000.0)
+    balanced = _busy_channel(ActivityTracker(), humans=3, each=4).stats(1, 600, now=1000.0)
+    assert monologue.humans == 1
+    assert monologue.score < balanced.score
+
+
+def test_bot_chatter_does_not_count_as_human_activity():
+    tracker = ActivityTracker()
+    for _ in range(20):
+        tracker.record(1, 500, True, 40, 1000.0)
+    stats = tracker.stats(1, 600, now=1000.0)
+    assert stats.messages == 0
+    assert stats.humans == 0
+    assert stats.score <= 0
+
+
+def test_a_dead_channel_scores_nothing():
+    tracker = ActivityTracker()
+    tracker.record(1, 100, False, 30, 0.0)
+    stats = tracker.stats(1, 600, now=100000.0)
+    assert stats.messages == 0
+    assert pick_channel([(1, stats)]) is None
+
+
+def test_a_channel_the_bot_just_spoke_in_is_penalised():
+    tracker = _busy_channel(ActivityTracker())
+    before = tracker.stats(1, 600, now=1000.0).score
+    tracker.record_self(1, 990.0)
+    after = tracker.stats(1, 600, now=1000.0).score
+    assert after < before
+
+
+def test_an_all_one_word_window_is_not_a_conversation():
+    tracker = ActivityTracker()
+    for user in range(3):
+        for _ in range(4):
+            tracker.record(1, 100 + user, False, 3, 1000.0)
+    assert tracker.stats(1, 600, now=1000.0).score < 10
+
+
+def test_the_tracker_does_not_grow_without_bound():
+    tracker = ActivityTracker()
+    for i in range(500):
+        tracker.record(1, 100, False, 10, 1000.0 + i)
+    assert len(tracker._seen[1]) <= 80
+    tracker.record(2, 100, False, 10, 0.0)
+    assert tracker.sweep(now=200000.0) >= 1
+
+
+def test_the_highest_scoring_channel_wins():
+    quiet = ChannelStats(messages=4, humans=2, score=3.0, newest_age=30)
+    busy = ChannelStats(messages=20, humans=5, score=22.0, newest_age=10)
+    assert pick_channel([(1, quiet), (2, busy)])[0] == 2
+
+
+# --- the gates --------------------------------------------------------------
+
+def _good_stats():
+    return ChannelStats(messages=12, humans=3, newest_age=20.0, score=20.0)
+
+
+def _enabled_config(**kwargs):
+    base = dict(enabled=True, channels=(1,), chance_percent=100)
+    base.update(kwargs)
+    return AutonomyConfig(**base)
+
+
+def test_every_gate_passing_leaves_no_reasons():
+    reasons = gate_reasons(_enabled_config(), AutonomyState(), idle_seconds=99999,
+                           channel_id=1, stats=_good_stats(), now=1_000_000.0,
+                           local_hour=15, day="2026-09-06")
+    assert reasons == []
+
+
+def test_a_bot_that_just_spoke_is_not_idle_enough():
+    reasons = gate_reasons(_enabled_config(), AutonomyState(), idle_seconds=60,
+                           channel_id=1, stats=_good_stats(), now=1_000_000.0,
+                           local_hour=15, day="2026-09-06")
+    assert any(r.startswith("bot-not-idle") for r in reasons)
+
+
+def test_an_empty_allowlist_means_no_channels_not_every_channel():
+    """The opposite of llm.channels, deliberately: being pinged in a channel is
+    consent, wandering into one uninvited is not."""
+    reasons = gate_reasons(AutonomyConfig(enabled=True, channels=()), AutonomyState(),
+                           idle_seconds=99999, channel_id=1, stats=_good_stats(),
+                           now=1_000_000.0, local_hour=15, day="2026-09-06")
+    assert "no-allowlist" in reasons
+
+
+def test_a_channel_outside_the_allowlist_is_refused():
+    reasons = gate_reasons(_enabled_config(channels=(999,)), AutonomyState(),
+                           idle_seconds=99999, channel_id=1, stats=_good_stats(),
+                           now=1_000_000.0, local_hour=15, day="2026-09-06")
+    assert "channel-not-allowed" in reasons
+
+
+def test_cooldowns_survive_and_are_enforced():
+    state = AutonomyState()
+    state.note_action(1, 1_000_000.0, "2026-09-06")
+    reasons = gate_reasons(_enabled_config(), state, idle_seconds=99999, channel_id=1,
+                           stats=_good_stats(), now=1_000_060.0, local_hour=15,
+                           day="2026-09-06")
+    assert "global-cooldown" in reasons
+    assert "channel-cooldown" in reasons
+
+
+def test_a_no_action_evaluation_stops_the_same_conversation_being_reconsidered():
+    state = AutonomyState()
+    state.note_eval(1, 1_000_000.0)
+    reasons = gate_reasons(_enabled_config(), state, idle_seconds=99999, channel_id=1,
+                           stats=_good_stats(), now=1_000_010.0, local_hour=15,
+                           day="2026-09-06")
+    assert "eval-cooldown" in reasons
+
+
+def test_the_daily_cap_holds():
+    config = _enabled_config(max_per_day=2)
+    state = AutonomyState()
+    for _ in range(2):
+        state.note_action(1, 0.0, "2026-09-06")
+    reasons = gate_reasons(config, state, idle_seconds=99999, channel_id=1,
+                           stats=_good_stats(), now=1_000_000.0, local_hour=15,
+                           day="2026-09-06")
+    assert "daily-cap" in reasons
+    # A new day clears it rather than needing a restart.
+    assert "daily-cap" not in gate_reasons(
+        config, state, idle_seconds=99999, channel_id=1, stats=_good_stats(),
+        now=1_000_000.0, local_hour=15, day="2026-09-07")
+
+
+def test_quiet_hours_wrap_over_midnight():
+    assert in_quiet_hours(2, 23, 8)
+    assert in_quiet_hours(23, 23, 8)
+    assert not in_quiet_hours(12, 23, 8)
+    assert not in_quiet_hours(12, -1, -1)
+
+
+def test_the_random_gate_is_last_and_cannot_rescue_a_failed_gate():
+    """Randomness decides whether a reasonable opportunity is taken. It never
+    promotes an unreasonable one, which is why it is not consulted here at all
+    until gate_reasons is empty."""
+    dead = ChannelStats(messages=1, humans=1, score=0.5, newest_age=10)
+    reasons = gate_reasons(_enabled_config(chance_percent=100), AutonomyState(),
+                           idle_seconds=99999, channel_id=1, stats=dead,
+                           now=1_000_000.0, local_hour=15, day="2026-09-06")
+    assert reasons, "a dead channel must fail deterministically, before any roll"
+    assert roll_passes(0) is False
+    assert roll_passes(100) is True
+
+
+# --- autonomy state persistence ---------------------------------------------
+
+def test_autonomy_state_round_trips_through_json():
+    state = AutonomyState()
+    state.note_action(7, 1_000_000.0, "2026-09-06")
+    state.note_reaction(555)
+    state.note_target(99)
+    restored = AutonomyState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert restored.last_channel_action[7] == 1_000_000.0
+    assert restored.already_reacted(555)
+    assert restored.targeted_recently(99)
+    assert restored.day_count == 1
+
+
+def test_a_corrupt_state_blob_degrades_instead_of_stopping_the_loop():
+    assert AutonomyState.from_dict(None).day_count == 0
+    assert AutonomyState.from_dict({"last_action_at": "not a number"}).day_count == 0
+
+
+def test_reacted_messages_are_remembered_and_bounded():
+    state = AutonomyState()
+    for message_id in range(200):
+        state.note_reaction(message_id)
+    assert len(state.reacted_messages) <= AutonomyState.REACTED_MAX
+    assert state.already_reacted(199)
+
+
+# --- autonomous delivery ----------------------------------------------------
+
+def _auto_channel():
+    channel = MagicMock()
+    channel.id = 7
+    channel.guild = MagicMock()
+    channel.guild.id = 5
+    channel.send = AsyncMock()
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_no_action_is_a_successful_outcome_that_posts_nothing():
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    action, _ = await cog._autonomous_deliver(
+        channel, _make_message(), NO_ACTION_TOKEN, _enabled_config(), state,
+        1_000_000.0, "2026-09-06")
+    assert action == "NO_ACTION"
+    channel.send.assert_not_awaited()
+    assert state.last_action_at == 0.0, "declining must not burn the action cooldown"
+
+
+@pytest.mark.asyncio
+async def test_an_autonomous_reaction_records_the_message_so_it_cannot_repeat():
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    _reacted_var.set(4242)
+    action, _ = await cog._autonomous_deliver(
+        channel, _make_message(), TerminalReply(""), _enabled_config(), state,
+        1_000_000.0, "2026-09-06")
+    assert action == "REACT"
+    assert state.already_reacted(4242)
+    channel.send.assert_not_awaited()
+    # And the registry refuses to offer it again on a later wake-up.
+    _msgs_var.set({})
+    target = _make_target_message(4242)
+    trigger = _make_message()
+    marker = "" if state.already_reacted(target.id) else note_message(trigger, target)
+    assert marker == ""
+
+
+@pytest.mark.asyncio
+async def test_an_unprompted_wall_of_text_is_dropped_rather_than_posted():
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    action, detail = await cog._autonomous_deliver(
+        channel, _make_message(), "x" * (AUTO_REPLY_CHAR_CAP + 1), _enabled_config(),
+        state, 1_000_000.0, "2026-09-06")
+    assert action == "NO_ACTION"
+    assert "too-long" in detail
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_same_person_is_not_picked_on_twice_in_a_row():
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    anchor = _make_message()
+    anchor.author.id = 77
+    state.note_target(77)
+    action, detail = await cog._autonomous_deliver(
+        channel, anchor, "you again", _enabled_config(), state, 1_000_000.0, "2026-09-06")
+    assert action == "NO_ACTION"
+    assert detail == "same-target-recently"
+
+
+@pytest.mark.asyncio
+async def test_reactions_only_mode_refuses_to_write_a_reply():
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    action, _ = await cog._autonomous_deliver(
+        channel, _make_message(), "something clever", _enabled_config(allow_reply=False),
+        state, 1_000_000.0, "2026-09-06")
+    assert action == "NO_ACTION"
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_send_that_discord_refuses_is_not_recorded_as_participation():
+    """Failing honestly matters twice over here: the cooldown must not be spent
+    on a message nobody saw."""
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    channel.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no"))
+    action, _ = await cog._autonomous_deliver(
+        channel, _make_message(), "hello", _enabled_config(), state,
+        1_000_000.0, "2026-09-06")
+    assert action == "SEND_FAILED"
+    assert state.last_action_at == 0.0
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_autonomous_reply_spends_every_cooldown():
+    cog = _make_cog()
+    cog._save_auto_state = AsyncMock()
+    channel, state = _auto_channel(), AutonomyState()
+    anchor = _make_message()
+    anchor.author.id = 88
+    action, _ = await cog._autonomous_deliver(
+        channel, anchor, "skill issue", _enabled_config(), state,
+        1_000_000.0, "2026-09-06")
+    assert action == "REPLY"
+    channel.send.assert_awaited_once()
+    assert state.last_action_at == 1_000_000.0
+    assert state.last_channel_action[7] == 1_000_000.0
+    assert state.day_count == 1
+    assert state.targeted_recently(88)
+
+
+# --- one round, several tools ------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_independent_lookups_in_one_round_cost_one_extra_inference():
+    """Batching already works and this pins it down.
+
+    Latency is the scarce resource: three lookups issued together cost ONE
+    follow-up inference, while three issued one per round would cost three, and
+    at ~4 tok/s that is the difference between a slow reply and an abandoned
+    one. All results go back before the next completion is requested."""
+    cog = _make_cog()
+    inferences = {"n": 0}
+    executed = []
+
+    async def fake_stream(payload, on_text):
+        inferences["n"] += 1
+        if inferences["n"] == 1:
+            return "", [
+                {"id": "a", "name": "read_member_profile", "arguments": '{"display_name": "x"}'},
+                {"id": "b", "name": "read_channel", "arguments": "{}"},
+                {"id": "c", "name": "read_message_reactions", "arguments": '{"ref": "msg1"}'},
+            ], "tool_calls"
+        return "done", [], "stop"
+
+    async def fake_dispatch(name, raw_args, message, allowed_acts=None):
+        executed.append(name)
+        return f"{name} result"
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = fake_dispatch
+    sent = []
+    trace = {"rounds": 0, "tool_calls": []}
+    answer = await cog._converse(_make_message(), sent, 200, AsyncMock(), trace)
+    assert answer == "done"
+    assert executed == ["read_member_profile", "read_channel", "read_message_reactions"]
+    assert inferences["n"] == 2, "three lookups must not cost three extra rounds"
+    tool_turns = [m for m in sent if m.get("role") == "tool"]
+    assert len(tool_turns) == 3
+    assert [m["tool_call_id"] for m in tool_turns] == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_action_drops_the_rest_of_its_round():
+    """If the turn is over, the remaining calls in that round are work whose
+    results nothing will ever read."""
+    cog = _make_cog()
+    executed = []
+
+    async def fake_stream(payload, on_text):
+        return "", [
+            {"id": "a", "name": "act_react_to_message", "arguments": "{}"},
+            {"id": "b", "name": "read_channel", "arguments": "{}"},
+        ], "tool_calls"
+
+    async def fake_dispatch(name, raw_args, message, allowed_acts=None):
+        executed.append(name)
+        return TerminalReply("") if name.startswith("act_") else "result"
+
+    cog._stream_completion = fake_stream
+    cog._dispatch_tool = fake_dispatch
+    answer = await cog._converse(_make_message(), [], 200, AsyncMock(),
+                                 {"rounds": 0, "tool_calls": []})
+    assert isinstance(answer, TerminalReply)
+    assert executed == ["act_react_to_message"]
+
+
+# --- every tool through the real dispatch path -------------------------------
+
+@pytest.mark.asyncio
+async def test_every_tool_survives_the_real_dispatch_path():
+    """Exercises all twelve tools through _dispatch_tool itself - the same entry
+    point the model's calls arrive at in production, including the allowlist
+    lookup, JSON argument parsing, the act_ authorization check and the
+    fail-closed wrapper.
+
+    This is not a substitute for a live ping (nothing here proves llama-server
+    emits a call this module can parse), but it does prove that every declared
+    tool is reachable, that its handler runs, and that none of them raise their
+    way into the "tool failed" branch - which is what an unproven tool path
+    usually turns out to be hiding.
+    """
+    _msgs_var.set({})
+    _images_var.set({})
+    cog = _make_cog()
+    cog.search_url = ""
+    message = _make_message()
+    message.guild.id = 5
+    message.guild.emojis = [_make_guild_emoji("copium")]
+    message.guild.voice_channels = []
+    message.author.id = 3
+    message.id = 1
+    message.reference = None
+
+    async def empty_history(*args, **kwargs):
+        return
+        yield  # pragma: no cover
+
+    message.channel = MagicMock()
+    message.channel.id = 7
+    message.channel.history = lambda **kwargs: empty_history()
+    message.channel.pins = AsyncMock(return_value=[])
+    message.channel.topic = "the tofu channel"
+    message.channel.send = AsyncMock()
+    permissions = MagicMock()
+    permissions.add_reactions = permissions.send_messages = True
+    message.channel.permissions_for = MagicMock(return_value=permissions)
+    message.channel.guild = message.guild
+    message.guild.me = MagicMock()
+    message.guild.members = []
+    target = _make_target_message()
+    message_registry(message)["msg1"] = target
+    cog.bot.stores.llm_log.search_replies = AsyncMock(return_value=[])
+    cog.bot.stores.scheduled.add = AsyncMock(return_value=1)
+
+    calls = {
+        "read_recent_messages": '{"limit": 5}',
+        "read_reply_chain": "{}",
+        "read_member_profile": '{"display_name": "nobody"}',
+        "read_image": '{"ref": "image1"}',
+        "read_channel": "{}",
+        "read_message_reactions": '{"ref": "msg1"}',
+        "read_own_past_replies": '{"query": "tofu"}',
+        "act_react_to_message": '{"ref": "msg1", "emoji": ":copium:"}',
+        "act_roll_dice": '{"spec": "1d20"}',
+        "act_set_reminder": '{"delay": "30m", "text": "check the NAS"}',
+        "act_start_poll": '{"question": "tofu?", "options": ["yes", "no"]}',
+    }
+    assert set(calls) | {"read_web_search"} == set(Aguiliar.TOOL_HANDLERS), \
+        "a tool was added without being exercised here"
+    for name, arguments in calls.items():
+        result = await cog._dispatch_tool(name, arguments, message)
+        rendered = str(result) if not isinstance(result, list) else json.dumps(result)
+        assert "tool failed" not in rendered, f"{name} raised through the wrapper"
+        assert "no such tool" not in rendered, f"{name} is not in the allowlist"
+    target.add_reaction.assert_awaited_once()
+    cog.bot.stores.scheduled.add.assert_awaited_once()
+    message.channel.send.assert_awaited_once()
+
+
+def test_the_message_registry_is_per_request_not_per_message_object():
+    """discord.Message has __slots__, so the ContextVar is the real storage and
+    the attribute fallback is only for direct calls and tests. If a request path
+    forgets to open the ContextVar, every caller gets a fresh dict, every
+    message is numbered msg1, and no ref the model was shown ever resolves -
+    silently, since the model is simply told the ref does not exist. This pins
+    the contract that made that bug possible for the image registry."""
+    shared = {}
+    _msgs_var.set(shared)
+    assert message_registry(_make_message()) is shared
+    assert message_registry(_make_message()) is shared, "two messages, one request"
+
+
+def test_both_request_scoped_registries_are_opened_together():
+    """_respond and the autonomous path must open the message registry wherever
+    they open the image one; a path that opens only images is the failure above."""
+    import inspect
+    from bot.modules.aguiliar import Aguiliar as Cog
+    for method in (Cog._respond, Cog._autonomous_participate):
+        source = inspect.getsource(method)
+        assert "_images_var.set({})" in source
+        assert "_msgs_var.set({})" in source

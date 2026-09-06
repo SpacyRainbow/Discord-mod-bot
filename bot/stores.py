@@ -766,6 +766,28 @@ class LLMLogStore(_Store):
             (channel_id, since_iso, limit),
         )
 
+    async def search_replies(self, guild_id: int, query: str, limit: int) -> list:
+        """Aguilar's OWN past replies matching `query`, newest first.
+
+        Deliberately scoped to the reply column: this table already stores what
+        people asked as well as what the bot answered, and searching the prompt
+        column too would quietly turn an existing debug log into a searchable
+        archive of what members said - which is a decision that has not been
+        made. Only successful exchanges, for the same reason recent_for_channel
+        filters them: a timeout row has no reply to find.
+
+        LIKE wildcards in the query are escaped, so a member asking about "100%"
+        searches for that and not for "any character".
+        """
+        needle = (query or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return await self._read_all(
+            "SELECT created_at, channel_name, reply, user_name FROM llm_log "
+            "WHERE guild_id = ? AND status = 'ok' AND reply IS NOT NULL AND reply != '' "
+            "AND reply LIKE ? ESCAPE '\\' "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (guild_id, f"%{needle}%", limit),
+        )
+
     async def recent_for_guild(self, guild_id: int, limit: int) -> list:
         """Newest-first, successes and failures alike - this one is /llmlog."""
         return await self._read_all(

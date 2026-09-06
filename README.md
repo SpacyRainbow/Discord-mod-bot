@@ -866,14 +866,30 @@ itself, the channel name, and one line saying how long ago the previous message
 was — enough for the model to judge for itself whether earlier context is even
 relevant. A ping after three days of silence usually is not. When it does need
 history — or something it cannot know at all — it asks for it, using one of
-these read-only tools:
+these tools.
 
-| Tool | What it reads |
+Tool names say whether they change anything, and this is enforced rather than
+conventional: a `read_` tool observes and mutates nothing, an `act_` tool has a
+side effect and is separately authorized in Python before it runs. A test
+asserts there is no third kind.
+
+| Read tool | What it reads |
 |---|---|
 | `read_recent_messages` | Up to 100 recent messages in the channel you pinged it in, with an `offset` so it can page further back |
 | `read_reply_chain` | The chain of messages your message is replying to, up to 10 hops |
 | `read_member_profile` | One member of this server, looked up by the name they are shown under: their names, roles, join date, account age, and their online status and current game when the Presence intent is enabled |
 | `read_web_search` | The top few result snippets for one web search, when `LLM_SEARCH_URL` points at a [SearXNG](https://github.com/searxng/searxng) instance. Offered only when that is configured |
+| `read_channel` | The channel topic, its pinned messages, and who is in the server's voice channels, with their mute/deafen/streaming state |
+| `read_image` | One image posted earlier in the channel, by the marker it was shown under |
+| `read_message_reactions` | The reactions on one message it has been shown: emoji, counts, and who reacted where Discord has already cached them |
+| `read_own_past_replies` | Its own previous replies in this server, by keyword — for "you told me something different last week". It searches what **it** said, not what members said |
+
+| Act tool | What it does |
+|---|---|
+| `act_react_to_message` | Adds one emoji reaction to a message it has been shown. This **ends the turn**: no second generation runs to announce it, which is what makes a reaction cost seconds rather than minutes |
+| `act_roll_dice` | Rolls real dice in Python (`1d20`, `2d6+3`). A language model cannot generate a fair random number and should not pretend to |
+| `act_set_reminder` | Schedules a reminder for the person who asked, through the same `scheduled_tasks` engine `/remind` uses, so it survives a restart |
+| `act_start_poll` | Posts a native Discord poll |
 
 **Search is a search, not a browser.** The only thing the model supplies is a
 query string: there is no URL parameter anywhere in the schema, so it cannot
@@ -955,19 +971,58 @@ This is a deliberate trade: fetching history costs about 0.2 seconds per token
 of prompt on this hardware, so paying for it only when it is needed is what
 keeps a normal reply to two minutes instead of five.
 
+### Speaking up on its own
+
+Separately from being pinged, it can occasionally join a conversation it was not
+invited to. This is off by default and its channel allowlist is
+**empty-means-none**, not empty-means-everywhere — being pinged in a channel is
+consent, wandering into one uninvited is not.
+
+A background loop runs once a minute and is pure Python: it counts human
+messages, distinct humans, recency and bot traffic in a rolling window. The
+model is never woken just to ask whether anything is happening. Only when every
+deterministic gate passes — the bot has been quiet long enough, the channel is
+allowlisted and readable, several humans are actually talking, no cooldown is
+running, the daily cap is not spent, it is outside quiet hours — and *then* a
+probability roll passes does it pay for one inference. The roll is last on
+purpose: randomness decides whether it takes a reasonable opening, never whether
+an unreasonable one becomes acceptable.
+
+That one inference chooses between `NO_ACTION`, a single reaction, or one short
+line. **`NO_ACTION` is the expected outcome and is a success** — it costs a short
+evaluation cooldown so the same conversation is not reconsidered a minute later.
+Reactions are preferred because they end the turn without a second generation.
+Cooldowns are persisted, so a redeploy does not hand it a clean slate. One
+person posting thirty times scores as a monologue rather than a conversation,
+bot and webhook traffic does not count as activity, and a message it has already
+reacted to cannot be offered to it again.
+
+Configure it with the `llm.auto.*` keys in `/setconfig`.
+
 ### What it cannot do
 
 The limits are enforced in Python, not asked for in the prompt:
 
-- The tool list is a fixed allowlist of the read tools above. Anything else is
-  refused.
+- The tool list is a fixed allowlist. Anything else is refused.
 - **No tool takes a channel, guild, user, or message ID.** The handlers read the
   channel you pinged in and nothing else, so there is no way to make it read
-  another channel, a channel you cannot see, a DM, or another server.
-- Every argument is re-clamped in code — a request for 9999 messages reads 100.
+  another channel, a channel you cannot see, a DM, or another server. A tool that
+  has to point at one specific message — reacting to it, reading its reactions —
+  takes an opaque marker like `msg3` that only resolves inside the current
+  request, so it can only ever name something it was already shown.
+- **Side effects are authorized in code, per request, not by the prompt.** An
+  `act_` tool is refused unless the caller passed it in that request's allowlist,
+  and the check is independent of whether the tool was described to the model.
+  Autonomous participation (below) gets reactions only.
+- Every `act_` tool re-checks the Discord permission itself and fails with an
+  error the model has to answer for, so a reaction that did not happen is never
+  reported as one.
+- Every argument is re-clamped in code — a request for 9999 messages reads 100,
+  and 99999 dice is refused outright.
 - Malformed or unknown tool calls fail closed.
-- It cannot fetch URLs, read attachments, run commands, touch settings or
-  secrets, or write anything anywhere.
+- It cannot fetch URLs, read attachments, run commands, or touch settings or
+  secrets. What it can write is exactly the four `act_` tools above: a reaction,
+  a poll, a reminder, and its own replies.
 - It cannot see images. The model it runs on is text-only, so an attached
   picture is invisible to it rather than misdescribed.
 - Messages it retrieves are inert data: mention syntax is stripped, length is

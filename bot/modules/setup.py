@@ -139,6 +139,21 @@ CONFIG_MANIFEST = [
     ("llm.memoryminutes", "30", "30", "How stale a remembered exchange may be (minutes)"),
     ("llm.logdays", "30", "30", "Exchange log retention (days)"),
     ("llm.narrate", "false", "false", "Say what it is about to look up (slower)"),
+    # The autonomous wake-up. Off, with an empty channel allowlist that means
+    # NONE rather than "everywhere" - see aguiliar.py's AUTONOMOUS PARTICIPATION.
+    ("llm.auto.enabled", "false", "false", "Speak up unprompted in busy channels"),
+    ("llm.auto.channels", None, "unset (no channels)", "Channels it may join uninvited"),
+    ("llm.auto.idleminutes", "45", "45", "Silence before it may speak unprompted (minutes)"),
+    ("llm.auto.windowminutes", "10", "10", "How much recent conversation counts (minutes)"),
+    ("llm.auto.minmessages", "8", "8", "Human messages needed in that window"),
+    ("llm.auto.minusers", "3", "3", "Distinct humans needed in that window"),
+    ("llm.auto.chance", "25", "25", "Chance it takes an eligible opening (%)"),
+    ("llm.auto.cooldownminutes", "90", "90", "Cooldown after speaking unprompted (minutes)"),
+    ("llm.auto.channelcooldownminutes", "180", "180", "Same-channel cooldown (minutes)"),
+    ("llm.auto.evalcooldownminutes", "20", "20", "Cooldown after deciding to stay quiet (minutes)"),
+    ("llm.auto.maxperday", "6", "6", "Most unprompted messages per day"),
+    ("llm.auto.quiethours", None, "unset", "Hours it stays silent, e.g. 23-8"),
+    ("llm.auto.allowreply", "true", "true", "May write a line, not only react"),
     ("updates.auto_apply", "false", "false", "Automatically restart to apply detected updates"),
 ]
 
@@ -172,6 +187,14 @@ STEP_RESET_PREFIXES = {
         "llm.enabled", "llm.maxtokens", "llm.cooldown", "llm.channels",
         "llm.timezone", "llm.memoryturns", "llm.memoryminutes", "llm.logdays",
         "llm.narrate",
+        "llm.auto.enabled", "llm.auto.channels", "llm.auto.idleminutes",
+        "llm.auto.windowminutes", "llm.auto.minmessages", "llm.auto.minusers",
+        "llm.auto.chance", "llm.auto.cooldownminutes",
+        "llm.auto.channelcooldownminutes", "llm.auto.evalcooldownminutes",
+        "llm.auto.maxperday", "llm.auto.quiethours", "llm.auto.allowreply",
+        # llm.auto.state is deliberately absent: it is the persisted cooldown
+        # bookkeeping, not a setting, and clearing it would re-arm a bot that
+        # had just spoken.
     ],
     STEP_UPDATES: ["updates."],
 }
