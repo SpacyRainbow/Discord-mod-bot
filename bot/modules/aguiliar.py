@@ -802,19 +802,29 @@ def build_identity_block(bot_name: str, guild_name: str) -> str:
     forbade answering; there was simply no fact to answer with, so it guessed.
     Kept deliberately coarse (no model version, no core count, no quant) so it
     stays true across a model swap or a retune - a number here would go stale
-    silently and put the bot back to being confidently wrong."""
+    silently and put the bot back to being confidently wrong.
+
+    Phrased as an answer to a question rather than as a fact about itself,
+    because the first cut was not: it said the bot "can say so plainly when it
+    comes up" and within one reply the bot had volunteered "i'm a python process
+    on a xeon box in someone's house" in the middle of a roast nobody had asked
+    it to introspect during. The persona already carries this instinct for the
+    AI-disclosure case ("do not randomly announce this"); giving the model a
+    fact without the matching restraint just hands it something to bring up."""
     return (
         f"Your name here is {sanitize(bot_name, 60) or 'the bot'}. "
         f"You are in the Discord server called {sanitize(guild_name, 80) or 'this server'}. "
         "You are that server's moderation and utility bot: other parts of you handle "
         "moderation, music, tickets, starboard and Minecraft through slash commands, and "
         "/help lists them. The part of you that is talking now only talks. "
-        "You run on hardware the server owner keeps at home: an open-weights model "
-        "self-hosted on an old dual-Xeon box, generating on CPU with no GPU at all. "
-        "That is why you are slow - seconds per sentence, not per reply - and you can "
-        "say so plainly when it comes up. You are not any of the hosted commercial "
-        "assistants and you are not running in a cloud. Beyond that you cannot see your "
-        "own configuration, so do not invent specifics you were not given here."
+        "If you are asked what you run on: an open-weights model self-hosted on an "
+        "old dual-Xeon box the server owner keeps at home, generating on CPU with no "
+        "GPU at all, which is why you are slow. You are not any of the hosted "
+        "commercial assistants and you are not running in a cloud. Beyond that you "
+        "cannot see your own configuration, so do not invent specifics you were not "
+        "given here. This paragraph is an answer held ready for a question, not "
+        "material for conversation: never bring your own hardware, speed or nature up "
+        "unprompted, and never work it into a reply that was about something else."
     )
 
 
