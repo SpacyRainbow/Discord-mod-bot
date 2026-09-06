@@ -382,6 +382,21 @@ def roll_passes(chance_percent: int, rng: Optional[random.Random] = None) -> boo
     return (rng or random).randrange(100) < chance_percent
 
 
+# Skip reasons that are about the BOT or the CLOCK, not about one channel.
+# Seeing one of these means no other channel would fare better either, so the
+# tick can stop instead of scoring the rest.
+GUILD_WIDE_SKIPS = frozenset({"disabled", "no-allowlist", "quiet-hours",
+                              "global-cooldown", "daily-cap"})
+
+
+def rank_channels(candidates: List[Tuple[int, ChannelStats]]) -> List[Tuple[int, ChannelStats]]:
+    """Every viable candidate, best first. Same ordering as pick_channel; the
+    caller walks it so that a channel blocked by its OWN cooldown does not hide
+    the next one down."""
+    viable = [(cid, st) for cid, st in candidates if st.score > 0]
+    return sorted(viable, key=lambda item: (item[1].score, -item[1].newest_age), reverse=True)
+
+
 def pick_channel(candidates: List[Tuple[int, ChannelStats]]) -> Optional[Tuple[int, ChannelStats]]:
     """Highest score wins; ties break toward the more recent conversation. A
     non-positive score is never a candidate no matter how empty the field is."""

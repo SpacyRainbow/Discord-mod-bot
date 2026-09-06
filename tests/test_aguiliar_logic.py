@@ -3573,3 +3573,57 @@ async def test_naming_a_channel_explicitly_is_not_second_guessed():
     guild.id = 5
     config = AutonomyConfig(enabled=True, channels=(3, 9), exclude=(9,))
     assert await cog._auto_candidate_ids(guild, config) == [3]
+
+
+# --- when it wakes up: the three corrections of 2026-09-06 -------------------
+
+def test_channels_are_ranked_so_a_cooldown_does_not_hide_the_runner_up():
+    """The busiest channel is often the one sitting on its own three-hour
+    cooldown. Gating only the top candidate let it block every other channel
+    for the length of that cooldown."""
+    from bot.modules.aguiliar_activity import rank_channels
+    quiet = ChannelStats(messages=9, humans=3, score=12.0, newest_age=30)
+    busy = ChannelStats(messages=20, humans=5, score=25.0, newest_age=10)
+    dead = ChannelStats(messages=0, humans=0, score=0.0, newest_age=9999)
+    assert [cid for cid, _ in rank_channels([(1, quiet), (2, busy), (3, dead)])] == [2, 1]
+
+
+def test_a_guild_wide_skip_is_distinguishable_from_a_channel_one():
+    """A global cooldown cannot be fixed by looking at another channel; a
+    channel cooldown can. The tick has to tell them apart to know whether to
+    keep scoring."""
+    from bot.modules.aguiliar_activity import GUILD_WIDE_SKIPS
+    assert "global-cooldown" in GUILD_WIDE_SKIPS
+    assert "quiet-hours" in GUILD_WIDE_SKIPS
+    assert "daily-cap" in GUILD_WIDE_SKIPS
+    assert "channel-cooldown" not in GUILD_WIDE_SKIPS
+    assert "eval-cooldown" not in GUILD_WIDE_SKIPS
+
+
+def test_a_missed_roll_costs_an_evaluation_cooldown():
+    """Otherwise the roll re-runs every AUTO_CHECK_SECONDS against the same
+    conversation, and llm.auto.chance means "per minute" rather than "per
+    opportunity" - 25% would fire within ten minutes about 94% of the time."""
+    state = AutonomyState()
+    state.note_eval(1, 1_000_000.0)
+    reasons = gate_reasons(_enabled_config(chance_percent=25), state, idle_seconds=99999,
+                           channel_id=1, stats=_good_stats(), now=1_000_060.0,
+                           local_hour=15, day="2026-09-06")
+    assert "eval-cooldown" in reasons, "a miss must suppress the next minute's re-roll"
+
+
+@pytest.mark.asyncio
+async def test_a_restart_does_not_count_as_having_been_quiet():
+    """time.monotonic() is CLOCK_MONOTONIC and is NOT namespaced, so inside the
+    container it reads as host uptime - measured at 12 days. An unseeded
+    _last_spoke therefore made every redeploy look like a twelve-day silence and
+    satisfied the idle gate instantly."""
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    cog.bot.guilds = [guild]
+    cog.bot.wait_until_ready = AsyncMock()
+    await cog.before_autonomous_check()
+    assert 5 in cog._last_spoke
+    idle = __import__("time").monotonic() - cog._last_spoke[5]
+    assert idle < 60, "a fresh process must read as having just spoken"

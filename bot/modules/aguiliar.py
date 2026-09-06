@@ -178,7 +178,7 @@ from discord.ext import commands, tasks
 from ..durations import parse_duration
 from .aguiliar_activity import (
     ActivityTracker, AutonomyConfig, AutonomyState, ChannelStats,
-    gate_reasons, pick_channel, roll_passes,
+    GUILD_WIDE_SKIPS, gate_reasons, pick_channel, rank_channels, roll_passes,
 )
 
 logger = logging.getLogger(__name__)
@@ -3354,6 +3354,16 @@ class Aguiliar(commands.Cog):
             return
         self._warmed = True
         self._warm_task = self.bot.loop.create_task(self._warm_prefix_cache())
+        # Treat a fresh process as having just spoken, in every guild.
+        # time.monotonic() is CLOCK_MONOTONIC, which is not namespaced: inside
+        # the container it reads as HOST uptime (measured: 12 days), so an
+        # unseeded _last_spoke made `time.monotonic() - 0.0` a twelve-day idle
+        # and the "quiet for 45 minutes" gate passed instantly after every
+        # redeploy - including one done ten seconds after it last spoke. The
+        # empty activity window made that unlikely to fire rather than safe,
+        # which is not the same thing.
+        for guild in self.bot.guilds:
+            self._last_spoke.setdefault(guild.id, time.monotonic())
 
     async def _warm_prefix_cache(self) -> None:
         if not self.configured or self.session is None:
@@ -4068,6 +4078,12 @@ class Aguiliar(commands.Cog):
     @autonomous_check.before_loop
     async def before_autonomous_check(self):
         await self.bot.wait_until_ready()
+        # Seeded here as well as in on_ready, because this is the one place
+        # guaranteed to run before the first tick: on_ready and wait_until_ready
+        # resolve at about the same moment, and "about" is a race. setdefault,
+        # so whichever gets there first wins and neither overwrites a real one.
+        for guild in self.bot.guilds:
+            self._last_spoke.setdefault(guild.id, time.monotonic())
 
     async def _autonomy_config(self, guild_id: int) -> AutonomyConfig:
         """Reads every knob for one guild. Bounds live here rather than in the
@@ -4178,20 +4194,36 @@ class Aguiliar(commands.Cog):
             if not self._can(channel, "read_message_history") or not self._can(channel, "send_messages"):
                 continue
             candidates.append((channel_id, self._activity.stats(channel_id, config.window_seconds)))
-        best = pick_channel(candidates)
+        # Best first, but not ONLY the best: the busiest channel is often the one
+        # sitting on a three-hour channel cooldown, and gating just that one made
+        # it block every other channel for the length of its own cooldown.
+        best = None
+        for channel_id, stats in rank_channels(candidates):
+            reasons = gate_reasons(config, state, idle_seconds=idle, channel_id=channel_id,
+                                   stats=stats, now=now_wall, local_hour=local.hour, day=day)
+            if not reasons:
+                best = (channel_id, stats)
+                break
+            logger.debug("aguiliar: auto skip guild=%s channel=%s %s reasons=%s",
+                         guild.id, channel_id, stats.as_log(), ",".join(reasons))
+            # A guild-wide reason cannot be fixed by looking at another channel.
+            if any(r in GUILD_WIDE_SKIPS or r.startswith("bot-not-idle") for r in reasons):
+                return False
         if best is None:
             return False
         channel_id, stats = best
-        reasons = gate_reasons(config, state, idle_seconds=idle, channel_id=channel_id,
-                               stats=stats, now=now_wall, local_hour=local.hour, day=day)
-        if reasons:
-            logger.debug("aguiliar: auto skip guild=%s channel=%s %s reasons=%s",
-                         guild.id, channel_id, stats.as_log(), ",".join(reasons))
-            return False
         # LAST gate, and the only random one. Nothing above it was decided by
         # chance; this only decides whether an already-reasonable opportunity is
         # taken, which is what keeps it spontaneous without making it arbitrary.
         if not roll_passes(config.chance_percent):
+            # A missed roll costs the SAME evaluation cooldown as a NO_ACTION.
+            # Without this the roll is re-run every AUTO_CHECK_SECONDS against
+            # the same conversation, so "25%" would mean 25% PER MINUTE - about
+            # a 94% chance of firing within ten minutes of eligibility, which is
+            # not what the number says and not what "occasionally" means. With
+            # it, the chance is per evaluation window and reads the way it looks.
+            state.note_eval(channel_id, now_wall)
+            await self._save_auto_state(guild.id, state)
             logger.info("aguiliar: auto guild=%s channel=%s %s idle=%.0fs roll=missed",
                         guild.id, channel_id, stats.as_log(), idle)
             return False
