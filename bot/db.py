@@ -172,6 +172,12 @@ CREATE TABLE IF NOT EXISTS llm_log (
     cached_tokens INTEGER,
     gap_messages INTEGER,
     gap_chars INTEGER,
+    gap_mode TEXT,
+    gap_scanned INTEGER,
+    gap_anchor_distance INTEGER,
+    gap_truncated INTEGER,
+    gap_render_chars INTEGER,
+    gap_tokens_est INTEGER,
     context TEXT,
     reply_mode TEXT,
     reply_chars INTEGER,
@@ -217,6 +223,19 @@ ADDED_COLUMNS = [
     ("llm_log", "cached_tokens", "INTEGER"),
     ("llm_log", "gap_messages", "INTEGER"),
     ("llm_log", "gap_chars", "INTEGER"),
+    # Added 2026-09-06 to tune the gap caps against evidence rather than taste.
+    # `gap_mode` says which degradation step ran (anchored / fallback /
+    # no-anchor / off), `gap_scanned` and `gap_anchor_distance` say whether
+    # GAP_SCAN_MAX is sized right, `gap_truncated` says whether the caps are
+    # biting, and `gap_render_chars` / `gap_tokens_est` are what the block
+    # actually cost - `gap_chars` counts raw message text, which is larger than
+    # what ships after sanitize().
+    ("llm_log", "gap_mode", "TEXT"),
+    ("llm_log", "gap_scanned", "INTEGER"),
+    ("llm_log", "gap_anchor_distance", "INTEGER"),
+    ("llm_log", "gap_truncated", "INTEGER"),
+    ("llm_log", "gap_render_chars", "INTEGER"),
+    ("llm_log", "gap_tokens_est", "INTEGER"),
     # What the model was actually SHOWN, so nobody has to reconstruct it from
     # the code and guess. `context` is the verbatim user turn - the one piece
     # of evidence that settles any "did it even see that" argument - and the

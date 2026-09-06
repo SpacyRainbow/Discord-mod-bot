@@ -59,6 +59,11 @@ from bot.modules.aguiliar import (
     sanitize,
     should_respond,
     trim_gap,
+    GAP_FALLBACK_MESSAGES,
+    GAP_FALLBACK_CHAR_CAP,
+    GAP_CHARS_PER_TOKEN,
+    MESSAGE_CHAR_CAP,
+    _gap_stats_var,
 )
 
 
@@ -1753,13 +1758,37 @@ async def test_the_gap_stops_at_the_bots_own_message_and_includes_it():
 
 
 @pytest.mark.asyncio
-async def test_the_gap_is_empty_when_the_bot_has_not_spoken_recently():
-    """No anchor means no window. Falling back to "the last N" would be the
-    sliding window this whole feature exists to avoid."""
+async def test_no_anchor_falls_back_to_bounded_recent_history():
+    """Changed 2026-09-06. This used to assert an EMPTY gap, on the reasoning
+    that "the last N" is the sliding window the feature exists to avoid. True
+    about the cost, wrong about the trade: an empty gap costs the whole
+    conversation, so a miss now degrades to a smaller, clearly-labelled slice.
+    """
     cog = _gap_cog()
     message = _gap_message([_gap_item(n, "bob", f"m{n}") for n in range(30, 0, -1)])
     block, count, _chars, anchor, _ids = await cog._gap_messages(message)
+    assert anchor is None
+    # Bounded by the FALLBACK caps, not by llm.gapmax (15) - a sliding window
+    # is reprocessed every ping, so it gets the tighter budget.
+    assert count == GAP_FALLBACK_MESSAGES
+    # items are newest-first, so m30 is the NEWEST: the trim drops from the
+    # oldest end, which means m30 survives and m1 does not.
+    assert "bob: m30" in block and "bob: m1\n" not in block
+    # And it says what it is: claiming "since you last spoke" over a slice with
+    # a hole in it would have the model answer as if nothing were missing.
+    assert "you have not spoken here recently" in block
+    assert _gap_stats_var.get()["mode"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_window_is_still_an_empty_gap():
+    """The fallback is not a licence to invent context: nothing said in the
+    window at all still means nothing shown."""
+    cog = _gap_cog()
+    message = _gap_message([])
+    block, count, _chars, anchor, _ids = await cog._gap_messages(message)
     assert block == "" and count == 0 and anchor is None
+    assert _gap_stats_var.get()["mode"] == "no-anchor"
 
 
 @pytest.mark.asyncio
@@ -1799,14 +1828,20 @@ async def test_the_gap_is_off_when_gapmax_is_zero():
 
 
 @pytest.mark.asyncio
-async def test_the_gap_stops_at_the_age_cutoff_before_it_finds_an_anchor():
+async def test_the_age_cutoff_bounds_the_window_without_emptying_it():
+    """The cutoff still keeps the ancient anchor out - that intent is intact -
+    but it no longer throws away the in-window messages collected before it.
+    A channel quiet for an hour and then busy used to get NOTHING here."""
     cog = _gap_cog(gapminutes=10)
     message = _gap_message([
         _gap_item(3, "bob", "recent", minutes_ago=1),
         _gap_item(2, "Aguilar", "hours ago", is_bot=True, author_id=42, minutes_ago=600),
     ])
     block, count, _chars, anchor, _ids = await cog._gap_messages(message)
-    assert block == "" and count == 0 and anchor is None
+    assert anchor is None and count == 1
+    assert "recent" in block and "hours ago" not in block
+    stats = _gap_stats_var.get()
+    assert stats["mode"] == "fallback" and stats["hit_cutoff"] is True
 
 
 def test_trim_gap_honours_both_the_count_and_the_character_cap():
@@ -2195,8 +2230,13 @@ async def test_the_reply_target_survives_the_gap_character_cap(db):
     cog = _gap_prompt_cog(db, items)
     message = _gap_live_message(items, content="Try this again")
 
+    # Changed 2026-09-06: this used to assert the message was NOT here. It was
+    # evicted because trim_gap charged its 1.5 kB of RAW text against the cap
+    # while render_gap ships it at MESSAGE_CHAR_CAP (300) - budget spent that
+    # was never being used. Now measured at rendered size, it fits, and the
+    # oldest-first trim never fires. The incident is fixed at the source.
     without = (await cog._build_messages(message))[-1]["content"]
-    assert "rectangle ABCD" not in without      # the bug, still true unprompted
+    assert "rectangle ABCD" in without
 
     parent = MagicMock(spec=discord.Message)
     parent.id = 5
@@ -2534,3 +2574,104 @@ def test_the_shipped_pools_are_sane():
     # Comfortably wider than the window, or the variety is theatre.
     assert len(THINKING_PHRASES) > RECENT_WINDOW * 4
     assert len(BUSY_PHRASES) > RECENT_WINDOW
+
+
+# --- the gap's instrumentation ---------------------------------------------
+#
+# These exist because GAP_CHAR_CAP is still sized by taste and should not be.
+# Each asserts one number that the tuning queries in the handoff depend on, so
+# a refactor that quietly stops recording one fails here rather than six weeks
+# later when somebody tries to read the logs.
+
+@pytest.mark.asyncio
+async def test_the_gap_records_how_far_back_the_anchor_was():
+    cog = _gap_cog()
+    items = [_gap_item(n, "bob", f"m{n}") for n in range(20, 4, -1)]
+    items.append(_gap_item(4, "Aguilar", "anchor", is_bot=True, author_id=42))
+    _block, _count, _chars, anchor, _ids = await cog._gap_messages(_gap_message(items))
+    stats = _gap_stats_var.get()
+    assert anchor == 4
+    assert stats["mode"] == "anchored"
+    # 16 humans walked, then the anchor: distance is the answer to "is
+    # GAP_SCAN_MAX big enough", which nothing recorded before.
+    assert stats["anchor_distance"] == 17 and stats["scanned"] == 17
+
+
+@pytest.mark.asyncio
+async def test_the_gap_records_whether_the_caps_actually_fired():
+    cog = _gap_cog(gapmax=3)
+    items = [_gap_item(n, "bob", f"m{n}") for n in range(9, 5, -1)]
+    items.append(_gap_item(5, "Aguilar", "anchor", is_bot=True, author_id=42))
+    await cog._gap_messages(_gap_message(items))
+    assert _gap_stats_var.get()["truncated"] is True
+
+    cog = _gap_cog()
+    await cog._gap_messages(_gap_message([
+        _gap_item(3, "bob", "hi"),
+        _gap_item(2, "Aguilar", "anchor", is_bot=True, author_id=42),
+    ]))
+    assert _gap_stats_var.get()["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_gap_estimates_tokens_from_what_is_actually_rendered():
+    """`gap_chars` counts raw message text and overstates the cost; the
+    estimate has to follow the rendered block, which is what gets tokenized."""
+    cog = _gap_cog()
+    block, _count, chars, _anchor, _ids = await cog._gap_messages(_gap_message([
+        _gap_item(3, "bob", "x" * 2000),
+        _gap_item(2, "Aguilar", "anchor", is_bot=True, author_id=42),
+    ]))
+    stats = _gap_stats_var.get()
+    assert stats["render_chars"] == len(block)
+    assert stats["tokens_est"] == len(block) // GAP_CHARS_PER_TOKEN
+    assert stats["render_chars"] < chars          # sanitize() shrank it
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_cannot_be_made_enormous_by_a_busy_channel():
+    """The whole risk of adding a fallback: a thousand-message channel must not
+    turn into a thousand-message prompt."""
+    cog = _gap_cog()
+    items = [_gap_item(n, "bob", "y" * 500) for n in range(1000, 0, -1)]
+    block, count, _chars, anchor, _ids = await cog._gap_messages(_gap_message(items))
+    assert anchor is None
+    assert count <= GAP_FALLBACK_MESSAGES
+    # The character cap binds before the message cap here, and it is the one
+    # that maps to prompt tokens.
+    body = sum(len(line) for line in block.splitlines()[2:-1])
+    assert body <= GAP_FALLBACK_CHAR_CAP + MESSAGE_CHAR_CAP
+
+
+@pytest.mark.asyncio
+async def test_the_scan_stops_at_the_anchor_rather_than_reading_the_window(monkeypatch):
+    """GAP_SCAN_MAX is a ceiling, not a cost: raising it to 300 must not make
+    the common case read 300 messages."""
+    cog = _gap_cog()
+    items = [_gap_item(3, "bob", "hi"),
+             _gap_item(2, "Aguilar", "anchor", is_bot=True, author_id=42)]
+    items += [_gap_item(n, "bob", f"old{n}") for n in range(1, 100)]
+    await cog._gap_messages(_gap_message(items))
+    assert _gap_stats_var.get()["scanned"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_gap_diagnostics_round_trip_through_the_log(db):
+    """The INSERT grew by six columns. A mismatch between the column list, the
+    placeholders and the tuple is a runtime error that only fires on a real
+    write - which is best-effort, so it would be swallowed and the whole
+    exchange log would silently stop."""
+    from bot.stores import LLMLogStore
+    store = LLMLogStore(db)
+    await store.add(
+        guild_id=1, channel_id=2, channel_name="c", user_id=3, user_name="u",
+        prompt="p", reply="r", tool_calls=[], rounds=1, duration_ms=10,
+        model="m", status="ok", error=None,
+        gap_messages=4, gap_chars=260, gap_mode="fallback", gap_scanned=300,
+        gap_anchor_distance=None, gap_truncated=1, gap_render_chars=310,
+        gap_tokens_est=77,
+    )
+    row = await store.context_row(1)
+    assert row is not None
+    rows = await store.recent_for_guild(1, 5)
+    assert rows and rows[0][-1] == "fallback"
