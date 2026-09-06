@@ -142,7 +142,8 @@ CONFIG_MANIFEST = [
     # The autonomous wake-up. Off, with an empty channel allowlist that means
     # NONE rather than "everywhere" - see aguiliar.py's AUTONOMOUS PARTICIPATION.
     ("llm.auto.enabled", "false", "false", "Speak up unprompted in busy channels"),
-    ("llm.auto.channels", None, "unset (no channels)", "Channels it may join uninvited"),
+    ("llm.auto.channels", None, "unset (no channels)", "Channels it may join uninvited, or 'all'"),
+    ("llm.auto.exclude", None, "unset", "Channels it may never join uninvited"),
     ("llm.auto.idleminutes", "45", "45", "Silence before it may speak unprompted (minutes)"),
     ("llm.auto.windowminutes", "10", "10", "How much recent conversation counts (minutes)"),
     ("llm.auto.minmessages", "8", "8", "Human messages needed in that window"),
@@ -187,7 +188,8 @@ STEP_RESET_PREFIXES = {
         "llm.enabled", "llm.maxtokens", "llm.cooldown", "llm.channels",
         "llm.timezone", "llm.memoryturns", "llm.memoryminutes", "llm.logdays",
         "llm.narrate",
-        "llm.auto.enabled", "llm.auto.channels", "llm.auto.idleminutes",
+        "llm.auto.enabled", "llm.auto.channels", "llm.auto.exclude",
+        "llm.auto.idleminutes",
         "llm.auto.windowminutes", "llm.auto.minmessages", "llm.auto.minusers",
         "llm.auto.chance", "llm.auto.cooldownminutes",
         "llm.auto.channelcooldownminutes", "llm.auto.evalcooldownminutes",

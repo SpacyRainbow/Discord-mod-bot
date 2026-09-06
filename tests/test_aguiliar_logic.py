@@ -3492,3 +3492,84 @@ def test_both_request_scoped_registries_are_opened_together():
         source = inspect.getsource(method)
         assert "_images_var.set({})" in source
         assert "_msgs_var.set({})" in source
+
+
+# --- llm.auto.channels = all -------------------------------------------------
+
+def test_all_mode_allows_any_channel_but_empty_still_means_none():
+    """"all" and "" are different answers to "which channels", and a typo must
+    land on the quiet one."""
+    everywhere = AutonomyConfig(enabled=True, all_channels=True)
+    nowhere = AutonomyConfig(enabled=True)
+    assert everywhere.allows(12345)
+    assert not nowhere.allows(12345)
+
+
+def test_the_denylist_beats_all_and_beats_an_explicit_allowlist():
+    """The safe reading of a contradiction is the restrictive one."""
+    everywhere = AutonomyConfig(enabled=True, all_channels=True, exclude=(7,))
+    named = AutonomyConfig(enabled=True, channels=(7, 8), exclude=(7,))
+    assert not everywhere.allows(7) and everywhere.allows(8)
+    assert not named.allows(7) and named.allows(8)
+
+
+def test_all_mode_satisfies_the_allowlist_gate():
+    reasons = gate_reasons(AutonomyConfig(enabled=True, all_channels=True, chance_percent=100),
+                           AutonomyState(), idle_seconds=99999, channel_id=4242,
+                           stats=_good_stats(), now=1_000_000.0, local_hour=15,
+                           day="2026-09-06")
+    assert reasons == []
+
+
+def test_an_excluded_channel_is_refused_even_in_all_mode():
+    reasons = gate_reasons(AutonomyConfig(enabled=True, all_channels=True, exclude=(4242,)),
+                           AutonomyState(), idle_seconds=99999, channel_id=4242,
+                           stats=_good_stats(), now=1_000_000.0, local_hour=15,
+                           day="2026-09-06")
+    assert "channel-not-allowed" in reasons
+
+
+def _guild_channel(channel_id, *, nsfw=False, category=None, name="general"):
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = channel_id
+    channel.name = name
+    channel.is_nsfw = MagicMock(return_value=nsfw)
+    channel.category = MagicMock()
+    channel.category.id = category
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_all_mode_skips_tickets_nsfw_and_machine_output():
+    """A ticket is the least casual conversation on the server - one person and
+    a bot, opened because something went wrong - and the logging and starboard
+    channels are output, not talk. None of them are channels it could join even
+    in principle, so "all" drops them structurally rather than hoping a
+    threshold catches them."""
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    guild.text_channels = [
+        _guild_channel(1, name="general"),
+        _guild_channel(2, name="nsfw", nsfw=True),
+        _guild_channel(3, name="ticket-0004", category=900),
+        _guild_channel(4, name="mod-log"),
+        _guild_channel(5, name="starboard"),
+        _guild_channel(6, name="gaming"),
+    ]
+    values = {"tickets.category_id": 900, "logging.channel": 4, "starboard.channel": 5}
+    cog.bot.stores.config.get_int = AsyncMock(
+        side_effect=lambda gid, key, default=0, **kw: values.get(key, default))
+    ids = await cog._auto_candidate_ids(guild, AutonomyConfig(enabled=True, all_channels=True))
+    assert ids == [1, 6]
+
+
+@pytest.mark.asyncio
+async def test_naming_a_channel_explicitly_is_not_second_guessed():
+    """The structural skips apply to "all" only. Naming a channel is a decision
+    somebody made on purpose; llm.auto.exclude is how they take it back."""
+    cog = _make_cog()
+    guild = MagicMock()
+    guild.id = 5
+    config = AutonomyConfig(enabled=True, channels=(3, 9), exclude=(9,))
+    assert await cog._auto_candidate_ids(guild, config) == [3]

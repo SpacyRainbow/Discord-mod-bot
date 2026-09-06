@@ -997,6 +997,13 @@ person posting thirty times scores as a monologue rather than a conversation,
 bot and webhook traffic does not count as activity, and a message it has already
 reacted to cannot be offered to it again.
 
+`llm.auto.channels` takes a list of channel IDs, or **`all`** for every text
+channel it can read and send in. Even in `all` mode it skips NSFW channels,
+anything under the tickets category (those are private support conversations,
+opened one per person by this same bot), and the logging and starboard channels,
+which are machine output rather than talk. `llm.auto.exclude` is a denylist that
+wins over everything, including `all`.
+
 Configure it with the `llm.auto.*` keys in `/setconfig`.
 
 ### What it cannot do

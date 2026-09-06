@@ -201,6 +201,14 @@ class AutonomyConfig:
     in a channel is consent, wandering into one uninvited is not."""
     enabled: bool = False
     channels: Tuple[int, ...] = ()
+    # "all" - every text channel the bot can actually read and send in, resolved
+    # per tick rather than stored, so a new channel is covered without anybody
+    # editing config. Deliberately a separate flag rather than a magic empty
+    # tuple: empty still means NONE, and the two must not be confusable.
+    all_channels: bool = False
+    # Always wins, in both modes. An allowlist of "everything" is only usable if
+    # there is a way to carve pieces out of it.
+    exclude: Tuple[int, ...] = ()
     idle_seconds: float = 2700.0          # 45 min since Aguilar last spoke
     window_seconds: float = 600.0         # 10 min of conversation considered
     min_messages: int = 8
@@ -214,6 +222,15 @@ class AutonomyConfig:
     quiet_start: int = -1                 # local hour, -1 disables
     quiet_end: int = -1
     allow_reply: bool = True
+
+    def allows(self, channel_id: int) -> bool:
+        """Whether this channel is eligible at all. The denylist is checked
+        first and applies to both modes: a channel named in llm.auto.exclude is
+        out even if somebody also named it in llm.auto.channels, because the
+        safe reading of a contradiction is the restrictive one."""
+        if channel_id in self.exclude:
+            return False
+        return self.all_channels or channel_id in self.channels
 
 
 @dataclass
@@ -331,9 +348,9 @@ def gate_reasons(config: AutonomyConfig, state: AutonomyState, *,
     reasons: List[str] = []
     if not config.enabled:
         reasons.append("disabled")
-    if not config.channels:
+    if not config.channels and not config.all_channels:
         reasons.append("no-allowlist")
-    elif channel_id not in config.channels:
+    elif not config.allows(channel_id):
         reasons.append("channel-not-allowed")
     if idle_seconds < config.idle_seconds:
         reasons.append(f"bot-not-idle({idle_seconds:.0f}s)")

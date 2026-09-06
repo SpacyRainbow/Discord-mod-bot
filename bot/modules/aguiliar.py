@@ -92,7 +92,12 @@ can ask for, enforced in _dispatch_tool rather than by the prompt.
 
 Config keys, all per-guild, all optional:
   llm.auto.enabled        - bool, default off.
-  llm.auto.channels       - comma-separated channel IDs. EMPTY MEANS NONE.
+  llm.auto.channels       - comma-separated channel IDs, or "all" for every text
+                            channel it can read and send in (NSFW, ticket,
+                            logging and starboard channels are still skipped).
+                            EMPTY MEANS NONE.
+  llm.auto.exclude        - comma-separated channel IDs it may never join. Wins
+                            over llm.auto.channels, including "all".
   llm.auto.idleminutes    - int, default 45. Silence from the bot before it may
                             consider speaking unprompted.
   llm.auto.windowminutes  - int, default 10. How much recent conversation counts.
@@ -4070,9 +4075,17 @@ class Aguiliar(commands.Cog):
         every thirty seconds: get_int clamps, and the clamps are deliberate
         floors, not defaults."""
         get_int = self.bot.stores.config.get_int
-        channels_raw = await self.bot.stores.config.get(guild_id, "llm.auto.channels", "") or ""
-        channels = tuple(
+        channels_raw = (await self.bot.stores.config.get(guild_id, "llm.auto.channels", "") or "").strip()
+        # "all" is an explicit opt-in to every channel it can read, not the
+        # default. Empty still means NONE - the two are different answers to
+        # "which channels", and a typo must land on the quiet one.
+        all_channels = channels_raw.casefold() == "all"
+        channels = () if all_channels else tuple(
             int(part) for part in channels_raw.replace(" ", "").split(",") if part.isdigit()
+        )
+        exclude_raw = await self.bot.stores.config.get(guild_id, "llm.auto.exclude", "") or ""
+        exclude = tuple(
+            int(part) for part in exclude_raw.replace(" ", "").split(",") if part.isdigit()
         )
         quiet_raw = (await self.bot.stores.config.get(guild_id, "llm.auto.quiethours", "") or "").strip()
         quiet_start = quiet_end = -1
@@ -4085,6 +4098,8 @@ class Aguiliar(commands.Cog):
         return AutonomyConfig(
             enabled=await self.bot.stores.config.get_bool(guild_id, "llm.auto.enabled", False),
             channels=channels,
+            all_channels=all_channels,
+            exclude=exclude,
             idle_seconds=60.0 * await get_int(guild_id, "llm.auto.idleminutes", 45,
                                               minimum=5, maximum=1440),
             window_seconds=60.0 * await get_int(guild_id, "llm.auto.windowminutes", 10,
@@ -4142,7 +4157,7 @@ class Aguiliar(commands.Cog):
         line is the whole observability story for this feature, so it carries
         the numbers that were used to decide, not just the decision."""
         config = await self._autonomy_config(guild.id)
-        if not config.enabled or not config.channels:
+        if not config.enabled or not (config.channels or config.all_channels):
             return False
         now_wall = time.time()
         idle = time.monotonic() - self._last_spoke.get(guild.id, 0.0)
@@ -4153,7 +4168,7 @@ class Aguiliar(commands.Cog):
         day = local.date().isoformat()
 
         candidates: List[Tuple[int, ChannelStats]] = []
-        for channel_id in config.channels:
+        for channel_id in await self._auto_candidate_ids(guild, config):
             channel = guild.get_channel(channel_id)
             # A channel it cannot read is not a candidate, and never becomes one
             # by being busy: permissions are checked here, before scoring, so a
@@ -4193,6 +4208,47 @@ class Aguiliar(commands.Cog):
         except Exception:
             logger.exception("aguiliar: autonomous participation failed")
         return True
+
+    async def _auto_candidate_ids(self, guild: discord.Guild,
+                                  config: AutonomyConfig) -> List[int]:
+        """Which channel ids this tick may consider.
+
+        In "all" mode the list is resolved live, so a channel created today is
+        covered without anybody editing config - and so is a channel whose
+        permissions changed. Three kinds are dropped structurally, because they
+        are not conversations the bot could join even in principle:
+
+          - NSFW channels.
+          - Anything under the tickets category: those are private support
+            conversations, opened one-per-person by THIS bot. Somebody in a
+            ticket is having the least casual conversation on the server.
+          - The logging and starboard channels: machine output, not talk.
+
+        These are dropped only in "all" mode. Naming a channel explicitly in
+        llm.auto.channels is a decision somebody made on purpose, and this does
+        not second-guess it - llm.auto.exclude is how you take one back out.
+        """
+        if not config.all_channels:
+            return [cid for cid in config.channels if config.allows(cid)]
+        get = self.bot.stores.config.get_int
+        ticket_category = await get(guild.id, "tickets.category_id", 0)
+        structural = {
+            await get(guild.id, "logging.channel", 0),
+            await get(guild.id, "starboard.channel", 0),
+        }
+        ids: List[int] = []
+        for channel in list(getattr(guild, "text_channels", []) or []):
+            if channel.id in structural or not config.allows(channel.id):
+                continue
+            if ticket_category and getattr(channel.category, "id", None) == ticket_category:
+                continue
+            try:
+                if channel.is_nsfw():
+                    continue
+            except AttributeError:
+                pass
+            ids.append(channel.id)
+        return ids
 
     async def _autonomous_participate(self, channel: discord.TextChannel,
                                       config: AutonomyConfig, state: AutonomyState,
