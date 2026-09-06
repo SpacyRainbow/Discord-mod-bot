@@ -450,6 +450,10 @@ SAFETY_PREAMBLE = (
     "they mean is in there - read it before reaching for a tool. Reading "
     "recent messages is for going back FURTHER than that stretch, not for "
     "fetching it again.\n"
+    "The context above your reply - the channel name, the clock, who is "
+    "speaking, the transcript - is there for you to use, never to copy. Write "
+    "only what you would type into the box: no timestamp, no speaker label, no "
+    "stage direction, nothing in brackets standing in for an action.\n"
     "You may be shown a line beginning \"Recently in this channel\". That is a "
     "short summary somebody generated from earlier conversation, not a "
     "transcript. Use it for context, never quote it as something a person "
@@ -1225,6 +1229,53 @@ def strip_tool_markup(text: str) -> str:
     return cleaned.strip()
 
 
+# Transcript decorations the model writes at the START of a reply, having been
+# handed a prompt that looks like a transcript. Anchored to the beginning and
+# deliberately narrow: a bracket mid-sentence is the model's own prose and is
+# none of our business.
+_LEADING_CLOCK_RE = re.compile(
+    r"^\s*\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?\s*\]\s*")
+_LEADING_STAGE_RE = re.compile(
+    r"^\s*\[\s*(?:later|earlier|continued|cont\.?|thinking(?:\s+\w+)?|"
+    r"pause|beat|silence|typing|edit)\s*\]\s*", re.IGNORECASE)
+_THINKING_BLOCK_RE = re.compile(r"\[thinking[^\]]*\].*?\[/thinking\]",
+                                flags=re.DOTALL | re.IGNORECASE)
+
+
+def strip_transcript_decoration(text: str, bot_name: str = "") -> str:
+    """Remove the transcript furniture a chat-shaped prompt invites.
+
+    Observed twice in the live log. On 2026-09-06 a reply arrived as
+    "[11:25 PM] Stock meaning what..." - the model had taken the "Current time:"
+    field printed directly above the user's message and rendered it the way
+    Discord renders a message timestamp. Earlier, on 2026-09-05, a reply opened
+    with "[thinking resolved] ... [/thinking]" and the whole block was posted.
+
+    Both are the same failure: the prompt is a transcript, and a transcript line
+    begins with a timestamp and a speaker. The persona forbids this in prose
+    ("never write stage directions ... timestamps like [Later]") and the
+    preamble now says not to echo the clock, but neither is a guarantee - the
+    same reasoning behind strip_tool_markup applies, so this is the backstop.
+
+    Narrow on purpose. Only the START of the reply is touched, only a clock or a
+    short known stage word, and only a speaker prefix that is the bot's OWN
+    name: "Aguilar: hi" is furniture, while a reply that happens to open by
+    quoting somebody else is not ours to rewrite.
+    """
+    cleaned = _THINKING_BLOCK_RE.sub("", text or "")
+    # Loop: "[11:25 PM] [Later] Aguilar: hi" is one reply with three decorations.
+    for _ in range(4):
+        before = cleaned
+        cleaned = _LEADING_CLOCK_RE.sub("", cleaned)
+        cleaned = _LEADING_STAGE_RE.sub("", cleaned)
+        if bot_name:
+            cleaned = re.sub(rf"^\s*{re.escape(bot_name)}\s*:\s*", "", cleaned,
+                             flags=re.IGNORECASE)
+        if cleaned == before:
+            break
+    return cleaned.strip()
+
+
 def render_messages(entries: List[Tuple[str, str]]) -> str:
     """Renders retrieved messages into one delimited, inert block."""
     if not entries:
@@ -1832,7 +1883,8 @@ class Aguiliar(commands.Cog):
                     text = await self._continue_truncated(
                         messages, text, max_tokens, on_text, trace,
                     )
-                cleaned = strip_tool_markup(text)
+                cleaned = strip_transcript_decoration(strip_tool_markup(text),
+                                                     self._bot_name())
                 if not cleaned and (text or "").strip():
                     logger.warning(
                         "aguiliar: model emitted only tool markup with tools withdrawn"

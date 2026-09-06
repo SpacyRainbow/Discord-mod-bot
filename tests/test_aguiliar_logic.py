@@ -41,6 +41,7 @@ from bot.modules.aguiliar import (
     relevance_hint,
     render_messages,
     strip_tool_markup,
+    strip_transcript_decoration,
     scaled_dimensions,
     resolve_timezone,
     SAFETY_PREAMBLE,
@@ -2414,3 +2415,60 @@ def test_the_moderator_flag_has_one_definition():
     assert is_moderator(_FakeMember("Mod", mod=True)) is True
     assert is_moderator(_FakeMember("Not", mod=False)) is False
     assert is_moderator(object()) is False
+
+
+# --- transcript furniture never reaches the channel -------------------------
+
+
+def test_the_bug_a_discord_style_timestamp_is_stripped():
+    """Live regression 2026-09-06: the model rendered the "Current time:" field
+    as a Discord message timestamp and opened its reply with it."""
+    assert strip_transcript_decoration(
+        "[11:25 PM] Stock meaning what, that's how it renders?"
+    ) == "Stock meaning what, that's how it renders?"
+
+
+def test_a_24_hour_and_seconds_clock_are_stripped_too():
+    assert strip_transcript_decoration("[23:25] hi") == "hi"
+    assert strip_transcript_decoration("[11:25:07 p.m.] hi") == "hi"
+
+
+def test_the_bug_a_thinking_block_is_removed():
+    """Live regression 2026-09-05: [thinking resolved]...[/thinking] posted."""
+    out = strip_transcript_decoration(
+        "[thinking resolved] correct something, I dare you. [/thinking] here we go."
+    )
+    assert out == "here we go."
+
+
+def test_stage_directions_are_stripped():
+    assert strip_transcript_decoration("[Later] and then") == "and then"
+
+
+def test_its_own_speaker_label_is_stripped():
+    assert strip_transcript_decoration("Aguilar: hi there", "Aguilar") == "hi there"
+
+
+def test_stacked_decorations_all_go():
+    assert strip_transcript_decoration("[11:25 PM] [Later] Aguilar: hi", "Aguilar") == "hi"
+
+
+def test_somebody_elses_name_is_left_alone():
+    """Quoting another member is prose, not furniture."""
+    text = "Raheem: that was your line, not mine"
+    assert strip_transcript_decoration(text, "Aguilar") == text
+
+
+def test_a_bracket_mid_sentence_is_left_alone():
+    text = "the answer is 4 [citation needed] and I stand by it"
+    assert strip_transcript_decoration(text, "Aguilar") == text
+
+
+def test_a_normal_reply_is_untouched():
+    text = "no. I'm Aguilar, the mod bot."
+    assert strip_transcript_decoration(text, "Aguilar") == text
+
+
+def test_empty_input_is_safe():
+    assert strip_transcript_decoration("", "Aguilar") == ""
+    assert strip_transcript_decoration(None, "Aguilar") == ""
