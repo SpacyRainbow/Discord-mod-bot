@@ -883,6 +883,8 @@ asserts there is no third kind.
 | `read_image` | One image posted earlier in the channel, by the marker it was shown under |
 | `read_message_reactions` | The reactions on one message it has been shown: emoji, counts, and who reacted where Discord has already cached them |
 | `read_own_past_replies` | Its own previous replies in this server, by keyword — for "you told me something different last week". It searches what **it** said, not what members said |
+| `read_check_text` | Counts what is in a sentence it is about to send: words, punctuation, letters, first and last character, and whether any forbidden letter appears. Takes up to five candidates at once |
+| `read_calculate` | Evaluates one arithmetic expression exactly, by walking the parsed expression against a whitelist of operators and functions |
 
 | Act tool | What it does |
 |---|---|
@@ -890,6 +892,28 @@ asserts there is no third kind.
 | `act_roll_dice` | Rolls real dice in Python (`1d20`, `2d6+3`). A language model cannot generate a fair random number and should not pretend to |
 | `act_set_reminder` | Schedules a reminder for the person who asked, through the same `scheduled_tasks` engine `/remind` uses, so it survives a restart |
 | `act_start_poll` | Posts a native Discord poll |
+
+**It counts and calculates outside itself, because it cannot do either
+reliably inside.** `enable_thinking` is off on this deployment, so there is no
+scratchpad: a constraint like *twelve words, exactly one comma, no letter e,
+ending in !* has nowhere to be worked out, and the model cannot check its own
+draft. On 2026-09-06 two such puzzles were answered with a skull reaction and
+with a dice roll — it reached for whatever tool was nearest rather than say it
+could not count. `read_check_text` gives it the counts for a candidate sentence
+so it can fix the draft before sending it, and takes a **list** because a tool
+round costs a full inference — checking three candidates together is one round,
+checking them one at a time is three, and only four are allowed.
+
+`read_calculate` is the same argument for arithmetic: a model asked for
+`23*47` produces a number that reads like arithmetic and is sometimes wrong,
+and unlike a bad dice roll nobody can tell by looking. It walks the parsed
+expression against a whitelist of operators and functions rather than calling
+`eval` with a stripped `__builtins__`, because the second is a known escape
+surface and this one takes a string written by a language model on the box that
+also holds the bot token. Exponents must be literal and are bounded before
+anything is evaluated — the cost of `9**9**9` is paid *during* evaluation, so a
+limit on the result would come too late. Neither tool has a per-message cap:
+both run locally in microseconds, and what is worth rationing is rounds.
 
 **Search is a search, not a browser.** The only thing the model supplies is a
 query string: there is no URL parameter anywhere in the schema, so it cannot

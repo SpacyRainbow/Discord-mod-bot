@@ -156,6 +156,7 @@ persona block ("you are X, and X always answers") is the classic shape that
 erodes a safety-tuned model's refusals, and stock weights were chosen here
 specifically so those refusals stay put.
 """
+import ast
 import asyncio
 import base64
 import contextvars
@@ -163,6 +164,8 @@ import datetime
 import io
 import json
 import logging
+import math
+import operator
 import os
 import random
 import re
@@ -381,6 +384,8 @@ STATUS_EMOJI: Dict[str, str] = {
     "read_member_profile": "\U0001f464",   # bust
     "read_image": "\U0001f441\ufe0f",         # eye
     "read_channel": "\U0001f4cd",          # pin
+    "read_check_text": "\U0001f524",       # abc
+    "read_calculate": "\U0001f9ee",        # abacus
 }
 STATUS_EMOJI_FALLBACK = "\u2699\ufe0f"        # gear, for a tool with no glyph
 # Anything that would let a query rewrite the status line as markdown, or ping
@@ -1001,10 +1006,73 @@ EXTRA_READ_TOOL_SCHEMAS: List[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_check_text",
+            "description": (
+                "Count what is in a sentence before you send it: words, "
+                "commas and other punctuation, letters, what it starts and "
+                "ends with. You cannot count reliably in your head, so when "
+                "somebody sets a constraint - a number of words, exactly one "
+                "comma, no letter e, must end in ! - write a candidate, check "
+                "it here, and fix it before you answer. A word is a run of "
+                "characters between spaces. Send up to 5 candidates in ONE "
+                "call: every round costs about a minute, so checking three "
+                "together is far better than checking three one after another."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "texts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The candidate sentences, up to 5.",
+                    },
+                    "avoid": {
+                        "type": "string",
+                        "description": (
+                            "Characters that must not appear, written together, "
+                            "e.g. \"e\" or \"aeiou\". Case is ignored."
+                        ),
+                    },
+                },
+                "required": ["texts"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_calculate",
+            "description": (
+                "Work out one arithmetic expression exactly: + - * / // % **, "
+                "parentheses, and abs, round, min, max, sum, sqrt, gcd, log, "
+                "log2, log10, floor, ceil, factorial, plus pi and e. Use it "
+                "whenever the answer depends on a number being right - you "
+                "produce numbers that read like arithmetic and are sometimes "
+                "wrong, and nobody can tell by looking. It does no algebra and "
+                "reads no word problems: work out the expression yourself, "
+                "then send it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "The expression alone, e.g. 23*47 or factorial(7)/5.",
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_message_reactions",
             "description": (
-                "See the reactions on one message you have been shown. Retrieved "
-                "messages are marked like [msg3]; pass that marker. Use it when "
+                "See the reactions on one message you have been shown. Every "
+                "message you have been shown is marked like [msg3] - in the "
+                "transcript above as well as in anything you read - so pass "
+                "that marker. Use it when "
                 "somebody asks how a message went down - whether people agreed, "
                 "laughed, or piled on."
             ),
@@ -1013,7 +1081,7 @@ EXTRA_READ_TOOL_SCHEMAS: List[dict] = [
                 "properties": {
                     "ref": {
                         "type": "string",
-                        "description": "The marker from the retrieved messages, e.g. msg3.",
+                        "description": "The marker on the message, e.g. msg3.",
                     },
                 },
                 "required": ["ref"],
@@ -1062,7 +1130,8 @@ ACT_TOOL_SCHEMAS: List[dict] = [
             "name": "act_react_to_message",
             "description": (
                 "Add ONE emoji reaction to a message you have been shown, marked "
-                "like [msg3]. This IS a reply - after reacting your turn is over "
+                "like [msg3] - the transcript you were given is marked too, so "
+                "you usually do not need to read anything first. This IS a reply - after reacting your turn is over "
                 "and you do not also write a message, so use it when a reaction "
                 "says everything you wanted to say. One reaction, never several."
             ),
@@ -2025,6 +2094,21 @@ def describe_tool_call(name: str, raw_args: Any) -> str:
         return "looking at the image…"
     if name == "read_channel":
         return "looking at this channel…"
+    if name == "read_check_text":
+        texts = args.get("texts")
+        count = len(texts) if isinstance(texts, list) else 1
+        return ("checking that sentence…" if count == 1
+                else f"checking {count} candidates…")
+    if name == "read_calculate":
+        # NOT _arg(): that strips markdown characters, and * is both markdown
+        # and multiplication - "23*47" would be shown to the room as "2347",
+        # a different sum from the one being worked out. Wrapped in a code span
+        # instead, with only what could break out of one removed.
+        raw = args.get("expression")
+        expression = ""
+        if isinstance(raw, (str, int)):
+            expression = re.sub(r"[`\\\n\r]", "", sanitize(str(raw), STATUS_ARG_CHAR_CAP)).strip()
+        return f"working out `{expression}`…" if expression else "working it out…"
     return f"calling {_STATUS_MARKUP_RE.sub('', str(name)[:40])}…"
 
 
@@ -2325,6 +2409,191 @@ def roll_dice(spec: str, rng: Optional[random.Random] = None) -> str:
     if count == 1 and not modifier:
         return f"{spec.strip()}: **{total}**"
     return f"{spec.strip()}: {detail} = **{total}**"
+
+
+# --- counting and arithmetic, done outside the model ------------------------
+# enable_thinking is off on this deployment, so there is no scratchpad. A
+# constraint like "twelve words, exactly one comma, no letter e" has nowhere to
+# be counted, and on 2026-09-06 two such puzzles were answered with a skull and
+# with "1d2: **2**" - the model reached for whatever tool was nearest rather
+# than admitting it could not check its own draft. These two do the checking
+# for it, deterministically, so a candidate can be VERIFIED instead of guessed.
+#
+# Both are read_*, so neither can end a turn, and neither has a per-message cap:
+# they run locally in microseconds, and the thing worth rationing is ROUNDS, not
+# calls. MAX_TOOL_ROUNDS already bounds those, and several candidates checked in
+# ONE round is the whole point of taking a list.
+CHECK_TEXTS_MAX = 5
+CHECK_TEXT_CHAR_CAP = 400
+# The word list is what makes a count checkable rather than another number to
+# trust, but it is only useful while it is short enough to read.
+CHECK_WORD_LIST_MAX = 60
+CALC_EXPRESSION_CHAR_CAP = 200
+# 9**9**9 is a hang, not an answer. Exponents are bounded and must be literal,
+# which is checked BEFORE anything is evaluated.
+CALC_POW_MAX = 64
+CALC_FACTORIAL_MAX = 500
+CALC_RESULT_DIGITS_MAX = 100
+
+_WORD_RE = re.compile(r"\S+")
+
+
+def describe_text(text: str, avoid: str = "") -> Dict[str, Any]:
+    """The countable facts about one candidate sentence.
+
+    Words are whitespace-separated runs, which is stated in the tool
+    description too: a count is only useful if the model knows which definition
+    produced it. The word list ships with the count for the same reason - a
+    number it cannot check is just a different thing to guess at.
+    """
+    words = _WORD_RE.findall(text)
+    punctuation: Dict[str, int] = {}
+    for char in text:
+        if not char.isalnum() and not char.isspace():
+            punctuation[char] = punctuation.get(char, 0) + 1
+    facts: Dict[str, Any] = {
+        "text": text,
+        "words": len(words),
+        "word_list": words[:CHECK_WORD_LIST_MAX],
+        "characters": len(text),
+        "letters": sum(1 for char in text if char.isalpha()),
+        "punctuation": punctuation,
+        "first_char": text[:1],
+        "last_char": text[-1:],
+    }
+    if avoid:
+        # Case-insensitive on purpose: "no letter e" means no E either, and a
+        # checker that says zero because the E was capitalised is worse than no
+        # checker at all.
+        lowered = text.lower()
+        hits = {}
+        for char in dict.fromkeys(avoid.lower()):
+            count = lowered.count(char)
+            if count:
+                hits[char] = count
+        facts["avoided_found"] = hits
+        facts["avoided_clean"] = not hits
+    return facts
+
+
+def check_texts(texts: Any, avoid: str = "") -> List[Dict[str, Any]]:
+    """Validates and describes up to CHECK_TEXTS_MAX candidates at once.
+
+    A list rather than one string because each tool ROUND costs a full
+    inference - measured at 80s and up on this box - so drafting three
+    candidates and checking them together is one round where checking them one
+    at a time is three, and MAX_TOOL_ROUNDS only allows four.
+    """
+    if isinstance(texts, str):
+        texts = [texts]
+    if not isinstance(texts, list) or not texts:
+        raise ValueError("pass the text to check, or a list of candidates")
+    if len(texts) > CHECK_TEXTS_MAX:
+        raise ValueError(f"check at most {CHECK_TEXTS_MAX} candidates at once")
+    checked = []
+    for item in texts:
+        if not isinstance(item, str):
+            raise ValueError("every candidate has to be text")
+        trimmed = item[:CHECK_TEXT_CHAR_CAP]
+        if not trimmed.strip():
+            raise ValueError("one of those candidates was empty")
+        checked.append(describe_text(trimmed, str(avoid or "")))
+    return checked
+
+
+# Deliberately a whitelist of operators rather than eval with a stripped
+# __builtins__: the second is a well-known escape surface, and this tool takes
+# a string written by a language model on a box that also holds the bot token.
+_CALC_BINOPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod, ast.Pow: operator.pow,
+}
+_CALC_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_CALC_NAMES = {"pi": math.pi, "e": math.e, "tau": math.tau}
+_CALC_FUNCS = {
+    "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
+    "sqrt": math.sqrt, "gcd": math.gcd, "log": math.log, "log2": math.log2,
+    "log10": math.log10, "floor": math.floor, "ceil": math.ceil,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+}
+
+
+def _calc_eval(node: ast.AST) -> Any:
+    if isinstance(node, ast.Expression):
+        return _calc_eval(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            raise ValueError("numbers only")
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _CALC_BINOPS:
+        if isinstance(node.op, ast.Pow):
+            # Checked on the NODE, before either side is evaluated: the cost of
+            # a huge power is paid during evaluation, so a limit applied to the
+            # result would be applied after the damage.
+            exponent = node.right
+            if not (isinstance(exponent, ast.Constant)
+                    and isinstance(exponent.value, (int, float))
+                    and not isinstance(exponent.value, bool)
+                    and abs(exponent.value) <= CALC_POW_MAX):
+                raise ValueError(f"exponents have to be numbers up to {CALC_POW_MAX}")
+        left, right = _calc_eval(node.left), _calc_eval(node.right)
+        try:
+            return _CALC_BINOPS[type(node.op)](left, right)
+        except ZeroDivisionError:
+            raise ValueError("division by zero")
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(str(exc)[:80])
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_UNARYOPS:
+        return _CALC_UNARYOPS[type(node.op)](_calc_eval(node.operand))
+    if isinstance(node, ast.Name) and node.id in _CALC_NAMES:
+        return _CALC_NAMES[node.id]
+    if isinstance(node, ast.Call):
+        name = getattr(node.func, "id", None)
+        if name == "factorial":
+            if len(node.args) != 1:
+                raise ValueError("factorial takes one number")
+            value = _calc_eval(node.args[0])
+            if not float(value).is_integer() or not 0 <= value <= CALC_FACTORIAL_MAX:
+                raise ValueError(f"factorial takes a whole number up to {CALC_FACTORIAL_MAX}")
+            return math.factorial(int(value))
+        if name in _CALC_FUNCS and not node.keywords:
+            args = [_calc_eval(arg) for arg in node.args]
+            try:
+                return _CALC_FUNCS[name](*args)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(str(exc)[:80])
+        raise ValueError(f"no such function: {str(name)[:30]}")
+    raise ValueError("that is not an arithmetic expression")
+
+
+def calculate(expression: str) -> Any:
+    """Evaluates one arithmetic expression, or raises ValueError.
+
+    The whole point is that the ANSWER is not generated. A model asked for
+    23*47 produces a number that reads like arithmetic and sometimes is not,
+    and unlike a bad dice roll nobody can tell by looking.
+    """
+    text = str(expression or "").strip()
+    if not text:
+        raise ValueError("say what to work out")
+    if len(text) > CALC_EXPRESSION_CHAR_CAP:
+        raise ValueError(f"expressions have to be under {CALC_EXPRESSION_CHAR_CAP} characters")
+    try:
+        tree = ast.parse(text, mode="eval")
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        raise ValueError("that did not parse as arithmetic")
+    result = _calc_eval(tree)
+    if isinstance(result, float):
+        if result != result or result in (float("inf"), float("-inf")):
+            raise ValueError("that has no finite answer")
+        # Rendered, not rounded: 0.1+0.2 should read as 0.3 rather than as the
+        # float it actually is, and a repr of 17 digits is noise in a chat.
+        rounded = round(result, 10)
+        result = int(rounded) if float(rounded).is_integer() else rounded
+    if isinstance(result, int) and len(str(abs(result))) > CALC_RESULT_DIGITS_MAX:
+        raise ValueError("that number is too big to be worth saying")
+    return result
 
 
 def resolve_emoji(raw: str, guild: Any) -> Any:
@@ -2711,6 +2980,28 @@ class Aguiliar(commands.Cog):
             return target
         return render_reactions(target, self.bot.user)
 
+    async def _tool_read_check_text(self, message: discord.Message, args: dict) -> str:
+        # "text" as well as "texts": the schema asks for a list and the model
+        # sends a bare string often enough that refusing it would spend a round
+        # teaching it something check_texts can simply accept.
+        raw = args.get("texts")
+        if raw is None:
+            raw = args.get("text")
+        try:
+            checked = check_texts(raw, str(args.get("avoid") or ""))
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        return json.dumps({"checked": checked})
+
+    async def _tool_read_calculate(self, message: discord.Message, args: dict) -> str:
+        expression = str(args.get("expression") or "")
+        try:
+            result = calculate(expression)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        return json.dumps({"expression": expression[:CALC_EXPRESSION_CHAR_CAP],
+                           "result": result})
+
     async def _tool_read_own_past_replies(self, message: discord.Message, args: dict) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
@@ -2856,7 +3147,8 @@ class Aguiliar(commands.Cog):
             return json.dumps({
                 "error": f"no message called {sanitize(ref, 40) or '(missing)'} here",
                 "messages_you_can_point_at": known,
-                "hint": "read recent messages first; they come back marked like [msg3]",
+                "hint": "use a marker from the transcript you were given; "
+                        "read recent messages only if the one you want is not in it",
             })
         return target
 
@@ -2869,6 +3161,8 @@ class Aguiliar(commands.Cog):
         "read_channel": "_tool_read_channel",
         "read_web_search": "_tool_read_web_search",
         "read_message_reactions": "_tool_read_message_reactions",
+        "read_check_text": "_tool_read_check_text",
+        "read_calculate": "_tool_read_calculate",
         "read_own_past_replies": "_tool_read_own_past_replies",
         "act_react_to_message": "_tool_act_react_to_message",
         "act_roll_dice": "_tool_act_roll_dice",

@@ -79,6 +79,14 @@ from bot.modules.aguiliar import (
     TerminalReply,
     is_tool_error,
     mark_reactable,
+    describe_tool_call,
+    calculate,
+    check_texts,
+    describe_text,
+    CALC_EXPRESSION_CHAR_CAP,
+    CALC_FACTORIAL_MAX,
+    CALC_POW_MAX,
+    CHECK_TEXTS_MAX,
     message_registry,
     with_notice,
 )
@@ -338,7 +346,8 @@ def test_tool_names_declare_whether_they_have_side_effects():
     act_names = {s["function"]["name"] for s in ACT_TOOL_SCHEMAS}
     assert read_names == {"read_recent_messages", "read_reply_chain", "read_member_profile",
                           "read_image", "read_channel", "read_web_search",
-                          "read_message_reactions", "read_own_past_replies"}
+                          "read_message_reactions", "read_own_past_replies",
+                          "read_check_text", "read_calculate"}
     assert act_names == {"act_react_to_message", "act_roll_dice",
                          "act_set_reminder", "act_start_poll"}
     assert all(name.startswith("read_") for name in read_names)
@@ -3500,6 +3509,8 @@ async def test_every_tool_survives_the_real_dispatch_path():
         "read_channel": "{}",
         "read_message_reactions": '{"ref": "msg1"}',
         "read_own_past_replies": '{"query": "tofu"}',
+        "read_check_text": '{"texts": ["a short one"], "avoid": "z"}',
+        "read_calculate": '{"expression": "6*7"}',
         "act_react_to_message": '{"ref": "msg1", "emoji": ":copium:"}',
         "act_roll_dice": '{"spec": "1d20"}',
         "act_set_reminder": '{"delay": "30m", "text": "check the NAS"}',
@@ -4256,3 +4267,118 @@ async def test_a_reaction_that_followed_a_real_answer_keeps_the_answer():
     await cog._finish_terminal(_make_message(), placeholder, TerminalReply(""), trace, 0.0)
     assert placeholder.edit.call_args.kwargs["content"] == draft
     placeholder.delete.assert_not_awaited()
+
+
+# --- counting and arithmetic outside the model ------------------------------
+# enable_thinking is off, so a constraint like "twelve words, one comma, no
+# letter e" has nowhere to be counted. These two tools do the counting; what
+# matters is that they are exact and that the calculator cannot be talked into
+# running anything.
+
+def test_describe_text_counts_what_a_constraint_asks_about():
+    facts = describe_text("Go and grab that odd, tall crown!", avoid="e")
+    assert facts["words"] == 7
+    assert facts["punctuation"] == {",": 1, "!": 1}
+    assert facts["last_char"] == "!"
+    assert facts["avoided_clean"] is True
+    # The list ships with the count so the number is checkable rather than
+    # another thing to take on trust.
+    assert facts["word_list"][0] == "Go" and facts["word_list"][-1] == "crown!"
+
+
+def test_a_forbidden_letter_is_caught_in_either_case():
+    """"No letter e" means no E either. A checker that says zero because the E
+    was capitalised is worse than no checker."""
+    facts = describe_text("Every dog!", avoid="e")
+    assert facts["avoided_found"] == {"e": 2}
+    assert facts["avoided_clean"] is False
+
+
+def test_check_texts_takes_a_batch_and_a_bare_string():
+    assert len(check_texts(["one two", "three four five"])) == 2
+    assert check_texts("just this")[0]["words"] == 2
+    with pytest.raises(ValueError):
+        check_texts(["x"] * (CHECK_TEXTS_MAX + 1))
+    with pytest.raises(ValueError):
+        check_texts([])
+    with pytest.raises(ValueError):
+        check_texts(["   "])
+
+
+def test_the_calculator_is_exact_where_the_model_is_not():
+    assert calculate("23*47") == 1081
+    assert calculate("factorial(7)/5") == 1008
+    assert calculate("sqrt(16)") == 4
+    assert calculate("2**10") == 1024
+    assert calculate("-(3+4)") == -7
+    assert calculate("gcd(24, 36)") == 12
+    # Rendered rather than left as the float it really is: 0.30000000000000004
+    # is noise in a chat message.
+    assert calculate("0.1+0.2") == 0.3
+
+
+@pytest.mark.parametrize("expression", [
+    "__import__('os').system('id')",
+    "open('/app/.env').read()",
+    "(1).__class__.__bases__",
+    "9**9**9",
+    f"2**{CALC_POW_MAX + 1}",
+    f"factorial({CALC_FACTORIAL_MAX + 1})",
+    "1/0",
+    "x + 1",
+    "print(1)",
+    "lambda: 1",
+    "[1,2,3]",
+    "1 if True else 2",
+    "x" * (CALC_EXPRESSION_CHAR_CAP + 1),
+    "",
+])
+def test_the_calculator_refuses_everything_that_is_not_arithmetic(expression):
+    """A whitelist walk of the AST rather than eval with a stripped
+    __builtins__: this takes a string written by a language model, on the box
+    that holds the bot token."""
+    with pytest.raises(ValueError):
+        calculate(expression)
+
+
+def test_a_huge_power_is_refused_before_it_is_computed():
+    """The cost of 9**9**9 is paid during evaluation, so a limit on the RESULT
+    would be applied after the hang. This asserts the node is rejected."""
+    import time as _time
+    started = _time.monotonic()
+    with pytest.raises(ValueError):
+        calculate("9**9**9")
+    assert _time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_new_tools_cannot_end_a_turn():
+    """Both are read_*, so neither may come back as a TerminalReply - that is
+    what a stray call to one of them costing an answer looked like."""
+    cog = _make_cog()
+    _act_fails_var.set(0)
+    for name, arguments in (("read_check_text", '{"texts": ["a b c"]}'),
+                            ("read_calculate", '{"expression": "2+2"}')):
+        result = await cog._dispatch_tool(name, arguments, _make_message())
+        assert not isinstance(result, TerminalReply)
+        assert not is_tool_error(result)
+    assert {"read_check_text", "read_calculate"} & ACT_TOOL_NAMES == set()
+
+
+@pytest.mark.asyncio
+async def test_a_bad_expression_comes_back_readable_not_raised():
+    cog = _make_cog()
+    result = await cog._dispatch_tool("read_calculate", '{"expression": "1/0"}',
+                                      _make_message())
+    assert "division by zero" in json.loads(result)["error"]
+
+
+def test_the_status_line_shows_the_sum_that_is_actually_being_done():
+    """* is both markdown and multiplication. The generic argument scrubber
+    strips it, which showed the room "2347" for 23*47 - a different sum."""
+    line = describe_tool_call("read_calculate", json.dumps({"expression": "23*47"}))
+    assert "23*47" in line
+    # And it still cannot break out of the code span it is wrapped in.
+    hostile = describe_tool_call("read_calculate",
+                                 json.dumps({"expression": "1`\n@everyone"}))
+    assert "`\n" not in hostile and "@everyone" not in hostile
