@@ -44,6 +44,7 @@ MODULES = [
     "bot.modules.embedfix",
     "bot.modules.updater",
     "bot.modules.aguiliar",
+    "bot.modules.eventlog",
     # "bot.modules.counters",
     # "bot.modules.leveling",
 ]

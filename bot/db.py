@@ -251,17 +251,26 @@ ADDED_COLUMNS = [
 
 
 class Database:
-    """Owns the single aiosqlite connection and tracks availability."""
+    """Owns one aiosqlite connection and tracks availability.
 
-    def __init__(self, path: str):
+    `schema` and `added_columns` are parameters rather than module constants so
+    a feature can own a SEPARATE database file without a second copy of this
+    class. They default to the bot's own schema, so every existing caller is
+    unchanged.
+    """
+
+    def __init__(self, path: str, schema: str = SCHEMA,
+                 added_columns: Optional[list] = None):
         self.path = path
+        self.schema = schema
+        self.added_columns = ADDED_COLUMNS if added_columns is None else added_columns
         self.conn: Optional[aiosqlite.Connection] = None
         self.available = False
 
     async def connect(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = await aiosqlite.connect(self.path)
-        await self.conn.executescript(SCHEMA)
+        await self.conn.executescript(self.schema)
         await self._add_missing_columns()
         await self.conn.commit()
         self.available = True
@@ -276,7 +285,7 @@ class Database:
         simply absent on every deployed copy. This closes that gap and is
         idempotent - it reads what is actually there first.
         """
-        for table, column, decl in ADDED_COLUMNS:
+        for table, column, decl in self.added_columns:
             try:
                 cursor = await self.conn.execute(f"PRAGMA table_info({table})")
                 existing = {row[1] for row in await cursor.fetchall()}

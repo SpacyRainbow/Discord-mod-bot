@@ -1120,6 +1120,54 @@ Logging never gets in the way of a reply: it happens after the answer is on
 screen, and if the database is unavailable the bot loses the log row, not the
 answer.
 
+### The channel event log, and why it is a separate database
+
+`/llmlog` answers *what was the model told, and what did it say back*. It
+cannot answer *and was that true*. It stores the prompt the bot **assembled**,
+so a message the gap transcript never picked up is invisible in it by
+construction, and a reaction the bot placed is recorded as a tool call rather
+than as something that appeared in the room. Every interesting failure so far
+has needed both halves — what the model saw, and what was actually there — and
+the second half had to be reconstructed by hand from container logs and message
+IDs.
+
+The event log is that second half. It records messages, edits, deletes and
+reactions in the channels it is pointed at, as they happen, with IDs and UTC
+timestamps, so an exchange can be diffed against the room it happened in. The
+bot's own messages are recorded too, which is what answers "did the reply
+actually post". Attachments are recorded as filename, size and content type —
+never fetched, and never by URL, because a signed Discord link expires and a
+dead link in a log reads as evidence when it is not.
+
+**It is off until you turn it on, per channel.** `eventlog.channels` is empty by
+default and **empty means none**, the opposite of `llm.channels`. Set it to a
+comma-separated list of channel IDs, or the literal `all` — which has to be
+spelled out, never implied. A channel list it cannot parse drops the entries it
+cannot read rather than widening the watch. This records what people say,
+verbatim, and **nothing prunes it**: that is a deliberate choice for a debugging
+log on a private server and the wrong default for anybody else's, so point it at
+the channel you are actually debugging and nothing more.
+
+It writes to its own SQLite file — `EVENTLOG_DB_PATH`, default
+`/app/data/eventlog.db` — rather than a table in the bot's database. Chat volume
+does not belong in the file that holds operational state, this one can be copied
+off and queried without touching a live database, and it can be deleted whole
+without a migration. `ATTACH` still joins the two when you want to compare an
+exchange against its room:
+
+```sql
+ATTACH '/app/data/eventlog.db' AS ev;
+SELECT kind, author_name, content, emoji, created_at
+FROM ev.events
+WHERE channel_id = ? AND created_at BETWEEN ? AND ?
+ORDER BY id;
+```
+
+Nothing here may break the bot. Every listener swallows its own exceptions, and
+a failed write disables the log until the next restart rather than retrying into
+a dead handle on every message — a debugging log that can take a message handler
+down with it costs more than it is worth.
+
 ### Persona, and why the safety preamble is not editable
 
 The system prompt is two layers. The first is a preamble that lives in code —
