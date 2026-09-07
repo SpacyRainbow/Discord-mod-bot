@@ -705,6 +705,7 @@ class LLMLogStore(_Store):
         gap_truncated: Optional[int] = None,
         gap_render_chars: Optional[int] = None,
         gap_tokens_est: Optional[int] = None,
+        gap_omitted: Optional[int] = None,
         context: Optional[str] = None,
         reply_mode: Optional[str] = None,
         reply_chars: Optional[int] = None,
@@ -716,10 +717,10 @@ class LLMLogStore(_Store):
             "prompt, reply, tool_calls, rounds, duration_ms, model, status, error, "
             "prompt_tokens, cached_tokens, gap_messages, gap_chars, gap_mode, "
             "gap_scanned, gap_anchor_distance, gap_truncated, gap_render_chars, "
-            "gap_tokens_est, context, "
+            "gap_tokens_est, gap_omitted, context, "
             "reply_mode, reply_chars, reply_parent_id, history_turns, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 guild_id,
                 channel_id,
@@ -744,6 +745,7 @@ class LLMLogStore(_Store):
                 gap_truncated,
                 gap_render_chars,
                 gap_tokens_est,
+                gap_omitted,
                 context,
                 reply_mode,
                 reply_chars,
@@ -808,14 +810,16 @@ class LLMLogStore(_Store):
             return await self._read_one(
                 "SELECT id, created_at, channel_name, user_name, prompt, reply, "
                 "context, reply_mode, reply_chars, reply_parent_id, history_turns, "
-                "gap_messages, gap_chars, prompt_tokens, cached_tokens "
+                "gap_messages, gap_chars, prompt_tokens, cached_tokens, "
+                "gap_mode, gap_omitted "
                 "FROM llm_log WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
                 (guild_id,),
             )
         return await self._read_one(
             "SELECT id, created_at, channel_name, user_name, prompt, reply, "
             "context, reply_mode, reply_chars, reply_parent_id, history_turns, "
-            "gap_messages, gap_chars, prompt_tokens, cached_tokens "
+            "gap_messages, gap_chars, prompt_tokens, cached_tokens, "
+            "gap_mode, gap_omitted "
             "FROM llm_log WHERE guild_id = ? AND id = ?",
             (guild_id, row_id),
         )

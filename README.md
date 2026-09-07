@@ -971,6 +971,26 @@ This is a deliberate trade: fetching history costs about 0.2 seconds per token
 of prompt on this hardware, so paying for it only when it is needed is what
 keeps a normal reply to two minutes instead of five.
 
+**Replying to something older than its last message pulls the stretch in
+between.** The channel transcript the bot normally sees starts at its own last
+message, so a reply reaching back past that points at a conversation the
+transcript already ended — the parent arrived with nothing around it, and the
+bot answered the recent chatter instead. When the replied-to message is older
+than that anchor, the window runs from the parent to now instead, on its own
+budget of twelve messages and about 1,200 characters. Age does not disqualify a
+parent: a reply is direct evidence that it matters, and the caps, not the clock,
+are what bound the cost.
+
+When that stretch is longer than the budget, the **middle** is what goes, not
+the older half. Both ends carry the meaning — the parent and what came straight
+after it are what the question refers to, the newest messages are the
+conversation it is being asked in — so the transcript keeps both and states the
+hole literally, as `… 23 messages omitted …`. It is never summarised and the two
+halves are never made to look continuous: a model told it is seeing a complete
+stretch answers as though nothing is missing. `read_reply_chain` remains the way
+to go deeper on purpose, and `/llmcontext` shows the mode (`reply_span`) and the
+omitted count for any exchange.
+
 ### Speaking up on its own
 
 Separately from being pinged, it can occasionally join a conversation it was not
@@ -1061,8 +1081,9 @@ Manage Server. Rows older than `llm.logdays` are pruned once a day.
 
 Each row also records what the model was **shown**, not only what it said: the
 verbatim user turn, how many memory turns were replayed, how much of it was the
-gap transcript, and which of the four reply paths ran (`none`, `bot_turn`,
-`quote`, `locator`). `/llmlog` summarises that on the cost line;
+gap transcript, which window it came from (`anchored`, `reply_span`,
+`fallback`) with how many messages that window omitted, and which of the four
+reply paths ran (`none`, `bot_turn`, `quote`, `locator`). `/llmlog` summarises that on the cost line;
 `/llmcontext [exchange_id]` attaches the whole context as a text file, newest
 exchange by default. That distinction matters more than it sounds: without it,
 "the model ignored what I replied to" and "the model was never shown what I

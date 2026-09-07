@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS llm_log (
     gap_truncated INTEGER,
     gap_render_chars INTEGER,
     gap_tokens_est INTEGER,
+    gap_omitted INTEGER,
     context TEXT,
     reply_mode TEXT,
     reply_chars INTEGER,
@@ -245,6 +246,7 @@ ADDED_COLUMNS = [
     ("llm_log", "reply_chars", "INTEGER"),
     ("llm_log", "reply_parent_id", "INTEGER"),
     ("llm_log", "history_turns", "INTEGER"),
+    ("llm_log", "gap_omitted", "INTEGER"),
 ]
 
 
