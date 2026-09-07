@@ -1176,6 +1176,39 @@ ACT_TOOL_NAMES: FrozenSet[str] = frozenset(
 # dice are all fine on request and all wrong unprompted.
 AUTONOMOUS_ACT_TOOLS: FrozenSet[str] = frozenset({"act_react_to_message"})
 
+# How many act_* tools may be ATTEMPTED in one turn. Not a safety limit - the
+# allowlist in _dispatch_tool is that - but an anti-spiral one.
+#
+# A failed act comes back as an ordinary tool result, and nothing in the
+# conversation marks it as off-task, so the nearest reachable goal becomes
+# making the tool work. Measured in production on 2026-09-06, twice, on the
+# same question: a react whose ref did not resolve became read_recent_messages
+# and then a second react - which succeeded, ended the turn, and landed a skull
+# on a message nobody had asked about - and a rejected 1d1 became a 1d2 whose
+# number was posted as the reply to a word puzzle. Both times the question was
+# never answered. One attempt means a failed act is a dead end rather than a
+# problem to solve, and ACT_FAILED_NOTICE is what says so out loud.
+ACT_ATTEMPTS_PER_TURN = 1
+# Appended to a failed act's error. The re-anchor is the point: the error alone
+# says what went wrong, which invites a fix, and says nothing about the fact
+# that the person is still waiting for words.
+ACT_FAILED_NOTICE = (
+    "That action did not happen. Do not try it again or try a different one - "
+    "answer in words instead."
+)
+# Returned instead of running an act once the budget is spent.
+ACT_SPENT_NOTICE = (
+    "You have already tried one action this turn and it did not work. No more "
+    "actions - reply in words."
+)
+# Pre-tool text at least this long is treated as a real answer rather than the
+# single sentence NARRATION_INSTRUCTION asks for, and survives a terminal
+# action instead of being wiped by it. A threshold rather than a narrate check
+# because llm.narrate is ON here, so gating on it would make this a no-op on
+# the one guild that has the problem. Tune it from narrated= in the terminal
+# log line, which exists to make that number visible.
+TERMINAL_KEEP_TEXT_MIN = 200
+
 _MENTION_RE = re.compile(r"<@[!&]?\d+>|<#\d+>|<a?:\w+:\d+>")
 _MASS_PING_RE = re.compile(r"@(everyone|here)")
 
@@ -1736,6 +1769,34 @@ _reacted_var: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
     "aguiliar_reacted", default=None,
 )
 
+# How many act_* tools have been attempted and FAILED this turn. A ContextVar
+# for the same reason as the two above - discord.Message has __slots__ - and an
+# int rather than a list because nothing needs to know which ones.
+_act_fails_var: "contextvars.ContextVar[int]" = contextvars.ContextVar(
+    "aguiliar_act_fails", default=0,
+)
+
+
+def is_tool_error(result: Any) -> bool:
+    """Whether a tool result is one of the error strings every handler returns
+    instead of raising. Every one of them is a JSON object with "error" first,
+    which is the contract this reads - a TerminalReply is never an error."""
+    return (isinstance(result, str) and not isinstance(result, TerminalReply)
+            and result.startswith('{"error"'))
+
+
+def with_notice(result: str, notice: str) -> str:
+    """Adds a re-anchor line to a tool error, keeping it valid JSON so the model
+    reads it the same way it reads every other tool result."""
+    try:
+        payload = json.loads(result)
+        if isinstance(payload, dict):
+            payload["do_this_instead"] = notice
+            return json.dumps(payload)
+    except (ValueError, TypeError):
+        pass
+    return json.dumps({"error": str(result)[:400], "do_this_instead": notice})
+
 
 def message_registry(message: Any) -> Dict[str, Any]:
     """Mirror of image_registry, including the __slots__ fallback: setattr on a
@@ -1789,6 +1850,36 @@ def note_images(trigger: Any, source: Any) -> str:
         registry[ref] = attachment
         marks.append(ref)
     return " [" + ", ".join(marks) + "]"
+
+
+def mark_reactable(trigger: Any, entries: List[Tuple[str, str]], ids: List[int],
+                   sources: Dict[int, Any],
+                   indices: Optional[List[int]] = None) -> None:
+    """Append a [msgN] marker to each transcript line the model may point at,
+    IN PLACE, oldest first.
+
+    Without this the gap block is plain "author: text" lines and the message
+    registry is empty for the whole ping path, so act_react_to_message can
+    never resolve a ref on its first try - it has to spend a round on
+    read_recent_messages before it can point at anything, and until it does,
+    every ref it invents fails. The autonomous path has always done this
+    (see _autonomous_participate); the ping path never did.
+
+    Bots and the bot's own lines are rendered but not marked, matching the
+    autonomous path: no marker means act_react_to_message physically cannot
+    reach them, so the registry is the guard rather than an instruction.
+
+    Marking happens AFTER trimming, in render order, so msg1 is the oldest line
+    actually shown and nothing off-screen is reachable.
+    """
+    for position in (range(len(entries)) if indices is None else indices):
+        source = sources.get(ids[position])
+        if source is None or getattr(getattr(source, "author", None), "bot", False):
+            continue
+        marker = note_message(trigger, source)
+        if marker:
+            author, text = entries[position]
+            entries[position] = (author, text + marker)
 
 
 def strip_tool_markup(text: str) -> str:
@@ -2804,6 +2895,14 @@ class Aguiliar(commands.Cog):
         if name in ACT_TOOL_NAMES and name not in allowed_acts:
             logger.warning("aguiliar: refused act tool %r (not permitted here)", name)
             return json.dumps({"error": f"{name} is not available right now"})
+        # The anti-spiral budget, checked BEFORE the handler runs so a second
+        # act costs nothing but the round it was asked in. Deliberately not part
+        # of the authorization check above: that one is about what this request
+        # is allowed to do at all, this one is about what has already been tried.
+        if name in ACT_TOOL_NAMES and _act_fails_var.get() >= ACT_ATTEMPTS_PER_TURN:
+            logger.info("aguiliar: refused %s - act budget spent this turn", name)
+            return json.dumps({"error": "no actions left this turn",
+                               "do_this_instead": ACT_SPENT_NOTICE})
         args = parse_tool_arguments(raw_args)
         if args is None:
             return json.dumps({"error": "arguments were not a JSON object"})
@@ -2813,14 +2912,20 @@ class Aguiliar(commands.Cog):
             result = await handler(message, args)
         except Exception:
             logger.exception("aguiliar: tool %s failed", name)
-            return json.dumps({"error": "tool failed"})
+            result = json.dumps({"error": "tool failed"})
+        # An act that did not happen is spent, and is told so. A read that fails
+        # is left alone: re-reading is how a read recovers, and there is no
+        # terminal outcome on that path to hijack the turn.
+        if name in ACT_TOOL_NAMES and is_tool_error(result):
+            _act_fails_var.set(_act_fails_var.get() + 1)
+            result = with_notice(result, ACT_FAILED_NOTICE)
         # One line per call, so "did the tool path work in production" is
         # answerable from the container log rather than by inference. terminal=1
         # is the interesting one: it means no second inference was needed.
         logger.info(
             "aguiliar: tool=%s ok=%s terminal=%s duration=%dms size=%d",
             name,
-            not (isinstance(result, str) and result.startswith('{"error"')),
+            not is_tool_error(result),
             int(isinstance(result, TerminalReply)),
             int((time.monotonic() - started) * 1000),
             len(result) if isinstance(result, (str, list)) else 0,
@@ -2982,6 +3087,12 @@ class Aguiliar(commands.Cog):
                     # deliberately dropped - the turn is over, and running them
                     # would be doing work whose results nothing will ever read.
                     trace["terminal"] = call["name"]
+                    # What it had already written when it reached for the tool.
+                    # Carried out rather than dropped: _finish_terminal used to
+                    # replace the placeholder with the tool's own text alone, so
+                    # a drafted answer that had been streaming live in front of
+                    # somebody was overwritten by "1d2: **2**".
+                    trace["said_first"] = said_first
                     if len(tool_calls) > 1:
                         logger.info("aguiliar: %s ended the turn, %d call(s) skipped",
                                     call["name"], len(tool_calls) - 1)
@@ -3169,6 +3280,12 @@ class Aguiliar(commands.Cog):
         # Parallel to `collected`, so an entry can be matched back to the
         # Discord message it came from after trimming.
         collected_ids: List[int] = []
+        # id -> the message itself, for the [msgN] markers applied after
+        # trimming. Keyed by id rather than kept parallel because both branches
+        # below already carry ids through their own trimming, and only the
+        # messages that SURVIVE are registered - a marker on a line the model
+        # was never shown is a ref it cannot see and must not be given.
+        sources_by_id: Dict[int, Any] = {}
         anchor_id: Optional[int] = None
         # Every message the walk looked at, and where the anchor sat in that
         # walk. Both are the numbers that say whether GAP_SCAN_MAX is sized
@@ -3229,6 +3346,7 @@ class Aguiliar(commands.Cog):
                         parent_pos = len(collected)
                     collected.append((author_name, text))
                     collected_ids.append(hist.id)
+                    sources_by_id[hist.id] = hist
                 elif hist.id == keep_id:
                     # An empty parent (an image or embed with no text) cannot be
                     # a transcript line, but finding it still ends the search -
@@ -3278,6 +3396,10 @@ class Aguiliar(commands.Cog):
                 collected, REPLY_SPAN_MESSAGES_MAX, REPLY_SPAN_CHAR_CAP,
                 head_keep, tail_keep,
             )
+            # In place on `collected`, because render_span reads the full list
+            # back by index rather than taking the trimmed entries.
+            mark_reactable(message, collected, collected_ids, sources_by_id,
+                           kept_indices)
             entries = [collected[index] for index in kept_indices]
             kept_ids = frozenset(collected_ids[index] for index in kept_indices)
             block = render_span(collected, kept_indices, omitted)
@@ -3339,6 +3461,9 @@ class Aguiliar(commands.Cog):
                 surviving.append(tail_ids[index])
                 position += 1
         kept_ids = frozenset(surviving)
+        # `surviving` is parallel to `entries` by construction above, which is
+        # what makes marking by position safe here.
+        mark_reactable(message, entries, surviving, sources_by_id)
         block = render_gap(entries, truncated, anchored=(mode == "anchored"))
         chars = sum(len(author) + len(content) + 2 for author, content in entries)
         # render_chars is the honest cost figure: `chars` counts raw message
@@ -4357,6 +4482,7 @@ class Aguiliar(commands.Cog):
         # does not exist - so it is worth one line here.
         _msgs_var.set({})
         _reacted_var.set(None)
+        _act_fails_var.set(0)
         try:
             placeholder = await message.reply(f"*{self._thinking.pick()}…*",
                                               mention_author=False)
@@ -4504,28 +4630,42 @@ class Aguiliar(commands.Cog):
         leaving "let me look" sitting under a reaction reads like the bot got
         stuck halfway. A non-empty one (a dice roll) replaces it.
 
+        The exception is text the model had already written before it reached
+        for the tool. One sentence of that is the narration
+        NARRATION_INSTRUCTION asks for and is exactly the "let me look" this
+        deletes; TERMINAL_KEEP_TEXT_MIN characters of it is an answer, and
+        replacing an answer with a dice roll is how a word puzzle got a number.
+        Above the threshold it is kept, and the action's own text goes under it.
+
         The exchange is still logged, with what actually happened in the reply
         column, because "it reacted and said nothing" and "it produced no text"
         must not look the same in /llmlog.
         """
         text = str(answer)
+        drafted = (trace.get("said_first") or "").strip()
+        kept = drafted if len(drafted) >= TERMINAL_KEEP_TEXT_MIN else ""
+        shown = "\n\n".join(part for part in (kept, text) if part)
         try:
-            if text:
-                await placeholder.edit(content=text)
+            if shown:
+                await placeholder.edit(content=shown)
             else:
                 await placeholder.delete()
         except discord.HTTPException:
             pass
         duration_ms = int((time.monotonic() - started) * 1000)
+        # drafted= is what makes TERMINAL_KEEP_TEXT_MIN tunable from evidence:
+        # it is the size of what the model wrote before acting, whether or not
+        # this turn kept it.
         logger.info(
             "aguiliar: guild=%s channel=%s user=%s status=terminal tool=%s rounds=%s "
-            "tools=%s duration=%sms chars=%s",
+            "tools=%s duration=%sms chars=%s drafted=%s kept=%s",
             message.guild.id, message.channel.id, message.author.id,
             trace.get("terminal"), trace["rounds"],
-            [c["name"] for c in trace["tool_calls"]], duration_ms, len(text),
+            [c["name"] for c in trace["tool_calls"]], duration_ms, len(shown),
+            len(drafted), int(bool(kept)),
         )
         await self._log_exchange(
-            message, text or f"({trace.get('terminal')})", trace, duration_ms, "ok", None,
+            message, shown or f"({trace.get('terminal')})", trace, duration_ms, "ok", None,
         )
 
     # --- autonomous wake-up -------------------------------------------------
@@ -4779,6 +4919,7 @@ class Aguiliar(commands.Cog):
         _prompt_var.set(None)
         _images_var.set({})
         _msgs_var.set({})
+        _act_fails_var.set(0)
 
         recent: List[discord.Message] = []
         try:

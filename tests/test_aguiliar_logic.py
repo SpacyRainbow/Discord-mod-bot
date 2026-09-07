@@ -68,6 +68,19 @@ from bot.modules.aguiliar import (
     GAP_CHARS_PER_TOKEN,
     MESSAGE_CHAR_CAP,
     _gap_stats_var,
+    _act_fails_var,
+    _msgs_var,
+    ACT_ATTEMPTS_PER_TURN,
+    ACT_FAILED_NOTICE,
+    ACT_SPENT_NOTICE,
+    ACT_TOOL_NAMES,
+    AUTONOMOUS_ACT_TOOLS,
+    TERMINAL_KEEP_TEXT_MIN,
+    TerminalReply,
+    is_tool_error,
+    mark_reactable,
+    message_registry,
+    with_notice,
 )
 
 
@@ -4038,3 +4051,208 @@ async def test_a_reply_inside_the_gap_still_uses_the_anchored_window():
     assert _gap_stats_var.get()["mode"] == "anchored"
     assert anchor_id == 28
     assert "older still" not in block
+
+
+# --- [msgN] markers on the ping path ----------------------------------------
+# Regression cluster for 2026-09-06: the gap block rendered plain "author: text"
+# lines, so the message registry was empty for the whole ping path and every ref
+# the model invented failed. It cost a wasted act and a recovery round before it
+# could point at anything.
+
+def _source(message_id, *, bot=False):
+    source = MagicMock()
+    source.id = message_id
+    source.author = MagicMock()
+    source.author.bot = bot
+    return source
+
+
+def test_mark_reactable_numbers_the_lines_oldest_first():
+    trigger = _make_message()
+    _msgs_var.set({})
+    entries = [("Raheem", "first"), ("Raheem", "second")]
+    sources = {1: _source(1), 2: _source(2)}
+    mark_reactable(trigger, entries, [1, 2], sources)
+    assert entries == [("Raheem", "first [msg1]"), ("Raheem", "second [msg2]")]
+    registry = message_registry(trigger)
+    assert registry["msg1"].id == 1 and registry["msg2"].id == 2
+
+
+def test_mark_reactable_leaves_bots_unreachable():
+    """No marker is the guard: a line with no ref cannot be named by
+    act_react_to_message at all, which is how the autonomous path already keeps
+    the bot from reacting to itself."""
+    trigger = _make_message()
+    _msgs_var.set({})
+    entries = [("Aguilar", "mine"), ("Raheem", "theirs")]
+    sources = {1: _source(1, bot=True), 2: _source(2)}
+    mark_reactable(trigger, entries, [1, 2], sources)
+    assert entries[0] == ("Aguilar", "mine")
+    assert entries[1] == ("Raheem", "theirs [msg1]")
+    assert set(message_registry(trigger)) == {"msg1"}
+
+
+def test_mark_reactable_only_marks_what_survived_trimming():
+    """A marker on a line the model was never shown would be a ref it cannot
+    see, so the span path marks by kept index rather than marking everything."""
+    trigger = _make_message()
+    _msgs_var.set({})
+    entries = [("Raheem", "kept"), ("Raheem", "cut"), ("Raheem", "kept too")]
+    sources = {1: _source(1), 2: _source(2), 3: _source(3)}
+    mark_reactable(trigger, entries, [1, 2, 3], sources, [0, 2])
+    assert entries[1] == ("Raheem", "cut")
+    assert entries[0][1].endswith("[msg1]") and entries[2][1].endswith("[msg2]")
+    assert {ref: m.id for ref, m in message_registry(trigger).items()} == {"msg1": 1, "msg2": 3}
+
+
+# --- the act budget ---------------------------------------------------------
+# A failed act used to come back as an ordinary tool result, so the model
+# treated repairing it as the task: a failed react became a read and a second
+# react that ended the turn on the wrong message, and a rejected 1d1 became a
+# 1d2 that was posted as the answer to a word puzzle.
+
+@pytest.mark.asyncio
+async def test_a_failed_act_carries_a_re_anchor():
+    cog = _make_cog()
+    _act_fails_var.set(0)
+    cog._tool_act_roll_dice = AsyncMock(
+        return_value=json.dumps({"error": "dice need between 2 and 1000 sides"}))
+    result = await cog._dispatch_tool("act_roll_dice", '{"spec": "1d1"}', _make_message())
+    payload = json.loads(result)
+    assert payload["error"].startswith("dice need")
+    assert payload["do_this_instead"] == ACT_FAILED_NOTICE
+
+
+@pytest.mark.asyncio
+async def test_a_failed_act_spends_the_turn_s_only_attempt():
+    cog = _make_cog()
+    _act_fails_var.set(0)
+    cog._tool_act_react_to_message = AsyncMock(
+        return_value=json.dumps({"error": "no message called msg1 here"}))
+    cog._tool_act_roll_dice = AsyncMock()
+    await cog._dispatch_tool("act_react_to_message", '{"ref": "msg1"}', _make_message())
+    result = await cog._dispatch_tool("act_roll_dice", '{"spec": "1d2"}', _make_message())
+    assert json.loads(result)["do_this_instead"] == ACT_SPENT_NOTICE
+    # Refused BEFORE the handler, so a second act costs only the round it was
+    # asked in - and the dice never actually rolled.
+    cog._tool_act_roll_dice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_read_stays_retryable():
+    """The budget is aimed at acts only. Re-reading is how a read recovers, and
+    a read has no terminal outcome that could hijack the turn."""
+    cog = _make_cog()
+    _act_fails_var.set(0)
+    cog._tool_read_recent_messages = AsyncMock(
+        return_value=json.dumps({"error": "history unreadable"}))
+    await cog._dispatch_tool("read_recent_messages", "{}", _make_message())
+    assert _act_fails_var.get() == 0
+    cog._tool_act_roll_dice = AsyncMock(return_value=TerminalReply("1d2: **2**"))
+    result = await cog._dispatch_tool("act_roll_dice", '{"spec": "1d2"}', _make_message())
+    assert isinstance(result, TerminalReply)
+
+
+@pytest.mark.asyncio
+async def test_an_act_that_worked_does_not_spend_the_budget():
+    cog = _make_cog()
+    _act_fails_var.set(0)
+    cog._tool_act_roll_dice = AsyncMock(return_value=TerminalReply("1d20: **7**"))
+    await cog._dispatch_tool("act_roll_dice", '{"spec": "1d20"}', _make_message())
+    assert _act_fails_var.get() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_raising_act_is_a_failed_act():
+    """A handler that blows up is still an action that did not happen, so it
+    spends the attempt like any other failure."""
+    cog = _make_cog()
+    _act_fails_var.set(0)
+    cog._tool_act_roll_dice = AsyncMock(side_effect=RuntimeError("boom"))
+    result = await cog._dispatch_tool("act_roll_dice", '{"spec": "1d20"}', _make_message())
+    assert json.loads(result)["do_this_instead"] == ACT_FAILED_NOTICE
+    assert _act_fails_var.get() == ACT_ATTEMPTS_PER_TURN
+
+
+def test_is_tool_error_never_calls_a_terminal_reply_an_error():
+    assert is_tool_error(json.dumps({"error": "nope"})) is True
+    assert is_tool_error(TerminalReply('{"error": "not really"}')) is False
+    assert is_tool_error("plain text result") is False
+
+
+def test_with_notice_keeps_the_error_readable_as_json():
+    payload = json.loads(with_notice(json.dumps({"error": "x"}), "do this"))
+    assert payload == {"error": "x", "do_this_instead": "do this"}
+    # A handler that returned something that is not JSON still gets a notice.
+    assert json.loads(with_notice("not json", "do this"))["do_this_instead"] == "do this"
+
+
+# --- a terminal action must not wipe a drafted answer -----------------------
+
+# Fixed lengths on purpose. Building the fixture out of TERMINAL_KEEP_TEXT_MIN
+# made these tests satisfy themselves at any value of it, which is a test that
+# cannot see the thing it is checking.
+LONG_DRAFT = "A" * 300
+SHORT_NARRATION = "let me look at that."
+
+
+def test_the_keep_threshold_sits_between_the_two_fixtures():
+    """Keeps the two tests below honest if the threshold is ever retuned from
+    the drafted= figure in the terminal log line."""
+    assert len(SHORT_NARRATION) < TERMINAL_KEEP_TEXT_MIN < len(LONG_DRAFT)
+
+
+def _placeholder():
+    placeholder = MagicMock()
+    placeholder.edit = AsyncMock()
+    placeholder.delete = AsyncMock()
+    return placeholder
+
+
+@pytest.mark.asyncio
+async def test_a_drafted_answer_survives_a_terminal_action():
+    """The 2026-09-06 failure exactly: a word puzzle answered with "1d2: **2**".
+    Whatever it had already written - and streamed live in front of somebody -
+    was replaced by the tool's own text."""
+    cog = _make_cog()
+    cog._log_exchange = AsyncMock()
+    placeholder = _placeholder()
+    draft = LONG_DRAFT
+    trace = {"rounds": 2, "tool_calls": [], "terminal": "act_roll_dice",
+             "said_first": draft}
+    await cog._finish_terminal(_make_message(), placeholder,
+                               TerminalReply("1d2: **2**"), trace, 0.0)
+    shown = placeholder.edit.call_args.kwargs["content"]
+    assert shown == draft + "\n\n1d2: **2**"
+    placeholder.delete.assert_not_awaited()
+    # And what is logged is what was shown, not the tool text alone.
+    assert cog._log_exchange.call_args.args[1] == shown
+
+
+@pytest.mark.asyncio
+async def test_a_narration_line_is_still_wiped_by_a_reaction():
+    """The other half: one sentence before a tool call is the narration
+    NARRATION_INSTRUCTION asks for, and leaving "let me look" sitting under a
+    reaction reads like the bot got stuck halfway."""
+    cog = _make_cog()
+    cog._log_exchange = AsyncMock()
+    placeholder = _placeholder()
+    trace = {"rounds": 1, "tool_calls": [], "terminal": "act_react_to_message",
+             "said_first": SHORT_NARRATION}
+    await cog._finish_terminal(_make_message(), placeholder, TerminalReply(""), trace, 0.0)
+    placeholder.delete.assert_awaited_once()
+    placeholder.edit.assert_not_awaited()
+    assert cog._log_exchange.call_args.args[1] == "(act_react_to_message)"
+
+
+@pytest.mark.asyncio
+async def test_a_reaction_that_followed_a_real_answer_keeps_the_answer():
+    cog = _make_cog()
+    cog._log_exchange = AsyncMock()
+    placeholder = _placeholder()
+    draft = LONG_DRAFT
+    trace = {"rounds": 1, "tool_calls": [], "terminal": "act_react_to_message",
+             "said_first": draft}
+    await cog._finish_terminal(_make_message(), placeholder, TerminalReply(""), trace, 0.0)
+    assert placeholder.edit.call_args.kwargs["content"] == draft
+    placeholder.delete.assert_not_awaited()
