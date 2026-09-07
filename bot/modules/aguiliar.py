@@ -386,6 +386,12 @@ STATUS_EMOJI: Dict[str, str] = {
     "read_channel": "\U0001f4cd",          # pin
     "read_check_text": "\U0001f524",       # abc
     "read_calculate": "\U0001f9ee",        # abacus
+    "read_message_reactions": "\U0001f4ac",  # speech balloon
+    "read_own_past_replies": "\U0001f4ad",   # thought balloon
+    "act_react_to_message": "\U0001f642",    # slight smile
+    "act_roll_dice": "\U0001f3b2",           # die
+    "act_set_reminder": "\u23f0",              # alarm clock
+    "act_start_poll": "\U0001f5f3\ufe0f",      # ballot box
 }
 STATUS_EMOJI_FALLBACK = "\u2699\ufe0f"        # gear, for a tool with no glyph
 # Anything that would let a query rewrite the status line as markdown, or ping
@@ -2109,7 +2115,31 @@ def describe_tool_call(name: str, raw_args: Any) -> str:
         if isinstance(raw, (str, int)):
             expression = re.sub(r"[`\\\n\r]", "", sanitize(str(raw), STATUS_ARG_CHAR_CAP)).strip()
         return f"working out `{expression}`…" if expression else "working it out…"
-    return f"calling {_STATUS_MARKUP_RE.sub('', str(name)[:40])}…"
+    if name == "read_message_reactions":
+        return "checking the reactions to that message…"
+    if name == "read_own_past_replies":
+        query = _arg("query")
+        return (f"looking back at what I said about \u201c{query}\u201d…" if query
+                else "looking back at what I said…")
+    if name == "act_react_to_message":
+        emoji = _arg("emoji")
+        return f"reacting with {emoji}…" if emoji else "reacting…"
+    if name == "act_roll_dice":
+        spec = _arg("spec")
+        return f"rolling {spec}…" if spec else "rolling…"
+    if name == "act_set_reminder":
+        # The reminder TEXT is deliberately left out - it is free-form prose and
+        # the delay is the part worth seeing while the write happens.
+        delay = _arg("delay")
+        return f"setting a reminder for {delay}…" if delay else "setting a reminder…"
+    if name == "act_start_poll":
+        # Likewise the question: the poll itself is about to appear carrying it.
+        return "starting a poll…"
+    # Unknown tool. The underscores become spaces BEFORE the markup strip, or
+    # the strip (which removes _ because it is Discord italics) welds the words
+    # into one - "readownpastreplies" was a real line somebody saw.
+    readable = _STATUS_MARKUP_RE.sub("", str(name)[:40].replace("_", " ")).strip()
+    return f"calling {readable}…" if readable else "working…"
 
 
 def render_status_line(calls: List[dict]) -> str:

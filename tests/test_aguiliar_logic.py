@@ -1437,6 +1437,34 @@ def test_the_status_line_says_what_the_tool_call_actually_is():
     assert describe_tool_call("read_reply_chain", "{}") == "reading what this replies to…"
     assert describe_tool_call("read_member_profile", '{"display_name": "Laffy"}') == \
         "looking up Laffy…"
+    assert describe_tool_call("read_message_reactions", '{"ref": "msg3"}') == \
+        "checking the reactions to that message…"
+    assert describe_tool_call("read_own_past_replies", '{"query": "tofu"}') == \
+        "looking back at what I said about “tofu”…"
+    assert describe_tool_call("read_own_past_replies", "{}") == \
+        "looking back at what I said…"
+    assert describe_tool_call("act_react_to_message", '{"emoji": ":copium:"}') == \
+        "reacting with :copium:…"
+    assert describe_tool_call("act_roll_dice", '{"spec": "1d20"}') == "rolling 1d20…"
+    assert describe_tool_call(
+        "act_set_reminder", '{"delay": "30m", "text": "check the NAS"}'
+    ) == "setting a reminder for 30m…"
+    assert describe_tool_call("act_start_poll", '{"question": "tofu?"}') == \
+        "starting a poll…"
+
+
+def test_every_tool_the_bot_can_call_has_a_written_status_line():
+    """The counterpart to the dispatch coverage assertion further down: a tool
+    added without a phrasing used to fall through to `calling <name>`, and the
+    markup strip removes underscores because they are Discord italics, so it
+    rendered as "calling readownpastreplies…" in front of the room."""
+    from bot.modules.aguiliar import Aguiliar, describe_tool_call, STATUS_EMOJI
+    for name in Aguiliar.TOOL_HANDLERS:
+        assert not describe_tool_call(name, "{}").startswith("calling "), \
+            f"{name} has no written status line"
+        assert STATUS_EMOJI.get(name), f"{name} has no glyph of its own"
+    glyphs = [STATUS_EMOJI[n] for n in Aguiliar.TOOL_HANDLERS]
+    assert len(set(glyphs)) == len(glyphs), "two tools share a glyph"
 
 
 def test_a_status_line_cannot_ping_anyone_or_rewrite_itself_as_markdown():
@@ -1456,6 +1484,8 @@ def test_an_unparseable_or_unknown_call_still_renders_something():
     assert describe_tool_call("read_web_search", "{not json") == "searching the web…"
     assert describe_tool_call("read_web_search", '{"query": 12.5}') == "searching the web…"
     assert "wat" in describe_tool_call("wat", "{}")
+    # An unknown UNDERSCORED name: the strip must not weld it into one word.
+    assert describe_tool_call("some_new_tool", "{}") == "calling some new tool…"
 
 
 def test_the_status_of_a_round_stacks_every_call_in_it():
